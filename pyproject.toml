@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tremor"
+version = "0.1.0"
+description = "GPS-synchronised grid frequency monitoring: synthetic signal generation and frequency estimation"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+# scipy is only needed for the offline (non-causal) filtering helpers in
+# tremor.filters -- the core signal/frequency modules are pure numpy so they
+# stay portable to MicroPython later.
+offline = [
+    "scipy",
+]
+dev = [
+    "pytest",
+    "scipy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
