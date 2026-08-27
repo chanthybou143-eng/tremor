@@ -25,6 +25,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # first-time setup
 .venv/bin/pytest tests/test_frequency.py -v                  # one file
 .venv/bin/pytest tests/test_frequency.py::test_estimate_frequency_hand_built  # one test
 .venv/bin/pytest -k "noise"                                  # by keyword
+.venv/bin/tremor-dashboard                                   # live dashboard (synthetic feed)
 ```
 
 No lint/format tooling is configured yet.
@@ -45,38 +46,79 @@ and can't do non-causal (whole-buffer) filtering:
   samples, for validating estimators against.
 
 - **`frequency.py`** (pure numpy, no scipy) — `estimate_frequency_zero_crossing()`
-  is the estimator: rising zero-crossings are found and linearly
+  is the batch estimator: rising zero-crossings are found and linearly
   interpolated, then frequency per cycle is `1 / diff(crossing_times)`,
-  timestamped at the midpoint of each crossing pair. This module takes
-  samples exactly as given and has no notion of filtering or nominal
-  frequency — it's intentionally kept small enough to eventually port to
-  MicroPython firmware. It is sensitive to noise near a zero crossing (a
-  single noisy sample can register a spurious crossing a fraction of a
-  sample away from the real one, producing a wildly wrong instantaneous
-  frequency for that one cycle) — that's why filtering lives elsewhere.
+  timestamped at the midpoint of each crossing pair. It takes samples
+  exactly as given and has no notion of filtering or nominal frequency. It
+  is sensitive to noise near a zero crossing (a single noisy sample can
+  register a spurious crossing a fraction of a sample away from the real
+  one, producing a wildly wrong instantaneous frequency for that one cycle)
+  — offline this is handled by taking a median over a batch of estimates
+  (see `tests/test_frequency.py`).
 
-- **`filters.py`** (scipy, offline-only) — `lowpass_filtfilt()` is a
-  zero-phase Butterworth low-pass (`scipy.signal.butter` + `filtfilt`) used
-  to condition a buffer before handing it to the estimator. It's explicitly
-  non-causal (needs the whole buffer, forward+backward) and documented as
-  analysis-only. When firmware work starts, the on-device replacement will
-  be a causal single-pole IIR — that substitution should not require
-  touching `frequency.py`.
+  `StreamingZeroCrossingDetector` is the causal, sample-at-a-time
+  counterpart, used by live sources (`source.py`): it has no batch of future
+  cycles to median over, so instead it rejects any rising crossing arriving
+  less than `min_interval_s` (default 15 ms, well under a 50 Hz half-cycle)
+  after the last *accepted* crossing. Both estimators are pure numpy/stdlib
+  so they stay portable to MicroPython firmware later.
+
+- **`filters.py`** — two conditioning options, chosen along the same
+  portability line. `lowpass_filtfilt()` (scipy, imported lazily inside the
+  function so importing the module never requires scipy) is a zero-phase
+  Butterworth low-pass used offline before the batch estimator; it's
+  explicitly non-causal (needs the whole buffer, forward+backward) and
+  analysis-only. `SinglePoleLowPass` is the causal, sample-at-a-time on-device
+  replacement — a first-order RC filter, pure Python arithmetic (`math`, no
+  numpy/scipy) — used by live sources (`source.py`) before samples reach
+  `StreamingZeroCrossingDetector`. It's weaker than the offline filter (6
+  dB/octave vs. 4th-order) so don't expect it to match the offline filter's
+  noise numbers exactly, just the same ballpark.
 
 `scipy` is scoped as an optional dependency (`offline`/`dev` extras in
 `pyproject.toml`), not a core dependency, precisely because `signal.py` and
 `frequency.py` must stay importable without it.
 
-### On-device crossing detection (future work)
+### Live dashboard (`source.py`, `rocof.py`, `dashboard.py`)
 
-When `frequency.py`'s crossing detection is ported to run live on the Pico,
-it needs a minimum-interval guard: reject any rising crossing that arrives
-less than ~15 ms after the previous accepted one (15 ms is well under a 50
-Hz half-cycle, so it only rejects spurious crossings, not real ones). This
-is the causal, streaming counterpart to the median-based noise robustness
-used offline — on-device there's no buffer of future cycles to take a
-median over, so a noise-induced spurious crossing has to be rejected right
-at detection time instead of filtered out afterward.
+`source.py` defines `FrequencySource`, the interface the dashboard programs
+against (`stream() -> Iterator[FreqSample]`, plus optional `start()`/
+`stop()`). `SyntheticFrequencySource` is the only implementation so far: a
+background thread runs `signal.MainsSignalGenerator` (a stateful,
+one-sample-at-a-time version of `generate_mains_signal` — needed because a
+disturbance can be injected mid-stream, which a fixed-length batch buffer
+can't represent) through `filters.SinglePoleLowPass` and then
+`frequency.StreamingZeroCrossingDetector`, paced to real time via
+`time.sleep`, pushing results onto a queue. `inject_step()` and
+`inject_ramp()` mutate the frequency offset the generator is currently using
+(a ramp is evaluated against wall-clock elapsed time each chunk, so it
+progresses correctly regardless of how the dashboard is polling it). A real
+serial feed from the Pico should implement `FrequencySource` the same way,
+so `dashboard.py` doesn't change.
+
+`rocof.py::rocof_from_window()` is a plain least-squares slope (Hz/s) over
+a window of `(t, freq_hz)` points — used both for the dashboard's RoCoF
+trace (a 500 ms trailing window, recomputed each time a new estimate
+arrives) and intended as the starting point for offline inertia-estimation
+work later.
+
+`dashboard.py` runs a consumer thread that drains a `FrequencySource` into
+rolling buffers (`_DashboardState`, lock-protected deques capped at the 60s
+display window), and a matplotlib `FuncAnimation` on the main thread redraws
+from a snapshot of those buffers every 150 ms. The frequency panel's y-axis
+is intentionally a fixed `nominal ± 0.5 Hz` (not autoscaled) so small
+deviations stay visually meaningful. The RoCoF panel discards the first
+`ROCOF_STARTUP_DISCARD_S` (1 s) of estimates from its buffer — the
+filter/detector haven't settled yet right after start, and that startup
+transient would otherwise dominate the sliding-fit slope and poison the
+panel's autoscale — and its y-axis (`_rocof_ylim()`) is clamped to
+`ROCOF_Y_DEFAULT_HZ_S` (±2 Hz/s) by default, expanding only if the data
+actually exceeds that. The big numeric readout shows a short rolling
+median (`_readout_frequency()`, 1 s window) rather than the latest single
+cycle, so it doesn't visibly jitter on per-cycle noise. Button widgets call
+`inject_step`/`inject_ramp`/`reset` directly on the source, so they only
+make sense for sources that expose them (they're hidden for a source that
+isn't a `SyntheticFrequencySource`).
 
 ### Test tolerances are tied to real hardware constraints
 

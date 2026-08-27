@@ -78,3 +78,58 @@ def generate_mains_signal(
         samples = samples + rng.normal(0.0, noise_std, size=n)
 
     return SyntheticSignal(t=t, samples=samples, true_freq_hz=true_freq_hz)
+
+
+class MainsSignalGenerator:
+    """Stateful, one-sample-at-a-time counterpart to
+    ``generate_mains_signal``.
+
+    ``generate_mains_signal`` produces a whole fixed-length buffer up front,
+    which doesn't fit a live source where a disturbance can be injected at
+    an arbitrary moment while streaming is already under way. This class
+    holds the oscillator's phase across calls and exposes ``set_offset`` so
+    a caller (e.g. a background generation thread) can change the frequency
+    offset between samples; phase stays continuous either way since it's
+    accumulated incrementally rather than recomputed from ``t``.
+    """
+
+    def __init__(
+        self,
+        sample_rate_hz: float,
+        nominal_freq_hz: float = 50.0,
+        amplitude: float = 1.0,
+        harmonics: Optional[Dict[int, float]] = None,
+        noise_std: float = 0.0,
+        rng: Optional[np.random.Generator] = None,
+    ):
+        self.sample_rate_hz = sample_rate_hz
+        self.nominal_freq_hz = nominal_freq_hz
+        self.amplitude = amplitude
+        self.harmonics = harmonics or {}
+        self.noise_std = noise_std
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+        self._t = 0.0
+        self._phase = 0.0
+        self._offset_hz = 0.0
+
+    def set_offset(self, offset_hz: float) -> None:
+        self._offset_hz = offset_hz
+
+    def next_sample(self):
+        """Return ``(t, sample, instantaneous_freq_hz)`` for the next
+        sample, advancing internal state by one sample period."""
+        dt = 1.0 / self.sample_rate_hz
+        freq_hz = self.nominal_freq_hz + self._offset_hz
+
+        t = self._t
+        value = self.amplitude * np.sin(self._phase)
+        for order, rel_amp in self.harmonics.items():
+            value += self.amplitude * rel_amp * np.sin(order * self._phase)
+        if self.noise_std > 0.0:
+            value += self.rng.normal(0.0, self.noise_std)
+
+        self._phase += 2.0 * np.pi * freq_hz * dt
+        self._t += dt
+
+        return t, value, freq_hz

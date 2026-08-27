@@ -18,10 +18,19 @@ dependencies = [
 offline = [
     "scipy",
 ]
+# matplotlib is only needed for the live dashboard (tremor.dashboard), not
+# for the core signal/frequency modules.
+dashboard = [
+    "matplotlib",
+]
 dev = [
     "pytest",
     "scipy",
+    "matplotlib",
 ]
+
+[project.scripts]
+tremor-dashboard = "tremor.dashboard:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
