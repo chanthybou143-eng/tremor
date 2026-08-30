@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>TREMOR — Unit Dashboard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #111417;
+    --card-bg: #1b1f24;
+    --card-border: #2a2f36;
+    --text: #e8eaed;
+    --muted: #8a919b;
+    --accent: #4da3ff;
+    --accent-rocof: #ff9f4d;
+    --offline: #4a4f57;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  h1 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin: 0 0 4px 0;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin: 0 0 24px 0;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card.offline {
+    opacity: 0.55;
+  }
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 10px;
+  }
+  .label {
+    font-weight: 600;
+    font-size: 1rem;
+  }
+  .status {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .status.live { color: #4dd68a; }
+  .readings {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 10px;
+  }
+  .reading .value {
+    font-size: 1.6rem;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+  }
+  .reading .unit {
+    font-size: 0.75rem;
+    color: var(--muted);
+  }
+  .reading.freq .value { color: var(--accent); }
+  .reading.rocof .value { color: var(--accent-rocof); }
+  canvas {
+    width: 100%;
+    height: 60px;
+    display: block;
+  }
+  .no-data {
+    color: var(--muted);
+    font-size: 0.9rem;
+    padding: 20px 0;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <h1>TREMOR — Unit Dashboard</h1>
+  <p class="subtitle">Frequency and RoCoF per unit · synthetic feed · polling every 1s</p>
+  <div class="grid" id="grid"></div>
+
+<script>
+const POLL_MS = 1000;
+const grid = document.getElementById('grid');
+const cardsById = {};
+
+function makeCard(unit) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    <div class="card-header">
+      <span class="label"></span>
+      <span class="status"></span>
+    </div>
+    <div class="readings">
+      <div class="reading freq">
+        <div class="value">--</div>
+        <div class="unit">Hz</div>
+      </div>
+      <div class="reading rocof">
+        <div class="value">--</div>
+        <div class="unit">Hz/s</div>
+      </div>
+    </div>
+    <canvas width="480" height="60"></canvas>
+    <div class="no-data" hidden>No data yet</div>
+  `;
+  grid.appendChild(card);
+  return card;
+}
+
+function drawSparkline(canvas, history) {
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (history.length < 2) return;
+
+  const freqs = history.map(p => p[1]);
+  const lo = Math.min(...freqs), hi = Math.max(...freqs);
+  const span = Math.max(hi - lo, 0.05); // floor so a near-flat line isn't jittery
+  const mid = (hi + lo) / 2;
+  const yMin = mid - span, yMax = mid + span;
+
+  const t0 = history[0][0], t1 = history[history.length - 1][0];
+  const tSpan = Math.max(t1 - t0, 1e-6);
+
+  ctx.strokeStyle = '#4da3ff';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  history.forEach(([t, f], i) => {
+    const x = ((t - t0) / tSpan) * w;
+    const y = h - ((f - yMin) / (yMax - yMin)) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  ctx.strokeStyle = '#3a4048';
+  ctx.setLineDash([2, 3]);
+  ctx.beginPath();
+  const yMidPx = h - ((50.0 - yMin) / (yMax - yMin)) * h;
+  ctx.moveTo(0, yMidPx);
+  ctx.lineTo(w, yMidPx);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function updateCard(card, unit) {
+  card.querySelector('.label').textContent = unit.label;
+  const statusEl = card.querySelector('.status');
+  statusEl.textContent = unit.status;
+  statusEl.className = 'status ' + unit.status;
+  card.classList.toggle('offline', unit.status !== 'live');
+
+  const noData = card.querySelector('.no-data');
+  const canvas = card.querySelector('canvas');
+  const readings = card.querySelector('.readings');
+
+  if (unit.status !== 'live') {
+    noData.hidden = false;
+    canvas.hidden = true;
+    readings.hidden = true;
+    return;
+  }
+  noData.hidden = true;
+  canvas.hidden = false;
+  readings.hidden = false;
+
+  card.querySelector('.reading.freq .value').textContent = unit.freq_hz.toFixed(3);
+  const rocof = unit.rocof_hz_s;
+  card.querySelector('.reading.rocof .value').textContent =
+    (rocof >= 0 ? '+' : '') + rocof.toFixed(3);
+
+  drawSparkline(canvas, unit.history);
+}
+
+async function poll() {
+  try {
+    const res = await fetch('/api/units');
+    const units = await res.json();
+    for (const unit of units) {
+      if (!cardsById[unit.id]) {
+        cardsById[unit.id] = makeCard(unit);
+      }
+      updateCard(cardsById[unit.id], unit);
+    }
+  } catch (err) {
+    console.error('poll failed', err);
+  }
+}
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

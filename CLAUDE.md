@@ -25,7 +25,9 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # first-time setup
 .venv/bin/pytest tests/test_frequency.py -v                  # one file
 .venv/bin/pytest tests/test_frequency.py::test_estimate_frequency_hand_built  # one test
 .venv/bin/pytest -k "noise"                                  # by keyword
-.venv/bin/tremor-dashboard                                   # live dashboard (synthetic feed)
+.venv/bin/tremor-dashboard                                   # single-unit live dashboard (synthetic feed)
+.venv/bin/tremor-web-dashboard                                # multi-unit web dashboard (synthetic feed)
+python3 freq_estimator.py                                     # standalone draft estimator's own validation harness
 ```
 
 No lint/format tooling is configured yet.
@@ -79,6 +81,22 @@ and can't do non-causal (whole-buffer) filtering:
 `pyproject.toml`), not a core dependency, precisely because `signal.py` and
 `frequency.py` must stay importable without it.
 
+### `freq_estimator.py` (repo root, not part of the `tremor` package)
+
+A separate, self-contained draft: the same zero-crossing-with-hysteresis
+idea as `frequency.py`/`filters.py`, but deliberately reimplemented with
+zero dependencies (`math`/`random` only, no numpy) so it can be
+copy-pasted directly into MicroPython firmware later with minimal changes.
+It's a candidate for what actually ends up running on each Pico, whereas
+`signal.py`/`frequency.py`/`filters.py` are the numpy-based *offline
+analysis* toolkit. Not yet merged into `src/tremor/` — `units.py` (below)
+imports it via a small `sys.path` shim rather than duplicating its logic;
+if it's ever formalised into the package, that shim goes away.
+`generate_synthetic_signal()` takes an optional `rng: random.Random`
+instead of touching the global `random` module, specifically so multiple
+instances can run concurrently (one per simulated unit) without racing on
+shared global state.
+
 ### Live dashboard (`source.py`, `rocof.py`, `dashboard.py`)
 
 `source.py` defines `FrequencySource`, the interface the dashboard programs
@@ -119,6 +137,40 @@ cycle, so it doesn't visibly jitter on per-cycle noise. Button widgets call
 `inject_step`/`inject_ramp`/`reset` directly on the source, so they only
 make sense for sources that expose them (they're hidden for a source that
 isn't a `SyntheticFrequencySource`).
+
+### Multi-unit web dashboard (`units.py`, `webapp.py`)
+
+A second, separate live view from the single-unit matplotlib dashboard
+above: a local Flask web app showing frequency + RoCoF for each of the 5
+planned units (only 2-3 simulated today; the rest render as "no data yet"
+placeholders — that's the exact swap-in point for real hardware later).
+
+`units.py` defines `UnitFeed` (mirrors `source.FrequencySource`, but
+tagged with a `unit_id`/`label`). `SyntheticUnitFeed` is the only
+implementation: a background thread repeatedly generates a ~1s chunk via
+`freq_estimator.generate_synthetic_signal` and runs it through
+`freq_estimator.estimate_frequency` (hysteresis + moving-average, not
+`tremor.frequency`'s pipeline — deliberately reusing the same draft that's
+closer to what will actually run on hardware), pushing the per-cycle
+readings onto a queue paced to real time. Every simulated unit measures
+the same shared `true_grid_freq_hz(t)` (currently a flat 50 Hz) — the hook
+for a future shared disturbance, since arrival-time comparison across
+units is the whole point of the network — differing only in independent
+noise and a small per-unit DC-offset (calibration error), not in the
+underlying frequency they're measuring.
+
+`webapp.py`'s `_UnitsState` is the same lock-protected rolling-buffer
+pattern as `dashboard.py`'s `_DashboardState`, keyed per unit, computing
+RoCoF via `rocof.rocof_from_window()` over a 2s trailing window (longer
+than the single-unit dashboard's 500ms, since this view polls at a much
+coarser ~1s cadence). The displayed frequency is a short rolling median
+(`READOUT_WINDOW_S`), not the latest raw single-cycle reading, for the
+same jitter reason as `dashboard.py`'s `_readout_frequency()`. The frontend
+(`templates/index.html`) is a single self-contained page — inline CSS/JS,
+canvas sparklines, no build step, no charting library — that polls
+`GET /api/units` every second; `create_app()` takes `simulated_units`/
+`unit_slots` so tests can spin up an app with zero or one feed instead of
+all three.
 
 ### Test tolerances are tied to real hardware constraints
 

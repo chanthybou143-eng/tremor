@@ -34,7 +34,7 @@ import random
 def generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=2.0,
                                amplitude=1.0, dc_offset=0.0,
                                noise_std=0.0, freq_ramp_hz_per_s=0.0,
-                               seed=None):
+                               seed=None, rng=None):
     """
     Generate a synthetic sampled sine wave standing in for the divided-down
     mains signal at the Pico's ADC pin.
@@ -43,10 +43,18 @@ def generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=2.0,
     drifting linearly over time) even though this module only estimates
     instantaneous frequency for now.
 
+    rng: an optional random.Random instance to draw noise from. If not
+    given, a private Random(seed) is created instead of touching the
+    global random module -- calling this from multiple threads (e.g. one
+    per simulated unit) concurrently would otherwise race on shared global
+    state, letting one caller's random.seed() reset another's in-flight
+    sequence out from under it. Pass your own long-lived rng if you want a
+    continuous (not re-seeded) stream across repeated calls.
+
     Returns (timestamps, samples) as plain lists.
     """
-    if seed is not None:
-        random.seed(seed)
+    if rng is None:
+        rng = random.Random(seed)
 
     n_samples = int(fs_hz * duration_s)
     dt = 1.0 / fs_hz
@@ -66,7 +74,7 @@ def generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=2.0,
 
         value = amplitude * math.sin(phase) + dc_offset
         if noise_std > 0.0:
-            value += random.gauss(0.0, noise_std)
+            value += rng.gauss(0.0, noise_std)
 
         timestamps.append(t)
         samples.append(value)
