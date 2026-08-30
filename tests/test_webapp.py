@@ -4,8 +4,31 @@ import time
 
 import pytest
 
-from tremor.webapp import UNIT_SLOTS, _UnitsState, create_app
+from tremor.webapp import UNIT_SLOTS, _UnitsState, _smoothed_history, create_app
 from tremor.units import UnitReading
+
+
+def test_smoothed_history_suppresses_single_cycle_spike():
+    # A stable series with one isolated outlier -- the kind of single bad
+    # cycle the hysteresis+filter pipeline occasionally still lets through
+    # (see test_units.py). The smoothed value at the spike should be much
+    # closer to its neighbours than to the raw spike itself.
+    points = [(i * 0.02, 50.0) for i in range(10)]
+    points[5] = (points[5][0], 53.0)  # single-cycle spike
+
+    smoothed = _smoothed_history(points, window_s=0.2)
+
+    assert smoothed[5][1] == pytest.approx(50.0)
+    assert len(smoothed) == len(points)
+
+
+def test_smoothed_history_preserves_a_real_trend():
+    points = [(i * 0.02, 50.0 + 0.5 * i * 0.02) for i in range(20)]  # 0.5Hz/s ramp
+
+    smoothed = _smoothed_history(points, window_s=0.2)
+
+    # A genuine trend should survive smoothing, not flatten to the mean.
+    assert smoothed[0][1] < smoothed[-1][1]
 
 
 def test_unitsstate_reports_offline_before_any_reading():

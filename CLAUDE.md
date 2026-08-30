@@ -165,7 +165,12 @@ RoCoF via `rocof.rocof_from_window()` over a 2s trailing window (longer
 than the single-unit dashboard's 500ms, since this view polls at a much
 coarser ~1s cadence). The displayed frequency is a short rolling median
 (`READOUT_WINDOW_S`), not the latest raw single-cycle reading, for the
-same jitter reason as `dashboard.py`'s `_readout_frequency()`. The frontend
+same jitter reason as `dashboard.py`'s `_readout_frequency()`. The sparkline
+history sent to the frontend is smoothed the same way (`_smoothed_history()`,
+a per-point rolling median over `SPARKLINE_SMOOTHING_WINDOW_S`) -- the raw
+per-cycle series genuinely does swing +/-0.15Hz cycle to cycle, which looks
+far jumpier plotted at full resolution than the underlying frequency
+actually is. The frontend
 (`templates/index.html`) is a single self-contained page — inline CSS/JS,
 canvas sparklines, no build step, no charting library — that polls
 `GET /api/units` every second; `create_app()` takes `simulated_units`/

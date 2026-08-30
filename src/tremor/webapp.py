@@ -33,6 +33,12 @@ ROCOF_WINDOW_S = 2.0
 # per-cycle noise (the same lesson already applied to the single-unit
 # matplotlib dashboard's readout).
 READOUT_WINDOW_S = 2.0
+# The sparkline is smoothed with the same kind of rolling median, applied
+# per-point along the whole series rather than collapsed to one number --
+# the raw per-cycle series genuinely does swing +/-0.15Hz cycle to cycle
+# (this is real noise, not a plotting bug), which reads as far jumpier
+# than the underlying frequency actually is. ~10 cycles at 50Hz.
+SPARKLINE_SMOOTHING_WINDOW_S = 0.2
 
 # All 5 planned units get a slot in the UI. Only the ones with a feed
 # registered (see SIMULATED_UNITS) show live data -- the rest render as
@@ -55,6 +61,24 @@ SIMULATED_UNITS = [
     dict(unit_id="unit-2", noise_std=0.02, dc_offset=-0.02, seed=2),
     dict(unit_id="unit-3", noise_std=0.03, dc_offset=0.0, seed=3),
 ]
+
+
+def _smoothed_history(
+    points: List[Tuple[float, float]], window_s: float = SPARKLINE_SMOOTHING_WINDOW_S
+) -> List[Tuple[float, float]]:
+    """Rolling median of ``points`` (list of ``(t, freq_hz)``) over a
+    trailing ``window_s``, one output point per input point. For display
+    only -- a two-pointer sliding window, so O(n) amortized even over the
+    full 60s history."""
+    ts = [p[0] for p in points]
+    fs = [p[1] for p in points]
+    smoothed = []
+    j = 0
+    for i in range(len(points)):
+        while ts[i] - ts[j] > window_s:
+            j += 1
+        smoothed.append((ts[i], statistics.median(fs[j : i + 1])))
+    return smoothed
 
 
 @dataclass
@@ -116,7 +140,7 @@ class _UnitsState:
                     status="live",
                     freq_hz=statistics.median(recent),
                     rocof_hz_s=slot.rocof[-1][1] if slot.rocof else 0.0,
-                    history=[list(p) for p in slot.freq],
+                    history=[list(p) for p in _smoothed_history(list(slot.freq))],
                 ))
             return out
 
