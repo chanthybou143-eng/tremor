@@ -17,6 +17,7 @@ import subprocess
 import sys
 import os
 import threading
+import time
 from collections import deque
 
 import matplotlib
@@ -35,18 +36,22 @@ MAX_POINTS = int(WINDOW_SECONDS / SAMPLE_INTERVAL_S)
 
 buf = deque(maxlen=MAX_POINTS)
 buf_lock = threading.Lock()
+status = {"connected": False, "proc": None}
+RECONNECT_DELAY_S = 1.0  # give the USB device a moment to re-enumerate
 
-# mpremote's console-script entry point isn't guaranteed to be on PATH (it
-# wasn't in this environment -- it's pip-installed under
-# ~/Library/Python/3.9/bin, which isn't on PATH), so invoke it as a module
-# via the current interpreter instead of relying on shell PATH resolution.
-proc = subprocess.Popen(
-    [sys.executable, "-m", "mpremote", "connect", PORT, "run", SCRIPT],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-    bufsize=1,
-)
+def _spawn():
+    # mpremote's console-script entry point isn't guaranteed to be on PATH
+    # (it wasn't in this environment -- it's pip-installed under
+    # ~/Library/Python/3.9/bin, which isn't on PATH), so invoke it as a
+    # module via the current interpreter instead of relying on shell PATH
+    # resolution.
+    return subprocess.Popen(
+        [sys.executable, "-m", "mpremote", "connect", PORT, "run", SCRIPT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
 def _reader():
     # proc.stdout.readline() blocks until a line arrives, so draining it
@@ -58,14 +63,31 @@ def _reader():
     # continuously in a background thread and let the UI just snapshot
     # whatever's accumulated, the same producer/consumer split used
     # elsewhere in this project's live dashboards.
-    for line_text in proc.stdout:
-        line_text = line_text.strip()
-        try:
-            value = float(line_text)
-        except ValueError:
-            continue  # skip banner / non-numeric lines from mpremote
-        with buf_lock:
-            buf.append(value)
+    #
+    # The outer while loop handles a dropped USB connection: a jostled
+    # cable or EMI can make macOS briefly re-enumerate the device (seen
+    # in practice -- "hardware connection lost" immediately followed by
+    # re-enumeration in the system log), which kills mpremote's subprocess
+    # silently. Without this, the plot would just freeze on its last frame
+    # forever with no indication anything was wrong, indistinguishable
+    # from the signal genuinely going flat.
+    while True:
+        proc = _spawn()
+        status["proc"] = proc
+        status["connected"] = True
+
+        for line_text in proc.stdout:
+            line_text = line_text.strip()
+            try:
+                value = float(line_text)
+            except ValueError:
+                continue  # skip banner / non-numeric lines from mpremote
+            with buf_lock:
+                buf.append(value)
+
+        status["connected"] = False
+        proc.wait()
+        time.sleep(RECONNECT_DELAY_S)
 
 reader_thread = threading.Thread(target=_reader, daemon=True)
 reader_thread.start()
@@ -83,6 +105,13 @@ def update(_frame):
         ys = list(buf)
     line.set_data(range(len(ys)), ys)
     ax.set_xlim(0, max(MAX_POINTS, 1))
+
+    if status["connected"]:
+        ax.set_title("TREMOR — live GP26 ADC waveform")
+        line.set_color("tab:blue")
+    else:
+        ax.set_title("TREMOR — RECONNECTING to Pico...")
+        line.set_color("tab:red")
     return line,
 
 ani = animation.FuncAnimation(fig, update, interval=30, blit=False, cache_frame_data=False)
@@ -90,4 +119,5 @@ ani = animation.FuncAnimation(fig, update, interval=30, blit=False, cache_frame_
 try:
     plt.show()
 finally:
-    proc.terminate()
+    if status["proc"] is not None:
+        status["proc"].terminate()
