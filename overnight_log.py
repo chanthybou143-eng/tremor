@@ -14,9 +14,25 @@ other):
     logs/frequency_<run_id>.csv   one row per chunk: timestamp, elapsed_s,
                                    frequency_hz, amplitude_v, min_v, max_v,
                                    n_cycles
-    logs/events_<run_id>.csv      one row per connection state change:
-                                   timestamp, elapsed_s, event
-                                   (event is "disconnected" or "reconnected")
+    logs/events_<run_id>.csv      one row per connection state change or
+                                   suspected sleep gap: timestamp, elapsed_s,
+                                   event (event is "disconnected",
+                                   "reconnected", or "possible_sleep_gap_Ns")
+
+A real disconnect/reconnect (mpremote's subprocess dying and respawning) is
+not the only way an overnight run can silently lose data: if the machine
+itself sleeps, the whole process tree freezes with it -- mpremote never
+crashes, so no disconnect event fires, but no samples arrive either for
+however long the sleep lasted. That gap is only visible as a mismatch
+between wall-clock time (which keeps advancing through a sleep, once the
+machine wakes and the OS clock catches up) and monotonic time (which
+freezes along with the process, since time.monotonic() on macOS is
+implemented as mach_absolute_time(), which pauses during actual system
+sleep). _check_sleep_gap() compares the two once per loop iteration and
+logs a "possible_sleep_gap_Ns" event when wall-clock time has run far ahead
+of monotonic time with no corresponding disconnect event to explain it --
+this was discovered and measured (~20 minutes silently lost, unlogged,
+across five gaps in a single ~1hr test run) before this heuristic existed.
 
 Kept as two separate files rather than one CSV with a "row type" column so
 each stays a flat, uniform-width table that loads trivially later (e.g.
@@ -68,6 +84,8 @@ BUTTER_ORDER = 4
 BUTTER_CUTOFF_HZ = 68.0      # see live_frequency.py: clears the ~150Hz 3rd harmonic
 HYSTERESIS_FRACTION = 0.05   # of RMS amplitude, on the *filtered* signal
 RECONNECT_DELAY_S = 1.0
+SLEEP_GAP_THRESHOLD_S = 5.0  # see _check_sleep_gap: comfortably above normal
+                             # ~1s cadence, comfortably below any real gap seen
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -152,6 +170,23 @@ def _drain_events():
     return events
 
 
+def _check_sleep_gap(last_wall, last_monotonic):
+    """Compare wall-clock elapsed time against monotonic elapsed time since
+    the last check. A real disconnect/reconnect still advances both clocks
+    together at their normal rate (the process keeps looping, just without
+    samples), so this only fires for the specific "the whole machine was
+    asleep" signature: monotonic time barely moved while wall-clock time
+    jumped. Returns (gap_s or None, new_last_wall, new_last_monotonic)."""
+    now_wall = datetime.now(timezone.utc)
+    now_monotonic = time.monotonic()
+    wall_delta = (now_wall - last_wall).total_seconds()
+    monotonic_delta = now_monotonic - last_monotonic
+    gap_s = wall_delta - monotonic_delta
+    if gap_s <= SLEEP_GAP_THRESHOLD_S:
+        gap_s = None
+    return gap_s, now_wall, now_monotonic
+
+
 def _flush_row(writer, f, row):
     writer.writerow(row)
     f.flush()
@@ -187,6 +222,8 @@ def main():
 
         start = time.monotonic()
         butter_state = {"b": None, "a": None, "zi": None}
+        last_wall = datetime.now(timezone.utc)
+        last_monotonic = start
 
         try:
             while RUN_SECONDS <= 0 or time.monotonic() - start < RUN_SECONDS:
@@ -202,6 +239,13 @@ def main():
                     butter_state.update(b=None, a=None, zi=None)
 
                 chunk = _drain_chunk(CHUNK_S)
+
+                gap_s, last_wall, last_monotonic = _check_sleep_gap(last_wall, last_monotonic)
+                if gap_s is not None:
+                    event = f"possible_sleep_gap_{gap_s:.0f}s"
+                    print(f"[{elapsed:7.1f}s] EVENT: {event}")
+                    _flush_row(events_writer, events_f, [_iso_now(), f"{elapsed:.3f}", event])
+                    butter_state.update(b=None, a=None, zi=None)
                 if not chunk:
                     state = "reconnecting" if not status["connected"] else "no samples"
                     print(f"[{elapsed:7.1f}s] {state} -- waiting for data")
