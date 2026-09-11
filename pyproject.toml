@@ -43,3 +43,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 tremor = ["templates/*.html"]
+
+[tool.pytest.ini_options]
+# Without this, pytest's default discovery walks the whole repo and tries
+# to collect repo-root Pico-side scripts whose names happen to match its
+# *_test.py pattern (e.g. gps_uart_test.py) -- those import `machine` and
+# other MicroPython-only modules, so collection fails on the host. All
+# real tests live in tests/; nothing at the repo root is meant to run here.
+testpaths = ["tests"]
