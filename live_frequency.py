@@ -8,13 +8,24 @@ freq_estimator.estimate_frequency -- the zero-crossing + hysteresis estimator
 already validated against synthetic 50Hz data in tests/test_freq_estimator.py
 -- to print a live grid frequency reading.
 
-adc_stream_timed.py (not adc_stream.py) is used here because the estimator
-needs real per-sample timestamps: it infers sample rate from consecutive
-timestamps to size its noise pre-filter, and a nominal "2kHz" assumption
-(from adc_stream.py's time.sleep_us(500)) is wrong once print()/USB latency
-is folded in -- the real measured rate on this hardware is ~1030Hz, not
-2000Hz. adc_stream.py is left untouched so live_plot.py keeps working as
-before.
+adc_stream_gps.py (not adc_stream.py, and no longer adc_stream_timed.py by
+default) is used here because the estimator needs real per-sample
+timestamps: it infers sample rate from consecutive timestamps to size its
+noise pre-filter, and a nominal "2kHz" assumption (from adc_stream.py's
+time.sleep_us(500)) is wrong once print()/USB latency is folded in -- the
+real measured rate on this hardware is ~1030Hz, not 2000Hz. adc_stream.py
+is left untouched so live_plot.py keeps working as before.
+
+_parse_sample_line() accepts either of the two wire schemas that can
+arrive on stdout: adc_stream_timed.py's 2-field "t_us,voltage" (no GPS)
+and adc_stream_gps.py's 3-field "t_us,raw_u16,utc_s" (raw ADC counts +
+GPS UTC seconds-of-day, blank until PPS sync). Both are normalised to
+(t_s, voltage, gps_utc_s) before reaching the queue, so the rest of the
+pipeline doesn't care which schema is live. Earlier this script only
+handled the 2-field schema and pointed at adc_stream_timed.py by default
+-- pointed at adc_stream_gps.py's output, split(",", 1) folded the
+raw/utc fields together into one un-parseable string and float() raised
+on every single line, silently dropping all samples.
 
 Why a 4th-order Butterworth pre-filter instead of freq_estimator's own
 moving-average (filter_window_s):
@@ -59,7 +70,7 @@ Usage:
 
 Defaults:
     port              /dev/cu.usbmodem101
-    adc_stream_path   adc_stream_timed.py (same folder as this script)
+    adc_stream_path   adc_stream_gps.py (same folder as this script)
     run_seconds       35 (milestone 4 asks for >=30s of stable readings)
 """
 
@@ -78,7 +89,7 @@ from freq_estimator import estimate_frequency
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/cu.usbmodem101"
 SCRIPT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "adc_stream_timed.py"
+    os.path.dirname(os.path.abspath(__file__)), "adc_stream_gps.py"
 )
 RUN_SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 35.0
 
@@ -91,6 +102,39 @@ RECONNECT_DELAY_S = 1.0
 
 sample_q = queue.Queue()
 status = {"connected": False, "proc": None}
+
+
+def _parse_sample_line(line_text):
+    """Parse one stdout line from either adc_stream_timed.py (2-field
+    "t_us,voltage") or adc_stream_gps.py (3-field "t_us,raw_u16,utc_s").
+    Returns (t_s, voltage, gps_utc_s) or None for non-data lines (mpremote
+    banners, blank lines) or malformed fields. gps_utc_s is None for the
+    2-field schema or before GPS/PPS sync (adc_stream_gps.py prints an
+    empty utc field until then)."""
+    fields = line_text.split(",")
+    if len(fields) == 2:
+        t_field, value_field, utc_field = fields[0], fields[1], ""
+    elif len(fields) == 3:
+        t_field, value_field, utc_field = fields
+    else:
+        return None
+    try:
+        t_s = int(t_field) / 1e6
+        voltage = float(value_field) if len(fields) == 2 else int(value_field) * 3.3 / 65535
+        gps_utc_s = float(utc_field) if utc_field else None
+    except ValueError:
+        return None
+    return t_s, voltage, gps_utc_s
+
+
+def _format_gps_utc(utc_s):
+    if utc_s is None:
+        return "no GPS sync"
+    total_ms = round(utc_s * 1000)
+    h, rem_ms = divmod(total_ms, 3_600_000)
+    m, rem_ms = divmod(rem_ms, 60_000)
+    s, ms = divmod(rem_ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d} UTC"
 
 
 def _spawn():
@@ -113,16 +157,10 @@ def _reader():
         status["connected"] = True
 
         for line_text in proc.stdout:
-            line_text = line_text.strip()
-            if "," not in line_text:
-                continue  # skip banner / non-data lines from mpremote
-            t_field, v_field = line_text.split(",", 1)
-            try:
-                t_s = int(t_field) / 1e6
-                voltage = float(v_field)
-            except ValueError:
-                continue
-            sample_q.put((t_s, voltage))
+            parsed = _parse_sample_line(line_text.strip())
+            if parsed is None:
+                continue  # skip banner / non-data / malformed lines from mpremote
+            sample_q.put(parsed)
 
         status["connected"] = False
         proc.wait()
@@ -191,8 +229,9 @@ def main():
             print(f"[{elapsed:5.1f}s] {state} -- waiting for data")
             continue
 
-        timestamps = [t for t, _ in chunk]
-        raw_voltages = np.array([v for _, v in chunk])
+        timestamps = [t for t, _, _ in chunk]
+        raw_voltages = np.array([v for _, v, _ in chunk])
+        gps_utc_values = [u for _, _, u in chunk if u is not None]
         span_s = timestamps[-1] - timestamps[0]
         fs_est = (len(chunk) - 1) / span_s if span_s > 0 else float("nan")
 
@@ -229,8 +268,9 @@ def main():
         chunk_median = statistics.median(f for _, f in per_cycle)
         in_range = SANITY_MIN_HZ <= chunk_median <= SANITY_MAX_HZ
         flag = "" if in_range else "  <-- OUT OF RANGE"
+        utc_label = _format_gps_utc(gps_utc_values[-1] if gps_utc_values else None)
         print(f"[{elapsed:5.1f}s] {chunk_median:8.4f} Hz "
-              f"({len(per_cycle)} cycles){flag}")
+              f"({len(per_cycle)} cycles) gps={utc_label}{flag}")
         if not in_range:
             _diagnose(chunk, dc_offset, hysteresis, amplitude, fs_est)
 

@@ -12,8 +12,14 @@ unattended, including multiple USB drops/reconnects.
 Two output files per run (timestamped so repeated runs never clobber each
 other):
     logs/frequency_<run_id>.csv   one row per chunk: timestamp, elapsed_s,
-                                   frequency_hz, amplitude_v, min_v, max_v,
-                                   n_cycles
+                                   gps_utc_s, frequency_hz, amplitude_v,
+                                   min_v, max_v, n_cycles ("timestamp" is
+                                   the host's own wall clock at write time,
+                                   same as before; "gps_utc_s" is the
+                                   GPS/PPS-derived UTC seconds-of-day from
+                                   the chunk's last sample, blank until the
+                                   unit has PPS sync -- see
+                                   _parse_sample_line())
     logs/events_<run_id>.csv      one row per connection state change or
                                    suspected sleep gap: timestamp, elapsed_s,
                                    event (event is "disconnected",
@@ -47,12 +53,22 @@ lose already-logged data -- this is the same property test_frequency's
 "auto-reconnect" fix cares about, just extended to the log file as well as
 the live plot.
 
+_parse_sample_line() (same helper as live_frequency.py -- see that
+module's docstring for the full story) accepts either wire schema that
+can arrive on stdout: adc_stream_timed.py's 2-field "t_us,voltage" (no
+GPS) or adc_stream_gps.py's 3-field "t_us,raw_u16,utc_s" (raw ADC counts
++ GPS UTC seconds-of-day, blank until PPS sync). Pointed at
+adc_stream_gps.py's output, the old 2-field-only parser folded the
+raw/utc fields together and float() raised on every line, silently
+dropping all samples -- this is why adc_stream_gps.py is now the default
+below instead of adc_stream_timed.py.
+
 Usage:
     python3 overnight_log.py [port] [adc_stream_path] [run_seconds]
 
 Defaults:
     port              /dev/cu.usbmodem101
-    adc_stream_path   adc_stream_timed.py (same folder as this script)
+    adc_stream_path   adc_stream_gps.py (same folder as this script)
     run_seconds       0 (run forever; pass a number to stop after N seconds,
                        used for the short test runs before the real
                        overnight run)
@@ -75,7 +91,7 @@ from freq_estimator import estimate_frequency
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "/dev/cu.usbmodem101"
 SCRIPT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "adc_stream_timed.py"
+    os.path.dirname(os.path.abspath(__file__)), "adc_stream_gps.py"
 )
 RUN_SECONDS = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0  # 0 = forever
 
@@ -99,6 +115,29 @@ status = {"connected": False, "proc": None}
 
 def _iso_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_sample_line(line_text):
+    """Parse one stdout line from either adc_stream_timed.py (2-field
+    "t_us,voltage") or adc_stream_gps.py (3-field "t_us,raw_u16,utc_s").
+    Returns (t_s, voltage, gps_utc_s) or None for non-data lines (mpremote
+    banners, blank lines) or malformed fields. gps_utc_s is None for the
+    2-field schema or before GPS/PPS sync (adc_stream_gps.py prints an
+    empty utc field until then)."""
+    fields = line_text.split(",")
+    if len(fields) == 2:
+        t_field, value_field, utc_field = fields[0], fields[1], ""
+    elif len(fields) == 3:
+        t_field, value_field, utc_field = fields
+    else:
+        return None
+    try:
+        t_s = int(t_field) / 1e6
+        voltage = float(value_field) if len(fields) == 2 else int(value_field) * 3.3 / 65535
+        gps_utc_s = float(utc_field) if utc_field else None
+    except ValueError:
+        return None
+    return t_s, voltage, gps_utc_s
 
 
 def _spawn():
@@ -128,16 +167,10 @@ def _reader():
         first_connection = False
 
         for line_text in proc.stdout:
-            line_text = line_text.strip()
-            if "," not in line_text:
-                continue  # skip banner / non-data lines from mpremote
-            t_field, v_field = line_text.split(",", 1)
-            try:
-                t_s = int(t_field) / 1e6
-                voltage = float(v_field)
-            except ValueError:
-                continue
-            sample_q.put((t_s, voltage))
+            parsed = _parse_sample_line(line_text.strip())
+            if parsed is None:
+                continue  # skip banner / non-data / malformed lines from mpremote
+            sample_q.put(parsed)
 
         status["connected"] = False
         event_q.put((_iso_now(), "disconnected"))
@@ -214,8 +247,8 @@ def main():
         events_writer = csv.writer(events_f)
         if freq_f.tell() == 0:
             _flush_row(freq_writer, freq_f, [
-                "timestamp", "elapsed_s", "frequency_hz", "amplitude_v",
-                "min_v", "max_v", "n_cycles",
+                "timestamp", "elapsed_s", "gps_utc_s", "frequency_hz",
+                "amplitude_v", "min_v", "max_v", "n_cycles",
             ])
         if events_f.tell() == 0:
             _flush_row(events_writer, events_f, ["timestamp", "elapsed_s", "event"])
@@ -251,8 +284,9 @@ def main():
                     print(f"[{elapsed:7.1f}s] {state} -- waiting for data")
                     continue
 
-                timestamps = [t for t, _ in chunk]
-                raw_voltages = np.array([v for _, v in chunk])
+                timestamps = [t for t, _, _ in chunk]
+                raw_voltages = np.array([v for _, v, _ in chunk])
+                gps_utc_values = [u for _, _, u in chunk if u is not None]
                 span_s = timestamps[-1] - timestamps[0]
                 fs_est = (len(chunk) - 1) / span_s if span_s > 0 else float("nan")
 
@@ -287,11 +321,14 @@ def main():
                     continue
 
                 freq_hz = statistics.median(f for _, f in per_cycle)
+                gps_utc_s = gps_utc_values[-1] if gps_utc_values else None
+                gps_utc_field = "" if gps_utc_s is None else f"{gps_utc_s:.3f}"
                 print(f"[{elapsed:7.1f}s] {freq_hz:8.4f} Hz "
-                      f"({len(per_cycle)} cycles, amp {amplitude:.4f}V)")
+                      f"({len(per_cycle)} cycles, amp {amplitude:.4f}V) "
+                      f"gps_utc={gps_utc_field or 'no sync'}")
 
                 _flush_row(freq_writer, freq_f, [
-                    _iso_now(), f"{elapsed:.3f}", f"{freq_hz:.4f}",
+                    _iso_now(), f"{elapsed:.3f}", gps_utc_field, f"{freq_hz:.4f}",
                     f"{amplitude:.5f}", f"{min(filtered):.5f}",
                     f"{max(filtered):.5f}", len(per_cycle),
                 ])
