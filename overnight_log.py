@@ -9,8 +9,8 @@ instead of printing to the console it appends every chunk's reading to a
 CSV file and keeps running indefinitely -- designed to survive hours
 unattended, including multiple USB drops/reconnects.
 
-Two output files per run (timestamped so repeated runs never clobber each
-other):
+Three output files per run (timestamped so repeated runs never clobber
+each other):
     logs/frequency_<run_id>.csv   one row per chunk: timestamp, elapsed_s,
                                    gps_utc_s, frequency_hz, amplitude_v,
                                    min_v, max_v, n_cycles ("timestamp" is
@@ -24,6 +24,32 @@ other):
                                    suspected sleep gap: timestamp, elapsed_s,
                                    event (event is "disconnected",
                                    "reconnected", or "possible_sleep_gap_Ns")
+    logs/raw_snippets_<run_id>.csv   one row per raw sample, but only during
+                                   a short snippet captured every
+                                   RAW_SNIPPET_INTERVAL_S: snippet_id, t_s,
+                                   voltage_v. t_s is the device's own
+                                   per-sample clock (from adc_stream_gps.py's
+                                   t_us field), so sample-to-sample spacing
+                                   within one snippet_id is exact even though
+                                   it isn't host wall-clock time -- see
+                                   _iso_now()-stamped "raw_snippet_N_saved"
+                                   events in events_<run_id>.csv for when
+                                   each snippet was actually taken.
+
+The per-chunk summary (frequency_hz, amplitude_v, min_v, max_v) is all this
+script has ever kept -- raw_voltages and filtered are chunk-local variables,
+discarded once the summary row is written, so there was previously no way
+to ask a question like "does the ~150Hz 3rd harmonic's size relative to the
+50Hz fundamental change with grid noise conditions" from an already-finished
+run's log. Saving every sample all night would run to tens of GB at
+~1030Hz; RAW_SNIPPET_DURATION_S (~5s, ~5000 samples) per
+RAW_SNIPPET_INTERVAL_S (5 min) keeps a whole overnight run's raw snippets in
+the tens-of-MB range while giving ~0.2Hz FFT bin resolution -- comfortably
+enough to separate the 50Hz fundamental from its ~150Hz 3rd harmonic. A
+snippet in progress when a disconnect/reconnect fires is discarded, not
+saved: adc_stream_gps.py's t0 (and therefore every t_us it prints) resets
+to zero when the on-device script restarts after a reconnect, so a snippet
+spanning that boundary would have a corrupt, non-monotonic time axis.
 
 A real disconnect/reconnect (mpremote's subprocess dying and respawning) is
 not the only way an overnight run can silently lose data: if the machine
@@ -40,12 +66,15 @@ of monotonic time with no corresponding disconnect event to explain it --
 this was discovered and measured (~20 minutes silently lost, unlogged,
 across five gaps in a single ~1hr test run) before this heuristic existed.
 
-Kept as two separate files rather than one CSV with a "row type" column so
+Kept as separate files rather than one CSV with a "row type" column so
 each stays a flat, uniform-width table that loads trivially later (e.g.
 pandas.read_csv with no special-casing) -- exactly the "gap because of a
 USB drop" vs "genuinely no data" distinction the plotting script
 (plot_frequency_log.py) needs comes from joining frequency rows against
-events rows by timestamp, not from parsing mixed row shapes.
+events rows by timestamp, not from parsing mixed row shapes. Same reasoning
+extends to raw_snippets_<run_id>.csv: a totally different row shape
+(per-sample, not per-chunk) that would force special-casing onto every
+existing reader if it shared a file with either of the other two.
 
 Every row is flushed and fsync'd immediately after writing specifically so
 a kill of the mpremote subprocess (or a real overnight power blip) can't
@@ -103,10 +132,14 @@ RECONNECT_DELAY_S = 1.0
 SLEEP_GAP_THRESHOLD_S = 5.0  # see _check_sleep_gap: comfortably above normal
                              # ~1s cadence, comfortably below any real gap seen
 
+RAW_SNIPPET_INTERVAL_S = 300  # how often a raw snippet capture starts
+RAW_SNIPPET_DURATION_S = 5    # ~5000 samples at ~1030Hz -- see module docstring
+
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 FREQ_LOG_PATH = os.path.join(LOG_DIR, f"frequency_{RUN_ID}.csv")
 EVENTS_LOG_PATH = os.path.join(LOG_DIR, f"events_{RUN_ID}.csv")
+RAW_SNIPPET_LOG_PATH = os.path.join(LOG_DIR, f"raw_snippets_{RUN_ID}.csv")
 
 sample_q = queue.Queue()
 event_q = queue.Queue()
@@ -226,6 +259,16 @@ def _flush_row(writer, f, row):
     os.fsync(f.fileno())
 
 
+def _flush_rows(writer, f, rows):
+    # One flush+fsync for the whole batch, not per row -- a raw snippet is
+    # ~5000 rows, and fsyncing each individually (as _flush_row does for the
+    # once-a-second summary/event rows) would stall the main loop for
+    # seconds every RAW_SNIPPET_INTERVAL_S for no benefit here.
+    writer.writerows(rows)
+    f.flush()
+    os.fsync(f.fileno())
+
+
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -235,16 +278,20 @@ def main():
     print(f"Connecting to Pico at {PORT}, running {SCRIPT} ...")
     print(f"Logging frequency to {FREQ_LOG_PATH}")
     print(f"Logging connection events to {EVENTS_LOG_PATH}")
+    print(f"Logging raw snippets ({RAW_SNIPPET_DURATION_S:.0f}s every "
+          f"{RAW_SNIPPET_INTERVAL_S:.0f}s) to {RAW_SNIPPET_LOG_PATH}")
     if RUN_SECONDS > 0:
         print(f"Will stop after {RUN_SECONDS:.0f}s (test mode).\n")
     else:
         print("Running until interrupted (Ctrl+C) -- this is the overnight mode.\n")
 
     with open(FREQ_LOG_PATH, "a", newline="") as freq_f, \
-         open(EVENTS_LOG_PATH, "a", newline="") as events_f:
+         open(EVENTS_LOG_PATH, "a", newline="") as events_f, \
+         open(RAW_SNIPPET_LOG_PATH, "a", newline="") as snippet_f:
 
         freq_writer = csv.writer(freq_f)
         events_writer = csv.writer(events_f)
+        snippet_writer = csv.writer(snippet_f)
         if freq_f.tell() == 0:
             _flush_row(freq_writer, freq_f, [
                 "timestamp", "elapsed_s", "gps_utc_s", "frequency_hz",
@@ -252,11 +299,18 @@ def main():
             ])
         if events_f.tell() == 0:
             _flush_row(events_writer, events_f, ["timestamp", "elapsed_s", "event"])
+        if snippet_f.tell() == 0:
+            _flush_row(snippet_writer, snippet_f, ["snippet_id", "t_s", "voltage_v"])
 
         start = time.monotonic()
         butter_state = {"b": None, "a": None, "zi": None}
         last_wall = datetime.now(timezone.utc)
         last_monotonic = start
+        snippet_id = 0
+        snippet_collecting = False
+        snippet_rows = []
+        snippet_span_s = 0.0
+        next_snippet_at = 0.0  # 0 => the first chunk starts collecting immediately
 
         try:
             while RUN_SECONDS <= 0 or time.monotonic() - start < RUN_SECONDS:
@@ -270,6 +324,10 @@ def main():
                     # that, so force a redesign+reseed from the next chunk's
                     # own data rather than carrying stale state across it.
                     butter_state.update(b=None, a=None, zi=None)
+                    if snippet_collecting:
+                        print(f"[{elapsed:7.1f}s] discarding in-progress raw "
+                              f"snippet {snippet_id} (reconnect mid-capture)")
+                        snippet_collecting = False
 
                 chunk = _drain_chunk(CHUNK_S)
 
@@ -279,6 +337,10 @@ def main():
                     print(f"[{elapsed:7.1f}s] EVENT: {event}")
                     _flush_row(events_writer, events_f, [_iso_now(), f"{elapsed:.3f}", event])
                     butter_state.update(b=None, a=None, zi=None)
+                    if snippet_collecting:
+                        print(f"[{elapsed:7.1f}s] discarding in-progress raw "
+                              f"snippet {snippet_id} (sleep gap mid-capture)")
+                        snippet_collecting = False
                 if not chunk:
                     state = "reconnecting" if not status["connected"] else "no samples"
                     print(f"[{elapsed:7.1f}s] {state} -- waiting for data")
@@ -289,6 +351,32 @@ def main():
                 gps_utc_values = [u for _, _, u in chunk if u is not None]
                 span_s = timestamps[-1] - timestamps[0]
                 fs_est = (len(chunk) - 1) / span_s if span_s > 0 else float("nan")
+
+                # Raw snippet capture: periodically stash a few seconds of
+                # unfiltered voltage for offline spectral analysis (see
+                # module docstring). Uses this chunk's already-computed
+                # raw_voltages/timestamps -- no extra sampling, just an
+                # extra thing done with data already in hand.
+                if not snippet_collecting and elapsed >= next_snippet_at:
+                    snippet_collecting = True
+                    snippet_id += 1
+                    snippet_rows = []
+                    snippet_span_s = 0.0
+
+                if snippet_collecting:
+                    snippet_rows.extend(
+                        (snippet_id, f"{t:.6f}", f"{v:.5f}")
+                        for t, v in zip(timestamps, raw_voltages)
+                    )
+                    snippet_span_s += span_s
+                    if snippet_span_s >= RAW_SNIPPET_DURATION_S:
+                        _flush_rows(snippet_writer, snippet_f, snippet_rows)
+                        event = f"raw_snippet_{snippet_id}_saved"
+                        print(f"[{elapsed:7.1f}s] EVENT: {event} "
+                              f"({len(snippet_rows)} samples, {snippet_span_s:.1f}s)")
+                        _flush_row(events_writer, events_f, [_iso_now(), f"{elapsed:.3f}", event])
+                        snippet_collecting = False
+                        next_snippet_at = elapsed + RAW_SNIPPET_INTERVAL_S
 
                 # Butterworth filter is (re)designed whenever we don't have
                 # one yet -- covers both the very first chunk and any chunk
@@ -340,6 +428,7 @@ def main():
 
     print(f"\nDone. Frequency log: {FREQ_LOG_PATH}")
     print(f"Events log: {EVENTS_LOG_PATH}")
+    print(f"Raw snippets log: {RAW_SNIPPET_LOG_PATH}")
 
 
 if __name__ == "__main__":
