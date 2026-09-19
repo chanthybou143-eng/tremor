@@ -80,10 +80,10 @@
   }
   .reading.freq .value { color: var(--accent); }
   .reading.rocof .value { color: var(--accent-rocof); }
-  canvas {
+  .chart-container {
+    position: relative;
     width: 100%;
-    height: 240px;
-    display: block;
+    height: 360px;
   }
   .no-data {
     color: var(--muted);
@@ -92,6 +92,7 @@
     text-align: center;
   }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <h1>TREMOR — Unit Dashboard</h1>
@@ -102,6 +103,13 @@
 const POLL_MS = 1000;
 const grid = document.getElementById('grid');
 const cardsById = {};
+const chartsById = {};
+
+// Dark-theme defaults for every chart on the page, set once -- Chart.js's
+// own defaults are dark text/gridlines, invisible against this page's
+// dark background otherwise.
+Chart.defaults.color = '#8a919b';       // matches --muted
+Chart.defaults.borderColor = 'rgba(255, 255, 255, 0.08)'; // light, subtle gridlines
 
 function makeCard(unit) {
   const card = document.createElement('div');
@@ -121,46 +129,96 @@ function makeCard(unit) {
         <div class="unit">Hz/s</div>
       </div>
     </div>
-    <canvas width="960" height="240"></canvas>
+    <div class="chart-container"><canvas></canvas></div>
     <div class="no-data" hidden>No data yet</div>
   `;
   grid.appendChild(card);
+
+  const canvas = card.querySelector('canvas');
+  chartsById[unit.id] = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: {
+      datasets: [
+        {
+          label: 'Frequency (Hz)',
+          data: [],
+          borderColor: '#4da3ff',        // matches --accent
+          backgroundColor: '#4da3ff',
+          yAxisID: 'yFreq',
+          pointRadius: 0,
+          borderWidth: 1.5,
+        },
+        {
+          label: 'RoCoF (Hz/s)',
+          data: [],
+          borderColor: '#ff9f4d',        // matches --accent-rocof
+          backgroundColor: '#ff9f4d',
+          yAxisID: 'yRocof',
+          pointRadius: 0,
+          borderWidth: 1.5,
+        },
+        {
+          label: '',                     // hidden from the legend (see filter below)
+          data: [],
+          borderColor: '#3a4048',
+          borderDash: [4, 4],
+          borderWidth: 1,
+          pointRadius: 0,
+          yAxisID: 'yFreq',
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,                  // avoid jank re-animating on every 1s poll
+      parsing: false,                    // data points are already {x, y}
+      interaction: { mode: 'nearest', intersect: false },
+      plugins: {
+        legend: {
+          labels: { filter: (item) => item.text !== '' },
+        },
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          title: { display: true, text: 'Seconds ago' },
+        },
+        yFreq: {
+          type: 'linear',
+          position: 'left',
+          title: { display: true, text: 'Frequency (Hz)' },
+        },
+        yRocof: {
+          type: 'linear',
+          position: 'right',
+          title: { display: true, text: 'RoCoF (Hz/s)' },
+          grid: { drawOnChartArea: false }, // avoid two overlapping gridlines
+        },
+      },
+    },
+  });
+
   return card;
 }
 
-function drawSparkline(canvas, history) {
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
-  if (history.length < 2) return;
+function updateChart(chart, unit) {
+  const freqHistory = unit.history || [];
+  const rocofHistory = unit.rocof_history || [];
+  if (freqHistory.length === 0 && rocofHistory.length === 0) return;
 
-  const freqs = history.map(p => p[1]);
-  const lo = Math.min(...freqs), hi = Math.max(...freqs);
-  const span = Math.max(hi - lo, 0.05); // floor so a near-flat line isn't jittery
-  const mid = (hi + lo) / 2;
-  const yMin = mid - span, yMax = mid + span;
+  const latestT = Math.max(
+    freqHistory.length ? freqHistory[freqHistory.length - 1][0] : -Infinity,
+    rocofHistory.length ? rocofHistory[rocofHistory.length - 1][0] : -Infinity,
+  );
 
-  const t0 = history[0][0], t1 = history[history.length - 1][0];
-  const tSpan = Math.max(t1 - t0, 1e-6);
+  chart.data.datasets[0].data = freqHistory.map(([t, f]) => ({ x: t - latestT, y: f }));
+  chart.data.datasets[1].data = rocofHistory.map(([t, r]) => ({ x: t - latestT, y: r }));
 
-  ctx.strokeStyle = '#4da3ff';
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  history.forEach(([t, f], i) => {
-    const x = ((t - t0) / tSpan) * w;
-    const y = h - ((f - yMin) / (yMax - yMin)) * h;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  });
-  ctx.stroke();
+  const xMin = chart.data.datasets[0].data.length ? chart.data.datasets[0].data[0].x : -60;
+  chart.data.datasets[2].data = [{ x: xMin, y: 50.0 }, { x: 0, y: 50.0 }]; // 50Hz reference line
 
-  ctx.strokeStyle = '#3a4048';
-  ctx.setLineDash([2, 3]);
-  ctx.beginPath();
-  const yMidPx = h - ((50.0 - yMin) / (yMax - yMin)) * h;
-  ctx.moveTo(0, yMidPx);
-  ctx.lineTo(w, yMidPx);
-  ctx.stroke();
-  ctx.setLineDash([]);
+  chart.update('none'); // 'none' = skip animation
 }
 
 function updateCard(card, unit) {
@@ -171,17 +229,17 @@ function updateCard(card, unit) {
   card.classList.toggle('offline', unit.status !== 'live');
 
   const noData = card.querySelector('.no-data');
-  const canvas = card.querySelector('canvas');
+  const chartContainer = card.querySelector('.chart-container');
   const readings = card.querySelector('.readings');
 
   if (unit.status !== 'live') {
     noData.hidden = false;
-    canvas.hidden = true;
+    chartContainer.hidden = true;
     readings.hidden = true;
     return;
   }
   noData.hidden = true;
-  canvas.hidden = false;
+  chartContainer.hidden = false;
   readings.hidden = false;
 
   card.querySelector('.reading.freq .value').textContent = unit.freq_hz.toFixed(3);
@@ -189,7 +247,7 @@ function updateCard(card, unit) {
   card.querySelector('.reading.rocof .value').textContent =
     (rocof >= 0 ? '+' : '') + rocof.toFixed(3);
 
-  drawSparkline(canvas, unit.history);
+  updateChart(chartsById[unit.id], unit);
 }
 
 async function poll() {

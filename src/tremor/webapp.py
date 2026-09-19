@@ -146,7 +146,7 @@ class _UnitsState:
                 if not slot.freq:
                     out.append(dict(
                         id=slot.unit_id, label=slot.label, status="offline",
-                        freq_hz=None, rocof_hz_s=None, history=[],
+                        freq_hz=None, rocof_hz_s=None, history=[], rocof_history=[],
                         amplitude_v=None, gps_utc_s=None,
                     ))
                     continue
@@ -162,6 +162,10 @@ class _UnitsState:
                     freq_hz=statistics.median(recent),
                     rocof_hz_s=slot.rocof[-1][1] if slot.rocof else 0.0,
                     history=[list(p) for p in _smoothed_history(list(slot.freq))],
+                    # Not smoothed like history -- rocof_from_window's least-squares
+                    # fit over ROCOF_WINDOW_S is already far less noisy than raw
+                    # per-cycle frequency, so there's nothing extra to gain here.
+                    rocof_history=[list(p) for p in slot.rocof],
                     amplitude_v=statistics.median(recent_amplitude) if recent_amplitude else None,
                     gps_utc_s=slot.last_gps_utc_s,
                 ))

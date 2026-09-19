@@ -69,6 +69,10 @@ def test_unitsstate_rocof_from_ramping_readings():
     snapshot = state.snapshot()
     unit1 = next(u for u in snapshot if u["id"] == "unit-1")
     assert unit1["rocof_hz_s"] == pytest.approx(slope_hz_s, abs=0.05)
+    # rocof_history is the full time series (for the dashboard's chart),
+    # not just the latest value -- same last value as rocof_hz_s.
+    assert len(unit1["rocof_history"]) > 1
+    assert unit1["rocof_history"][-1][1] == pytest.approx(slope_hz_s, abs=0.05)
 
 
 def test_index_route_serves_html():
