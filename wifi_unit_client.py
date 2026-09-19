@@ -4,30 +4,51 @@ on-device, and ships batches of those readings to TREMOR's /api/ingest
 endpoint over WiFi -- the eventual standalone replacement for the current
 laptop-tethered mpremote + overnight_log.py setup.
 
-NOT YET RUN ON REAL HARDWARE. Written against adc_stream_gps.py's proven
-ADC-ring-buffer/GPS-UART-polling design (same wraparound-safe ticks
-accumulator, same GPS_READ_CHUNK_BYTES reasoning), with chunk_summary.py
-and wifi_ingest.py already tested under desktop Python. The
-network.WLAN/urequests glue below can only be exercised on an actual
-Pico 2 W. Known MicroPython WiFi/urequests gotchas this was written to
-survive -- see the inline comments at each relevant point below for how:
-no WiFi auto-reconnect (_wifi_service), urequests responses must be
-.close()'d or sockets leak (_post_batch), no default socket timeout in
-most urequests forks (_post_batch), and a blocking POST can stall the
-main loop for longer than adc_stream_gps.py's ring buffer was ever sized
-for (RING_CAPACITY, flagged as an open design question below).
+Dual-core split (see conversation design notes -- justified by
+diagnostics/wifi_probe_concurrent.py's measurement: real urequests.post()
+latency under concurrent ADC/GPS load spiked to ~5.4-5.7s in ~18% of
+cycles, overflowing RING_CAPACITY=4096 and dropping ~1400-1600 samples
+per spike):
+
+    Core 0 (this module's top level and main loop): ADC Timer IRQ,
+    ring-buffer drain, chunk_summary, IngestBuffer.append(), GPS UART
+    servicing, PPSTimeSync. Never touches `wlan` -- see _core1_main.
+
+    Core 1 (_core1_main, launched via _thread): WiFi connect/reconnect
+    and periodic IngestBuffer.flush(). Owns `wlan` exclusively; core 0
+    only ever reads the plain _wifi_connected flag below for its status
+    line, specifically to avoid any cross-core access to the cyw43
+    driver itself (not just the Python-level WLAN object), which hasn't
+    been verified safe to call from two cores concurrently.
+
+IngestBuffer (wifi_ingest.py) is the only object touched from both cores,
+and is now internally locked for exactly that reason -- see its docstring
+for the minimal-hold-time design (the lock never spans the network call).
+
+NOT YET RUN ON REAL HARDWARE past the diagnostics/ probes. Known
+MicroPython WiFi/urequests gotchas this was written to survive -- see the
+inline comments at each relevant point: no WiFi auto-reconnect
+(_wifi_service), urequests responses must be .close()'d or sockets leak
+(_post_batch), no default socket timeout in most urequests forks
+(_post_batch).
+
+TEST_DURATION_S follows adc_stream_gps.py's own bring-up convention: None
+runs forever (production); a number bounds the run and prints a FINAL
+summary in the same shape as diagnostics/dualcore_control_a.py's, so a
+bounded run of *this* script is Test C in the Control A/B/C comparison --
+not a separate stand-in script -- and is directly diffable against
+Control A's numbers.
 
 Additive, not a modification: imports pps_time_sync.PPSTimeSync exactly as
 adc_stream_gps.py does, and freq_estimator.py (via chunk_summary.py)
 exactly as units.py's SyntheticUnitFeed does. Neither of those files, nor
-adc_stream_gps.py itself, is touched by this script -- this is a new,
-separate on-device entry point, run instead of adc_stream_gps.py when
-operating standalone (no laptop/mpremote).
+adc_stream_gps.py itself, is touched by this script.
 """
 
 import array
 import time
 
+import _thread
 import network
 import urequests
 from machine import ADC, UART, Pin, Timer
@@ -37,23 +58,17 @@ from chunk_summary import summarize_chunk
 from wifi_ingest import IngestBuffer
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
+TEST_DURATION_S = None  # None = run forever (production); a number = bounded
+                        # verification run -- see module docstring
+
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
-# adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
-# short USB/GPS-poll stalls. Unlike WiFi reconnect (made non-blocking
-# above), urequests.post() itself IS a blocking call with no async
-# alternative in stock urequests -- DNS+TCP+TLS+transfer for a small JSON
-# batch is plausibly ~0.5-2s, occasionally more, and the main loop can't
-# drain the ring buffer while blocked inside it. 4096 samples (~4s
-# headroom, ~24KB RAM) is a cheap stopgap so a typical POST doesn't
-# overflow it -- NOT a guarantee against a pathological multi-second
-# stall. OPEN DESIGN QUESTION for real hardware: if measured POST
-# latency threatens this headroom, the more robust fix is running the
-# POST on the Pico 2's second core via _thread (ADC/ring-buffer draining
-# stays on core 0, uninterrupted) rather than keep enlarging this buffer --
-# worth deciding once real latency numbers exist, not guessed now.
+# See diagnostics/wifi_probe_concurrent.py's measurement in the module
+# docstring for why this is 4096 (~4s headroom, ~24KB RAM), not
+# adc_stream_gps.py's 512 -- and why that headroom alone wasn't enough,
+# which is what motivated the dual-core split below.
 RING_CAPACITY = 4096
 MAX_DRAIN_PER_PASS = 128  # see adc_stream_gps.py: bounds one drain so GPS
-                          # UART servicing and WiFi/POST bookkeeping always get a turn
+                          # UART servicing always gets a turn
 
 CHUNK_S = 1.0            # one summarized reading per second, same cadence as overnight_log.py
 POST_INTERVAL_S = 8.0    # batch several readings per POST rather than one per
@@ -71,17 +86,11 @@ ADC_VOLTAGE_SCALE = 3.3 / 65535  # raw u16 -> volts, same conversion
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
 sync = PPSTimeSync(pps_pin=15)
-wlan = network.WLAN(network.STA_IF)
 
 t0 = time.ticks_us()
 
-# Ring buffer -- identical structure to adc_stream_gps.py's, see that
-# file's docstring for why (ISR does the minimum possible work; the main
-# loop converts/drains). RING_CAPACITY=512 at ADC_SAMPLE_HZ=1030 is only
-# ~497ms of headroom (same as adc_stream_gps.py) -- this is why WiFi
-# connect/reconnect below MUST be non-blocking: a single blocking connect
-# attempt of even a couple of seconds would overflow this buffer and drop
-# most samples acquired during the stall.
+# Ring buffer -- identical structure to adc_stream_gps.py's (ISR does the
+# minimum possible work; the main loop converts/drains).
 ring_ticks = array.array("L", [0] * RING_CAPACITY)
 ring_raw = array.array("H", [0] * RING_CAPACITY)
 write_idx = 0
@@ -108,69 +117,92 @@ GPS_READ_CHUNK_BYTES = 128  # see adc_stream_gps.py for the throughput/latency
                             # tradeoff this bounds
 gps_buf = b""
 
+buffer = IngestBuffer(UNIT_ID, post_fn=None, max_readings=MAX_BUFFERED_READINGS)  # post_fn set below
 
-wlan.active(True)
-_last_wifi_attempt_ticks = time.ticks_us()
+# Cross-core status only -- never used for control flow on either side, so
+# plain-variable reads/writes are fine without a lock (see module
+# docstring: core 0 never touches `wlan` itself, only this flag).
+_wifi_connected = False
+_stop_flag = False  # core 0 sets this at TEST_DURATION_S; core 1 polls it to exit its loop
 
 
-def _wifi_service():
-    """Call every loop pass -- never blocks. wlan.connect() itself is
-    asynchronous (the cyw43 driver negotiates in the background; MicroPython's
-    call returns immediately), so this only ever *starts* an attempt at most
-    once per WIFI_RETRY_INTERVAL_S and otherwise just checks isconnected() --
-    it never busy-waits, which matters given the ring buffer's ~497ms
-    headroom (see its comment above). NEEDS VERIFICATION ON HARDWARE: that
-    wlan.connect() on the Pico 2 W's cyw43 driver really is non-blocking in
-    the way ESP32 MicroPython ports document -- if it isn't, this call needs
-    to move off the main loop (e.g. a second thread via _thread) instead.
+def _core1_main():
+    """Runs entirely on core 1: WiFi connect/reconnect + periodic
+    IngestBuffer.flush(). Everything that touches `wlan` or issues the
+    network POST lives here and only here.
     """
-    global _last_wifi_attempt_ticks
-    if wlan.isconnected():
-        return
-    now = time.ticks_us()
-    if time.ticks_diff(now, _last_wifi_attempt_ticks) >= WIFI_RETRY_INTERVAL_S * 1_000_000:
-        _last_wifi_attempt_ticks = now
+    global _wifi_connected
+
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    last_wifi_attempt_ticks = time.ticks_us()
+    last_post_ticks = time.ticks_us()
+
+    def _wifi_service():
+        """Call every loop pass -- never blocks. wlan.connect() itself is
+        asynchronous (the cyw43 driver negotiates in the background;
+        MicroPython's call returns immediately -- confirmed on this
+        firmware by diagnostics/wifi_probe.py: 6-26ms call-return time),
+        so this only ever *starts* an attempt at most once per
+        WIFI_RETRY_INTERVAL_S and otherwise just checks isconnected().
+        """
+        nonlocal last_wifi_attempt_ticks
+        global _wifi_connected
+        _wifi_connected = wlan.isconnected()
+        if _wifi_connected:
+            return
+        now = time.ticks_us()
+        if time.ticks_diff(now, last_wifi_attempt_ticks) >= WIFI_RETRY_INTERVAL_S * 1_000_000:
+            last_wifi_attempt_ticks = now
+            try:
+                wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            except OSError:
+                pass  # e.g. "already connecting" -- next retry will catch a real failure
+
+    def _post_batch(payload):
+        """IngestBuffer's injected post_fn. Returns True only on a 2xx
+        response. Every response is explicitly closed -- a missed
+        .close() on urequests leaks the underlying socket, and repeated
+        leaks exhaust the Pico's socket table over an unattended
+        multi-hour run. NEEDS VERIFICATION ON HARDWARE: whether this
+        urequests build supports a timeout kwarg at all -- without one, a
+        dead/half-open connection can block this call indefinitely (this
+        blocks only core 1 now, not the ADC/GPS path on core 0, but it
+        would still stall this unit's own reporting).
+        """
+        if not wlan.isconnected():
+            return False
+        response = None
         try:
-            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        except OSError:
-            pass  # e.g. "already connecting" -- next retry will catch a real failure
+            response = urequests.post(INGEST_URL, json=payload)
+            return 200 <= response.status_code < 300
+        except Exception:
+            return False
+        finally:
+            if response is not None:
+                response.close()
+
+    buffer._post_fn = _post_batch  # set here so _post_batch can close over this core's wlan
+
+    while not _stop_flag:
+        _wifi_service()
+        now = time.ticks_us()
+        if time.ticks_diff(now, last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
+            last_post_ticks = now
+            buffer.flush()  # _post_batch checks wlan.isconnected() itself
+        time.sleep_ms(50)  # core 1 has no hard-real-time work; a short sleep avoids busy-spinning
 
 
-def _post_batch(payload):
-    """IngestBuffer's injected post_fn. Returns True only on a 2xx
-    response. Every response is explicitly closed -- a missed .close()
-    on urequests leaks the underlying socket, and repeated leaks exhaust
-    the Pico's socket table over an unattended multi-hour run (see module
-    docstring). NEEDS VERIFICATION ON HARDWARE: whether this urequests
-    build supports a timeout kwarg at all -- without one, a dead/half-open
-    connection can block this call indefinitely.
-    """
-    if not wlan.isconnected():
-        return False
-    response = None
-    try:
-        response = urequests.post(INGEST_URL, json=payload)
-        return 200 <= response.status_code < 300
-    except Exception:
-        return False
-    finally:
-        if response is not None:
-            response.close()
-
-
-buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
+_thread.start_new_thread(_core1_main, ())
 
 _last_consumed_ticks = t0
 _elapsed_us_total = 0
 _chunk_ticks = []      # raw time.ticks_us() per sample -- for gps_utc_s lookup
 _chunk_ts_s = []       # elapsed seconds per sample -- summarize_chunk's timestamps
 _chunk_counts = []     # raw u16 ADC counts per sample -- converted to volts below
-_last_post_ticks = t0
 _last_status_ticks = t0
 
-_wifi_service()
-
-while True:
+while TEST_DURATION_S is None or _elapsed_us_total < TEST_DURATION_S * 1_000_000:
     drained = 0
     while read_idx != write_idx and drained < MAX_DRAIN_PER_PASS:
         raw_ticks = ring_ticks[read_idx]
@@ -216,19 +248,27 @@ while True:
             if len(gps_buf) > MAX_GPS_BUF_BYTES:
                 gps_buf = gps_buf[-MAX_GPS_BUF_BYTES:]
 
-    _wifi_service()
-
     now = time.ticks_us()
-    if time.ticks_diff(now, _last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
-        _last_post_ticks = now
-        buffer.flush()  # _post_batch checks wlan.isconnected() itself; a
-                         # no-op (returns False, buffer untouched) while down
-
     if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
         _last_status_ticks = now
         s = sync.status
-        print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} dropped={} "
-              "overflow={}".format(
-            _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
+        print("# STATUS elapsed_s={:.1f} wifi={} synced={} pps={} sync={} rejected={} "
+              "no_edge={} period_us={} buffered={} dropped={} overflow={}".format(
+            _elapsed_us_total / 1e6, _wifi_connected, s["synced"], s["pps_count"],
+            s["sync_count"], s["rejected_count"], s["no_edge_count"], s["pps_period_us"],
             len(buffer), buffer.dropped_count, overflow_count,
         ))
+
+if TEST_DURATION_S is not None:
+    _stop_flag = True
+    adc_timer.deinit()
+    time.sleep_ms(200)  # let core 1 notice _stop_flag and exit its loop
+    s = sync.status
+    print("=== Test C end ===")
+    print("FINAL pps_count={} sync_count={} sync_ratio={:.4f} rejected={} no_edge={} "
+          "pps_period_us={} overflow_count={} buffered={} dropped={}".format(
+        s["pps_count"], s["sync_count"],
+        (s["sync_count"] / s["pps_count"]) if s["pps_count"] else float("nan"),
+        s["rejected_count"], s["no_edge_count"], s["pps_period_us"],
+        overflow_count, len(buffer), buffer.dropped_count,
+    ))
