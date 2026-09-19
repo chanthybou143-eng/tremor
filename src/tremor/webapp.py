@@ -46,6 +46,11 @@ READOUT_WINDOW_S = 2.0
 # (this is real noise, not a plotting bug), which reads as far jumpier
 # than the underlying frequency actually is. ~10 cycles at 50Hz.
 SPARKLINE_SMOOTHING_WINDOW_S = 0.2
+# Real per-reading cadence for an ingested batch -- matches
+# wifi_unit_client.py's CHUNK_S and overnight_log.py's CHUNK_S (both 1.0s),
+# the one-reading-per-second convention used throughout this project. Used
+# to space out a batch's timestamps realistically (see /api/ingest).
+READING_INTERVAL_S = 1.0
 
 # Small, plausible per-unit calibration/noise variation -- all units track
 # the same true_grid_freq_hz() (see units.py), only their independent ADC
@@ -226,10 +231,17 @@ def create_app(
         Readings are timestamped by server receipt time, not gps_utc_s --
         gps_utc_s is seconds-of-day and can be absent pre-sync, so it isn't
         safe as the window/RoCoF ordering key; it's stored alongside purely
-        as metadata. A small per-reading offset (~1 mains cycle) keeps
-        timestamps strictly increasing within one batch -- rocof_from_window's
-        least-squares fit is poorly conditioned on near-duplicate timestamps
-        (sub-microsecond spacing triggers numpy's RankWarning).
+        as metadata. Readings within a batch are spaced READING_INTERVAL_S
+        apart, working backward from receipt time (the last reading in the
+        batch lands ~now, earlier ones progressively before it) -- matching
+        wifi_unit_client.py's real one-reading-per-second cadence, not
+        compressed into a few milliseconds. Compressing them (an earlier
+        version used a flat 0.02s step, modeled on per-mains-cycle spacing
+        that never matched any real client) corrupted rocof_from_window's
+        slope: dividing a real ~1s frequency delta by an apparent ~0.02s
+        gap inflated RoCoF by ~50x, visible on the dashboard as physically
+        impossible spikes and gave the chart's line a bursts-with-gaps
+        shape instead of a continuous trace.
         """
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
@@ -256,9 +268,10 @@ def create_app(
             parsed.append((freq_hz, amplitude_v, gps_utc_s))
 
         now = time.time()
+        n = len(parsed)
         for i, (freq_hz, amplitude_v, gps_utc_s) in enumerate(parsed):
             state.add_reading(unit_id, UnitReading(
-                t=now + i * 0.02,
+                t=now - (n - 1 - i) * READING_INTERVAL_S,
                 freq_hz=freq_hz,
                 amplitude_v=amplitude_v,
                 gps_utc_s=gps_utc_s,

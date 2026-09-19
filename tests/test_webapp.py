@@ -134,6 +134,39 @@ def test_api_ingest_accepts_a_batch_and_updates_the_unit():
         app.config["TREMOR_SHUTDOWN"]()
 
 
+def test_api_ingest_spaces_batch_readings_by_reading_interval_not_compressed():
+    # Regression test: an earlier version stamped a batch's readings
+    # ~0.02s apart (modeled on per-mains-cycle spacing that never matched
+    # any real client) instead of the real ~1s-per-reading cadence
+    # wifi_unit_client.py actually uses. That compression divided a real
+    # ~1s frequency delta by an apparent ~0.02s gap, inflating RoCoF by
+    # ~50x -- invisible with only a frequency sparkline, but produced
+    # physically-impossible spikes once the dashboard started plotting
+    # RoCoF as its own line (a few tenths of a Hz/s is a large *real*
+    # swing; several Hz/s is not physically plausible).
+    app = create_app(simulated_units=[])
+    client = app.test_client()
+    try:
+        # A gentle, realistic ramp: 0.01 Hz/s -- a full second apart, that's
+        # a tiny per-reading step, easy to blow up if timestamps are wrong.
+        readings = [{"frequency_hz": 50.0 + 0.01 * i} for i in range(8)]
+        resp = client.post("/api/ingest", json={"unit_id": "unit-1", "readings": readings})
+        assert resp.status_code == 202
+
+        data = client.get("/api/units").get_json()
+        unit1 = next(u for u in data if u["id"] == "unit-1")
+
+        history_ts = [t for t, _ in unit1["history"]]
+        gaps = [b - a for a, b in zip(history_ts, history_ts[1:])]
+        assert all(gap == pytest.approx(1.0, abs=0.05) for gap in gaps)
+
+        # True slope here is 0.01 Hz/s -- correct spacing should recover
+        # something in that ballpark, not an order-of-magnitude-inflated value.
+        assert abs(unit1["rocof_hz_s"]) < 0.5
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
 def test_api_ingest_accepts_a_new_unit_id_and_it_appears_automatically():
     # The whole point of the dynamic roster: a unit_id nothing has seen
     # before is accepted outright and shows up on the dashboard on its
