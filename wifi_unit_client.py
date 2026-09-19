@@ -4,6 +4,53 @@ on-device, and ships batches of those readings to TREMOR's /api/ingest
 endpoint over WiFi -- the eventual standalone replacement for the current
 laptop-tethered mpremote + overnight_log.py setup.
 
+NOT CURRENTLY DEPLOYED (2026-09-19). A ~10.5h soak of this exact script
+surfaced a recurring MemoryError crash -- "memory allocation failed,
+allocating 8192 bytes" at chunk_summary.py:82 (the per-chunk
+`[(v - dc_offset) ** 2 for v in filtered]` list comprehension, ~1000
+elements, allocated fresh every second) -- 23 times over ~4h45m, with the
+interval between crashes shrinking as the run went on (~107s, then ~74s
+between the last three), consistent with heap fragmentation building up
+under the shared dual-core allocator rather than a one-off glitch. Likely
+mechanism: this per-second large-list churn on core 0, concurrent with
+core 1's TLS/urequests allocations on the *same* heap (see the "new
+GC-pause risk" design note below), fragments the heap enough that an
+8KB allocation occasionally fails outright even with adequate total free
+memory. Each crash restarts the script from scratch, silently discarding
+whatever was sitting unflushed in IngestBuffer at that moment (in RAM,
+wiped on restart) -- real, uncounted data loss with no drop counter to
+show it, unlike the ring-buffer overflow this redesign was built to fix.
+
+It also produced a second-order symptom: 23 of 29 disconnect/reconnect
+events logged that night were actually these crashes, not the USB drops
+they were first assumed to be (mischaracterized as such in status updates
+during the run, since disconnect/reconnect counts were checked without
+grepping for the traceback itself). A crash-triggered restart, followed
+quickly by a small post-restart batch, could land close enough in real
+time to the tail of the pre-crash batch still in /api/ingest's 60s
+server-side window to make rocof_from_window's fit see an artificially
+tiny apparent time gap between two batches whose timestamps are each
+independently reconstructed from "now" -- observed live as a
+-22.953 Hz/s spike (physically impossible; the underlying frequency
+reading itself was plausible). This is a distinct edge case from the
+earlier same-night within-batch timestamp-compression bug (fixed in
+d348cf1) -- that one was systematic and every batch; this one is an
+occasional cross-batch boundary artifact that only appears around a
+crash/restart.
+
+Reverted to the pre-dual-core single-core version (git show
+9dfdf08:wifi_unit_client.py) for actual deployment -- known-stable,
+overflow behavior under load is bounded and already measured
+(diagnostics/wifi_probe_concurrent.py), rather than an unbounded silent
+loss with no counter. This file is kept, not deleted -- the dual-core
+approach is still the right direction once the heap-fragmentation issue
+is understood and fixed; that fix is unresolved follow-up work, not
+attempted here. A fix will need to either reduce per-second allocation
+churn on core 0 (e.g. reuse a preallocated buffer instead of a fresh
+list comprehension every chunk) or move real allocation-heavy work off
+the shared heap's contention path entirely -- to be scoped separately,
+with its own measurement, not guessed at now.
+
 Dual-core split (see conversation design notes -- justified by
 diagnostics/wifi_probe_concurrent.py's measurement: real urequests.post()
 latency under concurrent ADC/GPS load spiked to ~5.4-5.7s in ~18% of
