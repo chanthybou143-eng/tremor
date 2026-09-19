@@ -1,0 +1,234 @@
+"""Standalone Pico-side WiFi client: samples the ADC, syncs GPS/PPS time,
+reduces each ~1s chunk to a (frequency_hz, amplitude_v, gps_utc_s) reading
+on-device, and ships batches of those readings to TREMOR's /api/ingest
+endpoint over WiFi -- the eventual standalone replacement for the current
+laptop-tethered mpremote + overnight_log.py setup.
+
+NOT YET RUN ON REAL HARDWARE. Written against adc_stream_gps.py's proven
+ADC-ring-buffer/GPS-UART-polling design (same wraparound-safe ticks
+accumulator, same GPS_READ_CHUNK_BYTES reasoning), with chunk_summary.py
+and wifi_ingest.py already tested under desktop Python. The
+network.WLAN/urequests glue below can only be exercised on an actual
+Pico 2 W. Known MicroPython WiFi/urequests gotchas this was written to
+survive -- see the inline comments at each relevant point below for how:
+no WiFi auto-reconnect (_wifi_service), urequests responses must be
+.close()'d or sockets leak (_post_batch), no default socket timeout in
+most urequests forks (_post_batch), and a blocking POST can stall the
+main loop for longer than adc_stream_gps.py's ring buffer was ever sized
+for (RING_CAPACITY, flagged as an open design question below).
+
+Additive, not a modification: imports pps_time_sync.PPSTimeSync exactly as
+adc_stream_gps.py does, and freq_estimator.py (via chunk_summary.py)
+exactly as units.py's SyntheticUnitFeed does. Neither of those files, nor
+adc_stream_gps.py itself, is touched by this script -- this is a new,
+separate on-device entry point, run instead of adc_stream_gps.py when
+operating standalone (no laptop/mpremote).
+"""
+
+import array
+import time
+
+import network
+import urequests
+from machine import ADC, UART, Pin, Timer
+
+from pps_time_sync import PPSTimeSync
+from chunk_summary import summarize_chunk
+from wifi_ingest import IngestBuffer
+from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
+
+ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
+# adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
+# short USB/GPS-poll stalls. Unlike WiFi reconnect (made non-blocking
+# above), urequests.post() itself IS a blocking call with no async
+# alternative in stock urequests -- DNS+TCP+TLS+transfer for a small JSON
+# batch is plausibly ~0.5-2s, occasionally more, and the main loop can't
+# drain the ring buffer while blocked inside it. 4096 samples (~4s
+# headroom, ~24KB RAM) is a cheap stopgap so a typical POST doesn't
+# overflow it -- NOT a guarantee against a pathological multi-second
+# stall. OPEN DESIGN QUESTION for real hardware: if measured POST
+# latency threatens this headroom, the more robust fix is running the
+# POST on the Pico 2's second core via _thread (ADC/ring-buffer draining
+# stays on core 0, uninterrupted) rather than keep enlarging this buffer --
+# worth deciding once real latency numbers exist, not guessed now.
+RING_CAPACITY = 4096
+MAX_DRAIN_PER_PASS = 128  # see adc_stream_gps.py: bounds one drain so GPS
+                          # UART servicing and WiFi/POST bookkeeping always get a turn
+
+CHUNK_S = 1.0            # one summarized reading per second, same cadence as overnight_log.py
+POST_INTERVAL_S = 8.0    # batch several readings per POST rather than one per
+                         # second -- each POST pays a DNS+TCP+TLS handshake cost
+                         # that dominates a single small payload's transfer time
+MAX_BUFFERED_READINGS = 600  # ~10 minutes at 1 reading/s -- see wifi_ingest.py's
+                              # docstring; needs retuning against real gc.mem_free()
+
+WIFI_RETRY_INTERVAL_S = 5    # how often to kick off a fresh connect attempt while down
+STATUS_INTERVAL_S = 10
+
+ADC_VOLTAGE_SCALE = 3.3 / 65535  # raw u16 -> volts, same conversion
+                                  # overnight_log.py's _parse_sample_line() applies
+
+adc = ADC(26)
+uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
+sync = PPSTimeSync(pps_pin=15)
+wlan = network.WLAN(network.STA_IF)
+
+t0 = time.ticks_us()
+
+# Ring buffer -- identical structure to adc_stream_gps.py's, see that
+# file's docstring for why (ISR does the minimum possible work; the main
+# loop converts/drains). RING_CAPACITY=512 at ADC_SAMPLE_HZ=1030 is only
+# ~497ms of headroom (same as adc_stream_gps.py) -- this is why WiFi
+# connect/reconnect below MUST be non-blocking: a single blocking connect
+# attempt of even a couple of seconds would overflow this buffer and drop
+# most samples acquired during the stall.
+ring_ticks = array.array("L", [0] * RING_CAPACITY)
+ring_raw = array.array("H", [0] * RING_CAPACITY)
+write_idx = 0
+read_idx = 0
+overflow_count = 0
+
+
+def _on_adc_timer(timer):
+    global write_idx, overflow_count
+    next_write_idx = (write_idx + 1) % RING_CAPACITY
+    if next_write_idx == read_idx:
+        overflow_count += 1
+        return
+    ring_ticks[write_idx] = time.ticks_us()
+    ring_raw[write_idx] = adc.read_u16()
+    write_idx = next_write_idx
+
+
+adc_timer = Timer()
+adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer)
+
+MAX_GPS_BUF_BYTES = 1024
+GPS_READ_CHUNK_BYTES = 128  # see adc_stream_gps.py for the throughput/latency
+                            # tradeoff this bounds
+gps_buf = b""
+
+
+wlan.active(True)
+_last_wifi_attempt_ticks = time.ticks_us()
+
+
+def _wifi_service():
+    """Call every loop pass -- never blocks. wlan.connect() itself is
+    asynchronous (the cyw43 driver negotiates in the background; MicroPython's
+    call returns immediately), so this only ever *starts* an attempt at most
+    once per WIFI_RETRY_INTERVAL_S and otherwise just checks isconnected() --
+    it never busy-waits, which matters given the ring buffer's ~497ms
+    headroom (see its comment above). NEEDS VERIFICATION ON HARDWARE: that
+    wlan.connect() on the Pico 2 W's cyw43 driver really is non-blocking in
+    the way ESP32 MicroPython ports document -- if it isn't, this call needs
+    to move off the main loop (e.g. a second thread via _thread) instead.
+    """
+    global _last_wifi_attempt_ticks
+    if wlan.isconnected():
+        return
+    now = time.ticks_us()
+    if time.ticks_diff(now, _last_wifi_attempt_ticks) >= WIFI_RETRY_INTERVAL_S * 1_000_000:
+        _last_wifi_attempt_ticks = now
+        try:
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        except OSError:
+            pass  # e.g. "already connecting" -- next retry will catch a real failure
+
+
+def _post_batch(payload):
+    """IngestBuffer's injected post_fn. Returns True only on a 2xx
+    response. Every response is explicitly closed -- a missed .close()
+    on urequests leaks the underlying socket, and repeated leaks exhaust
+    the Pico's socket table over an unattended multi-hour run (see module
+    docstring). NEEDS VERIFICATION ON HARDWARE: whether this urequests
+    build supports a timeout kwarg at all -- without one, a dead/half-open
+    connection can block this call indefinitely.
+    """
+    if not wlan.isconnected():
+        return False
+    response = None
+    try:
+        response = urequests.post(INGEST_URL, json=payload)
+        return 200 <= response.status_code < 300
+    except Exception:
+        return False
+    finally:
+        if response is not None:
+            response.close()
+
+
+buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
+
+_last_consumed_ticks = t0
+_elapsed_us_total = 0
+_chunk_ticks = []      # raw time.ticks_us() per sample -- for gps_utc_s lookup
+_chunk_ts_s = []       # elapsed seconds per sample -- summarize_chunk's timestamps
+_chunk_counts = []     # raw u16 ADC counts per sample -- converted to volts below
+_last_post_ticks = t0
+_last_status_ticks = t0
+
+_wifi_service()
+
+while True:
+    drained = 0
+    while read_idx != write_idx and drained < MAX_DRAIN_PER_PASS:
+        raw_ticks = ring_ticks[read_idx]
+        raw_count = ring_raw[read_idx]
+        read_idx = (read_idx + 1) % RING_CAPACITY
+        drained += 1
+
+        _elapsed_us_total += time.ticks_diff(raw_ticks, _last_consumed_ticks)
+        _last_consumed_ticks = raw_ticks
+
+        _chunk_ticks.append(raw_ticks)
+        _chunk_ts_s.append(_elapsed_us_total / 1e6)
+        _chunk_counts.append(raw_count)
+
+    # Once ~CHUNK_S worth of samples has accumulated, reduce it to one
+    # (frequency_hz, amplitude_v, gps_utc_s) reading and buffer it.
+    if _chunk_ts_s and (_chunk_ts_s[-1] - _chunk_ts_s[0]) >= CHUNK_S:
+        voltages = [count * ADC_VOLTAGE_SCALE for count in _chunk_counts]
+        try:
+            frequency_hz, amplitude_v = summarize_chunk(_chunk_ts_s, voltages)
+            gps_utc_s = sync.ticks_to_utc(_chunk_ticks[-1])
+            buffer.append(frequency_hz, amplitude_v, gps_utc_s)
+        except ValueError:
+            pass  # too few crossings this chunk -- skip it, same as overnight_log.py
+        _chunk_ticks = []
+        _chunk_ts_s = []
+        _chunk_counts = []
+
+    if uart.any():
+        chunk = uart.read(GPS_READ_CHUNK_BYTES)
+        if chunk:
+            gps_buf += chunk
+            while b"\n" in gps_buf:
+                line_bytes, gps_buf = gps_buf.split(b"\n", 1)
+                if b"RMC" not in line_bytes:
+                    continue
+                try:
+                    line = line_bytes.decode("ascii").strip()
+                except UnicodeError:
+                    continue
+                if line:
+                    sync.feed_nmea(line)
+            if len(gps_buf) > MAX_GPS_BUF_BYTES:
+                gps_buf = gps_buf[-MAX_GPS_BUF_BYTES:]
+
+    _wifi_service()
+
+    now = time.ticks_us()
+    if time.ticks_diff(now, _last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
+        _last_post_ticks = now
+        buffer.flush()  # _post_batch checks wlan.isconnected() itself; a
+                         # no-op (returns False, buffer untouched) while down
+
+    if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
+        _last_status_ticks = now
+        s = sync.status
+        print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} dropped={} "
+              "overflow={}".format(
+            _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
+            len(buffer), buffer.dropped_count, overflow_count,
+        ))

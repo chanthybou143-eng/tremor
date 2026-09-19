@@ -1,0 +1,14 @@
+"""Copy this file to wifi_config.py (already gitignored -- see .gitignore)
+and fill in real values for this deployment site, then flash it alongside
+wifi_unit_client.py. wifi_config.py itself must never be committed: it
+holds this site's WiFi credentials.
+"""
+
+WIFI_SSID = "your-network-name"
+WIFI_PASSWORD = "your-network-password"
+
+# Which of the 5 planned units this Pico is -- must match one of the
+# UNIT_SLOTS ids in src/tremor/webapp.py (unit-1 .. unit-5).
+UNIT_ID = "unit-1"
+
+INGEST_URL = "https://tremorgrid.pythonanywhere.com/api/ingest"

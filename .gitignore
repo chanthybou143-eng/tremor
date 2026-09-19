@@ -7,3 +7,4 @@ dist/
 .pytest_cache/
 logs/
 .DS_Store
+wifi_config.py

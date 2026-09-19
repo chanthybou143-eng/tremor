@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from chunk_summary import summarize_chunk  # noqa: E402
+from freq_estimator import generate_synthetic_signal  # noqa: E402
+
+# Pico's real measured ADC rate (see CLAUDE.md) -- exercising this at the
+# actual target rate, not an arbitrary offline-DSP rate, is the whole point
+# of this test (same reasoning as tests/test_frequency.py's sample_rate_hz
+# parametrization).
+FS_HZ = 1030.0
+
+
+def test_recovers_clean_frequency_with_realistic_dc_offset():
+    # amplitude/dc_offset in the ballpark of the real divider circuit's
+    # measured ~0.7V swing riding on a ~1.65V mid-rail bias (see CLAUDE.md).
+    ts, ys = generate_synthetic_signal(
+        freq_hz=50.0, fs_hz=FS_HZ, duration_s=1.0,
+        amplitude=0.72, dc_offset=1.65, seed=1,
+    )
+    freq_hz, amplitude_v = summarize_chunk(ts, ys)
+    assert freq_hz == pytest.approx(50.0, abs=0.05)
+    assert amplitude_v == pytest.approx(0.72, rel=0.1)
+
+
+def test_recovers_off_nominal_frequency():
+    ts, ys = generate_synthetic_signal(
+        freq_hz=49.85, fs_hz=FS_HZ, duration_s=1.0,
+        amplitude=0.72, dc_offset=1.65, seed=2,
+    )
+    freq_hz, _amplitude_v = summarize_chunk(ts, ys)
+    assert freq_hz == pytest.approx(49.85, abs=0.05)
+
+
+def test_survives_realistic_noise():
+    ts, ys = generate_synthetic_signal(
+        freq_hz=50.0, fs_hz=FS_HZ, duration_s=1.0,
+        amplitude=0.72, dc_offset=1.65, noise_std=0.01, seed=3,
+    )
+    freq_hz, _amplitude_v = summarize_chunk(ts, ys)
+    assert freq_hz == pytest.approx(50.0, abs=0.05)
+
+
+def test_raises_on_too_few_crossings():
+    # hysteresis larger than the signal's own amplitude arms no crossings
+    # -- same failure mode estimate_frequency itself documents.
+    ts, ys = generate_synthetic_signal(
+        freq_hz=50.0, fs_hz=FS_HZ, duration_s=1.0,
+        amplitude=0.72, dc_offset=1.65, seed=4,
+    )
+    with pytest.raises(ValueError):
+        summarize_chunk(ts, ys, hysteresis_fraction=50.0)
