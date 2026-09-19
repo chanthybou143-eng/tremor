@@ -19,4 +19,6 @@ if project_home not in sys.path:
 
 from tremor.webapp import create_app
 
-application = create_app()
+# Real-hardware-only: no synthetic units, so the dashboard only shows units
+# that have actually POSTed real readings via /api/ingest.
+application = create_app(simulated_units=[])
