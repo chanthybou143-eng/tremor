@@ -194,6 +194,8 @@ _chunk_counts = []     # raw u16 ADC counts per sample -- converted to volts bel
 _last_post_ticks = t0
 _last_status_ticks = t0
 peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
+post_attempts = 0  # a flush() where the buffer was actually non-empty -- excludes no-op flushes
+post_successes = 0
 
 _wifi_service()
 
@@ -252,8 +254,13 @@ while True:
     now = time.ticks_us()
     if time.ticks_diff(now, _last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
         _last_post_ticks = now
-        buffer.flush()  # _post_batch checks wlan.isconnected() itself; a
-                         # no-op (returns False, buffer untouched) while down
+        if current_buffered > 0:
+            post_attempts += 1
+            if buffer.flush():  # _post_batch checks wlan.isconnected() itself; a
+                                 # no-op (returns False, buffer untouched) while down
+                post_successes += 1
+        else:
+            buffer.flush()  # genuinely nothing to send -- not counted as an attempt
 
     if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
         _last_status_ticks = now
@@ -261,8 +268,9 @@ while True:
         gc.collect()  # so mem_free()/mem_alloc() reflect reclaimable garbage,
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
-              "dropped={} overflow={} heap_free={} heap_alloc={}".format(
+              "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
+              "post_successes={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
-            gc.mem_free(), gc.mem_alloc(),
+            gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
         ))
