@@ -24,6 +24,12 @@ PythonAnywhere deployment (reproducible ~15s response delay on any
 connection not explicitly closed; see the keepalive-single-core branch's
 diagnostics), so batching more readings per POST is the remaining lever.
 
+gc.mem_free()/gc.mem_alloc() are logged alongside the existing periodic
+status line (with an explicit gc.collect() first, so the numbers reflect
+reclaimed state, not a mid-accumulation snapshot) specifically so a long
+soak's heap trend is visible -- the dual-core incident's fragmentation
+was only caught after the fact, from a crash, not from watching a trend.
+
 Additive, not a modification: imports pps_time_sync.PPSTimeSync exactly as
 adc_stream_gps.py does, and freq_estimator.py (via chunk_summary.py)
 exactly as units.py's SyntheticUnitFeed does. Neither of those files, nor
@@ -31,6 +37,7 @@ adc_stream_gps.py itself, is touched by this script.
 """
 
 import array
+import gc
 import time
 
 import network
@@ -186,6 +193,7 @@ _chunk_ts_s = []       # elapsed seconds per sample -- summarize_chunk's timesta
 _chunk_counts = []     # raw u16 ADC counts per sample -- converted to volts below
 _last_post_ticks = t0
 _last_status_ticks = t0
+peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
 
 _wifi_service()
 
@@ -237,6 +245,10 @@ while True:
 
     _wifi_service()
 
+    current_buffered = len(buffer)
+    if current_buffered > peak_buffered:
+        peak_buffered = current_buffered
+
     now = time.ticks_us()
     if time.ticks_diff(now, _last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
         _last_post_ticks = now
@@ -246,8 +258,11 @@ while True:
     if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
         _last_status_ticks = now
         s = sync.status
-        print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} dropped={} "
-              "overflow={}".format(
+        gc.collect()  # so mem_free()/mem_alloc() reflect reclaimable garbage,
+                       # not a snapshot mid-accumulation -- see module docstring
+        print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
+              "dropped={} overflow={} heap_free={} heap_alloc={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
-            len(buffer), buffer.dropped_count, overflow_count,
+            current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
+            gc.mem_free(), gc.mem_alloc(),
         ))
