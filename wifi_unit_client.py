@@ -1,28 +1,33 @@
 """Standalone Pico-side WiFi client: samples the ADC, syncs GPS/PPS time,
 reduces each ~1s chunk to a (frequency_hz, amplitude_v, gps_utc_s) reading
 on-device, and ships batches of those readings to TREMOR's /api/ingest
-endpoint over WiFi -- the eventual standalone replacement for the current
-laptop-tethered mpremote + overnight_log.py setup.
+endpoint over WiFi -- the deployed replacement for the laptop-tethered
+mpremote + overnight_log.py setup. This is the known-good single-core
+client (originally 9dfdf08); a dual-core (_thread) redesign was tried and
+reverted after a MemoryError crash loop from heap fragmentation, and
+stays single-core-only going forward (see wifi_ingest.py/git history).
 
-NOT YET RUN ON REAL HARDWARE. Written against adc_stream_gps.py's proven
-ADC-ring-buffer/GPS-UART-polling design (same wraparound-safe ticks
-accumulator, same GPS_READ_CHUNK_BYTES reasoning), with chunk_summary.py
-and wifi_ingest.py already tested under desktop Python. The
-network.WLAN/urequests glue below can only be exercised on an actual
-Pico 2 W. Known MicroPython WiFi/urequests gotchas this was written to
-survive -- see the inline comments at each relevant point below for how:
-no WiFi auto-reconnect (_wifi_service), urequests responses must be
-.close()'d or sockets leak (_post_batch), no default socket timeout in
-most urequests forks (_post_batch), and a blocking POST can stall the
-main loop for longer than adc_stream_gps.py's ring buffer was ever sized
-for (RING_CAPACITY, flagged as an open design question below).
+Written against adc_stream_gps.py's proven ADC-ring-buffer/GPS-UART-polling
+design (same wraparound-safe ticks accumulator, same GPS_READ_CHUNK_BYTES
+reasoning), with chunk_summary.py and wifi_ingest.py tested under desktop
+Python. Known MicroPython WiFi/urequests gotchas this was written to
+survive -- see the inline comments at each relevant point: no WiFi
+auto-reconnect (_wifi_service), urequests responses must be .close()'d or
+sockets leak (_post_batch), no default socket timeout in most urequests
+forks (_post_batch), and a blocking POST can stall the main loop for
+longer than the ring buffer's headroom (RING_CAPACITY).
+
+POST_INTERVAL_S raised from 8s to 30s to reduce how often the ~2.1-2.6s
+DNS+TCP+TLS handshake gets paid per hour -- a persistent/keep-alive
+connection was investigated and found not viable against this specific
+PythonAnywhere deployment (reproducible ~15s response delay on any
+connection not explicitly closed; see the keepalive-single-core branch's
+diagnostics), so batching more readings per POST is the remaining lever.
 
 Additive, not a modification: imports pps_time_sync.PPSTimeSync exactly as
 adc_stream_gps.py does, and freq_estimator.py (via chunk_summary.py)
 exactly as units.py's SyntheticUnitFeed does. Neither of those files, nor
-adc_stream_gps.py itself, is touched by this script -- this is a new,
-separate on-device entry point, run instead of adc_stream_gps.py when
-operating standalone (no laptop/mpremote).
+adc_stream_gps.py itself, is touched by this script.
 """
 
 import array
@@ -56,11 +61,25 @@ MAX_DRAIN_PER_PASS = 128  # see adc_stream_gps.py: bounds one drain so GPS
                           # UART servicing and WiFi/POST bookkeeping always get a turn
 
 CHUNK_S = 1.0            # one summarized reading per second, same cadence as overnight_log.py
-POST_INTERVAL_S = 8.0    # batch several readings per POST rather than one per
-                         # second -- each POST pays a DNS+TCP+TLS handshake cost
-                         # that dominates a single small payload's transfer time
-MAX_BUFFERED_READINGS = 600  # ~10 minutes at 1 reading/s -- see wifi_ingest.py's
-                              # docstring; needs retuning against real gc.mem_free()
+# Single source of truth for how often buffer.flush() POSTs a batch.
+# Raised from 8s to 30s: a persistent/keep-alive connection was
+# investigated and found not viable against this specific PythonAnywhere
+# deployment (reproducible ~15s response delay on any connection not
+# explicitly told "Connection: close" -- see the keepalive-single-core
+# branch's diagnostics; not revisited here, keep-alive is dead). With
+# reuse off the table, the remaining lever to cut total time spent on
+# the ~2.1-2.6s DNS+TCP+TLS handshake each POST pays is fewer POSTs per
+# hour, not cheaper ones -- 30s batches 3-4x more readings per handshake
+# than 8s did, at the cost of a longer worst-case delay before a reading
+# reaches the dashboard.
+POST_INTERVAL_S = 30.0
+# ~30 readings/batch at POST_INTERVAL_S=30s and one reading/s (CHUNK_S)
+# -- 600 is a ~20x margin over one normal batch, and the outage-tolerance
+# semantics (drop-oldest once buffered readings span ~10 minutes) are
+# unchanged by the interval bump, since this bound is independent of how
+# often flush() is called. See the bench-run report (commit history) for
+# the actually-observed peak.
+MAX_BUFFERED_READINGS = 600
 
 WIFI_RETRY_INTERVAL_S = 5    # how often to kick off a fresh connect attempt while down
 STATUS_INTERVAL_S = 10
