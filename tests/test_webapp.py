@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from tremor.webapp import UNIT_SLOTS, _UnitsState, _smoothed_history, create_app
+from tremor.webapp import _UnitsState, _smoothed_history, create_app
 from tremor.units import UnitReading
 
 
@@ -31,34 +31,35 @@ def test_smoothed_history_preserves_a_real_trend():
     assert smoothed[0][1] < smoothed[-1][1]
 
 
-def test_unitsstate_reports_offline_before_any_reading():
-    state = _UnitsState(UNIT_SLOTS)
-    snapshot = state.snapshot()
-
-    assert len(snapshot) == 5
-    assert all(u["status"] == "offline" for u in snapshot)
-    assert all(u["freq_hz"] is None for u in snapshot)
+def test_unitsstate_reports_no_units_before_any_reading():
+    # No pre-seeded slots -- a unit that has never reported shouldn't
+    # appear at all, not as an "offline" placeholder.
+    state = _UnitsState()
+    assert state.snapshot() == []
 
 
 def test_unitsstate_reports_live_after_readings():
-    state = _UnitsState(UNIT_SLOTS)
+    state = _UnitsState()
     t = 0.0
     for freq in [49.98, 50.01, 49.99, 50.02, 50.00]:
         state.add_reading("unit-1", UnitReading(t=t, freq_hz=freq))
         t += 0.02
 
     snapshot = state.snapshot()
-    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
-    others = [u for u in snapshot if u["id"] != "unit-1"]
 
+    # Only the unit that actually reported gets a card -- nothing else
+    # appears alongside it.
+    assert len(snapshot) == 1
+    unit1 = snapshot[0]
+    assert unit1["id"] == "unit-1"
+    assert unit1["label"] == "Unit 1"  # derived from unit_id, not a fixed registry
     assert unit1["status"] == "live"
     assert unit1["freq_hz"] == pytest.approx(50.0, abs=0.05)
     assert len(unit1["history"]) == 5
-    assert all(u["status"] == "offline" for u in others)
 
 
 def test_unitsstate_rocof_from_ramping_readings():
-    state = _UnitsState(UNIT_SLOTS)
+    state = _UnitsState()
     t = 0.0
     slope_hz_s = 0.5
     while t < 3.0:
@@ -80,14 +81,15 @@ def test_index_route_serves_html():
 
 
 def test_api_units_route_shape_with_no_simulated_units():
+    # No feeds registered and nothing ingested yet -- the dashboard should
+    # show no units at all, not 5 permanent "offline" placeholders.
     app = create_app(simulated_units=[])
     client = app.test_client()
     resp = client.get("/api/units")
     data = resp.get_json()
 
     assert resp.status_code == 200
-    assert len(data) == 5
-    assert all(u["status"] == "offline" for u in data)
+    assert data == []
     app.config["TREMOR_SHUTDOWN"]()
 
 
@@ -128,15 +130,38 @@ def test_api_ingest_accepts_a_batch_and_updates_the_unit():
         app.config["TREMOR_SHUTDOWN"]()
 
 
-def test_api_ingest_rejects_unknown_unit():
+def test_api_ingest_accepts_a_new_unit_id_and_it_appears_automatically():
+    # The whole point of the dynamic roster: a unit_id nothing has seen
+    # before is accepted outright and shows up on the dashboard on its
+    # first batch -- no code change, no pre-registration.
     app = create_app(simulated_units=[])
     client = app.test_client()
     try:
         resp = client.post("/api/ingest", json={
-            "unit_id": "not-a-real-unit",
+            "unit_id": "unit-7",
+            "readings": [{"frequency_hz": 50.0}],
+        })
+        assert resp.status_code == 202
+
+        data = client.get("/api/units").get_json()
+        assert len(data) == 1
+        assert data[0]["id"] == "unit-7"
+        assert data[0]["label"] == "Unit 7"
+        assert data[0]["status"] == "live"
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_api_ingest_rejects_empty_unit_id():
+    app = create_app(simulated_units=[])
+    client = app.test_client()
+    try:
+        resp = client.post("/api/ingest", json={
+            "unit_id": "",
             "readings": [{"frequency_hz": 50.0}],
         })
         assert resp.status_code == 400
+        assert client.get("/api/units").get_json() == []
     finally:
         app.config["TREMOR_SHUTDOWN"]()
 

@@ -1,5 +1,11 @@
-"""Local web dashboard: frequency + RoCoF for each of the 5 planned TREMOR
-units, backed by synthetic per-unit feeds today.
+"""Local web dashboard: frequency + RoCoF per TREMOR unit.
+
+Units are dynamic, not a fixed roster: a unit gets a card the first time
+it reports a reading (via a registered feed, or a real POST to
+/api/ingest) and never before -- there's no pre-seeded "offline" slot for
+a unit that hasn't reported yet. Up to 5 units are planned for the real
+network, but nothing here hardcodes that count; a 6th would show up the
+same way a 2nd does, with no code change.
 
 Run with ``python -m tremor.webapp`` (or the ``tremor-web-dashboard``
 console script), then open http://127.0.0.1:5000/. Swapping a real unit's
@@ -41,18 +47,6 @@ READOUT_WINDOW_S = 2.0
 # than the underlying frequency actually is. ~10 cycles at 50Hz.
 SPARKLINE_SMOOTHING_WINDOW_S = 0.2
 
-# All 5 planned units get a slot in the UI. Only the ones with a feed
-# registered (see SIMULATED_UNITS) show live data -- the rest render as
-# "no data yet" placeholders, which is exactly the swap-in point for real
-# hardware: register_feed() is the only thing a real unit needs.
-UNIT_SLOTS = [
-    ("unit-1", "Unit 1"),
-    ("unit-2", "Unit 2"),
-    ("unit-3", "Unit 3"),
-    ("unit-4", "Unit 4"),
-    ("unit-5", "Unit 5"),
-]
-
 # Small, plausible per-unit calibration/noise variation -- all units track
 # the same true_grid_freq_hz() (see units.py), only their independent ADC
 # noise and small DC-offset calibration error differ, same as real units
@@ -62,6 +56,14 @@ SIMULATED_UNITS = [
     dict(unit_id="unit-2", noise_std=0.02, dc_offset=-0.02, seed=2),
     dict(unit_id="unit-3", noise_std=0.03, dc_offset=0.0, seed=3),
 ]
+
+
+def _default_label(unit_id: str) -> str:
+    """Derives a display label straight from unit_id (e.g. "unit-2" ->
+    "Unit 2") -- there's no separate label registry, since a unit that
+    POSTs to /api/ingest never goes through Python code that could supply
+    one explicitly."""
+    return unit_id.replace("-", " ").replace("_", " ").title()
 
 
 def _smoothed_history(
@@ -97,18 +99,21 @@ class _UnitSlot:
 
 class _UnitsState:
     """Thread-safe rolling buffers per unit, fed by one consumer thread per
-    registered feed, read by the HTTP handler thread."""
+    registered feed (or a POST to /api/ingest), read by the HTTP handler
+    thread. Slots are created lazily, on a unit's first reading -- see
+    add_reading -- not pre-seeded, so snapshot() only ever reports units
+    that have actually shown up."""
 
-    def __init__(self, unit_slots: List[Tuple[str, str]]):
+    def __init__(self):
         self._lock = threading.Lock()
-        self._slots: Dict[str, _UnitSlot] = {
-            unit_id: _UnitSlot(unit_id=unit_id, label=label)
-            for unit_id, label in unit_slots
-        }
+        self._slots: Dict[str, _UnitSlot] = {}
 
     def add_reading(self, unit_id: str, reading: UnitReading) -> None:
         with self._lock:
-            slot = self._slots[unit_id]
+            slot = self._slots.get(unit_id)
+            if slot is None:
+                slot = _UnitSlot(unit_id=unit_id, label=_default_label(unit_id))
+                self._slots[unit_id] = slot
             slot.freq.append((reading.t, reading.freq_hz))
             self._trim(slot.freq, reading.t)
 
@@ -174,20 +179,17 @@ def _consume(
 
 def create_app(
     simulated_units: Optional[List[dict]] = None,
-    unit_slots: Optional[List[Tuple[str, str]]] = None,
 ) -> Flask:
     simulated_units = SIMULATED_UNITS if simulated_units is None else simulated_units
-    unit_slots = UNIT_SLOTS if unit_slots is None else unit_slots
-    labels_by_id = dict(unit_slots)
 
-    state = _UnitsState(unit_slots)
+    state = _UnitsState()
     stop_event = threading.Event()
     feeds_and_threads = []
 
     for cfg in simulated_units:
         unit_id = cfg["unit_id"]
         feed_kwargs = {k: v for k, v in cfg.items() if k != "unit_id"}
-        feed = SyntheticUnitFeed(unit_id=unit_id, label=labels_by_id[unit_id], **feed_kwargs)
+        feed = SyntheticUnitFeed(unit_id=unit_id, label=_default_label(unit_id), **feed_kwargs)
         feed.start()
         consumer = threading.Thread(
             target=_consume, args=(unit_id, feed, state, stop_event), daemon=True
@@ -214,6 +216,9 @@ def create_app(
                             "gps_utc_s": 41023.5}, ...]}
         amplitude_v/gps_utc_s are optional per-reading (gps_utc_s is blank
         on the device until PPS sync, same as overnight_log.py's schema).
+        unit_id isn't checked against a fixed roster -- a new unit_id gets
+        its own dashboard card automatically on its first accepted batch
+        (see _UnitsState.add_reading), no code change needed to "add" it.
         Readings are timestamped by server receipt time, not gps_utc_s --
         gps_utc_s is seconds-of-day and can be absent pre-sync, so it isn't
         safe as the window/RoCoF ordering key; it's stored alongside purely
@@ -227,8 +232,8 @@ def create_app(
             return jsonify(error="expected a JSON object"), 400
 
         unit_id = payload.get("unit_id")
-        if unit_id not in labels_by_id:
-            return jsonify(error=f"unknown unit_id {unit_id!r}"), 400
+        if not isinstance(unit_id, str) or not unit_id.strip():
+            return jsonify(error=f"invalid unit_id {unit_id!r}"), 400
 
         readings = payload.get("readings")
         if not isinstance(readings, list) or not readings:
