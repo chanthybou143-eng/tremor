@@ -36,6 +36,10 @@ from freq_estimator import estimate_frequency, generate_synthetic_signal  # noqa
 class UnitReading:
     t: float
     freq_hz: float
+    # Populated by real ingested readings (see webapp.py's /api/ingest);
+    # SyntheticUnitFeed never sets these, so both default to None.
+    amplitude_v: Optional[float] = None
+    gps_utc_s: Optional[float] = None
 
 
 class UnitFeed(ABC):

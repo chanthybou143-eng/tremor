@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import statistics
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 from .rocof import rocof_from_window
 from .units import SyntheticUnitFeed, UnitFeed, UnitReading
@@ -87,6 +88,11 @@ class _UnitSlot:
     label: str
     freq: Deque[Tuple[float, float]] = field(default_factory=deque)
     rocof: Deque[Tuple[float, float]] = field(default_factory=deque)
+    # Only populated by real ingested readings (see /api/ingest below) --
+    # SyntheticUnitFeed's readings never carry amplitude_v, so this stays
+    # empty for the synthetic units.
+    amplitude: Deque[Tuple[float, float]] = field(default_factory=deque)
+    last_gps_utc_s: Optional[float] = None
 
 
 class _UnitsState:
@@ -105,6 +111,12 @@ class _UnitsState:
             slot = self._slots[unit_id]
             slot.freq.append((reading.t, reading.freq_hz))
             self._trim(slot.freq, reading.t)
+
+            if reading.amplitude_v is not None:
+                slot.amplitude.append((reading.t, reading.amplitude_v))
+                self._trim(slot.amplitude, reading.t)
+            if reading.gps_utc_s is not None:
+                slot.last_gps_utc_s = reading.gps_utc_s
 
             window = [
                 (t, f) for t, f in slot.freq if reading.t - t <= ROCOF_WINDOW_S
@@ -130,10 +142,14 @@ class _UnitsState:
                     out.append(dict(
                         id=slot.unit_id, label=slot.label, status="offline",
                         freq_hz=None, rocof_hz_s=None, history=[],
+                        amplitude_v=None, gps_utc_s=None,
                     ))
                     continue
                 latest_t = slot.freq[-1][0]
                 recent = [f for t, f in slot.freq if latest_t - t <= READOUT_WINDOW_S]
+                recent_amplitude = [
+                    a for t, a in slot.amplitude if latest_t - t <= READOUT_WINDOW_S
+                ]
                 out.append(dict(
                     id=slot.unit_id,
                     label=slot.label,
@@ -141,6 +157,8 @@ class _UnitsState:
                     freq_hz=statistics.median(recent),
                     rocof_hz_s=slot.rocof[-1][1] if slot.rocof else 0.0,
                     history=[list(p) for p in _smoothed_history(list(slot.freq))],
+                    amplitude_v=statistics.median(recent_amplitude) if recent_amplitude else None,
+                    gps_utc_s=slot.last_gps_utc_s,
                 ))
             return out
 
@@ -186,6 +204,58 @@ def create_app(
     @app.get("/api/units")
     def api_units():
         return jsonify(state.snapshot())
+
+    @app.post("/api/ingest")
+    def api_ingest():
+        """Batched ingest for a real unit's readings -- what a Pico's WiFi
+        client will eventually POST, one batch per uplink. Body shape:
+            {"unit_id": "unit-1",
+             "readings": [{"frequency_hz": 49.98, "amplitude_v": 0.72,
+                            "gps_utc_s": 41023.5}, ...]}
+        amplitude_v/gps_utc_s are optional per-reading (gps_utc_s is blank
+        on the device until PPS sync, same as overnight_log.py's schema).
+        Readings are timestamped by server receipt time, not gps_utc_s --
+        gps_utc_s is seconds-of-day and can be absent pre-sync, so it isn't
+        safe as the window/RoCoF ordering key; it's stored alongside purely
+        as metadata. A small per-reading offset (~1 mains cycle) keeps
+        timestamps strictly increasing within one batch -- rocof_from_window's
+        least-squares fit is poorly conditioned on near-duplicate timestamps
+        (sub-microsecond spacing triggers numpy's RankWarning).
+        """
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(error="expected a JSON object"), 400
+
+        unit_id = payload.get("unit_id")
+        if unit_id not in labels_by_id:
+            return jsonify(error=f"unknown unit_id {unit_id!r}"), 400
+
+        readings = payload.get("readings")
+        if not isinstance(readings, list) or not readings:
+            return jsonify(error="'readings' must be a non-empty list"), 400
+
+        parsed = []
+        for r in readings:
+            if not isinstance(r, dict):
+                return jsonify(error="each reading must be an object"), 400
+            try:
+                freq_hz = float(r["frequency_hz"])
+                amplitude_v = float(r["amplitude_v"]) if r.get("amplitude_v") is not None else None
+                gps_utc_s = float(r["gps_utc_s"]) if r.get("gps_utc_s") is not None else None
+            except (KeyError, TypeError, ValueError):
+                return jsonify(error="each reading needs a numeric frequency_hz"), 400
+            parsed.append((freq_hz, amplitude_v, gps_utc_s))
+
+        now = time.time()
+        for i, (freq_hz, amplitude_v, gps_utc_s) in enumerate(parsed):
+            state.add_reading(unit_id, UnitReading(
+                t=now + i * 0.02,
+                freq_hz=freq_hz,
+                amplitude_v=amplitude_v,
+                gps_utc_s=gps_utc_s,
+            ))
+
+        return jsonify(accepted=len(parsed)), 202
 
     def shutdown() -> None:
         stop_event.set()

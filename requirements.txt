@@ -1,0 +1,20 @@
+# Pinned to exactly what's installed and tested in the project's .venv
+# (Python 3.9.6) -- generated from `.venv/bin/pip freeze`, trimmed to the
+# subset tremor.webapp actually imports at runtime (Flask + its own
+# dependency chain, plus numpy for tremor.rocof). Deliberately excludes
+# dev/offline/hardware-only packages from the same .venv that the web
+# dashboard never touches: scipy (tremor.filters' offline Butterworth
+# filter), matplotlib (the single-unit tremor.dashboard), pytest, mpremote
+# and pyserial (Pico bring-up tooling).
+blinker==1.9.0
+click==8.1.8
+Flask==3.1.3
+importlib_metadata==8.7.1
+importlib_resources==6.5.2
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+numpy==2.0.2
+typing_extensions==4.16.0
+Werkzeug==3.1.8
+zipp==3.23.1

@@ -102,3 +102,53 @@ def test_api_units_route_goes_live_with_a_simulated_unit():
         assert unit1["freq_hz"] == pytest.approx(50.0, abs=0.05)
     finally:
         app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_api_ingest_accepts_a_batch_and_updates_the_unit():
+    app = create_app(simulated_units=[])
+    client = app.test_client()
+    try:
+        resp = client.post("/api/ingest", json={
+            "unit_id": "unit-1",
+            "readings": [
+                {"frequency_hz": 49.98, "amplitude_v": 0.72, "gps_utc_s": 41023.5},
+                {"frequency_hz": 50.01, "amplitude_v": 0.73, "gps_utc_s": 41023.52},
+            ],
+        })
+        assert resp.status_code == 202
+        assert resp.get_json()["accepted"] == 2
+
+        data = client.get("/api/units").get_json()
+        unit1 = next(u for u in data if u["id"] == "unit-1")
+        assert unit1["status"] == "live"
+        assert unit1["freq_hz"] == pytest.approx(49.995, abs=0.01)
+        assert unit1["amplitude_v"] == pytest.approx(0.725, abs=0.01)
+        assert unit1["gps_utc_s"] == pytest.approx(41023.52)
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_api_ingest_rejects_unknown_unit():
+    app = create_app(simulated_units=[])
+    client = app.test_client()
+    try:
+        resp = client.post("/api/ingest", json={
+            "unit_id": "not-a-real-unit",
+            "readings": [{"frequency_hz": 50.0}],
+        })
+        assert resp.status_code == 400
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_api_ingest_rejects_missing_frequency():
+    app = create_app(simulated_units=[])
+    client = app.test_client()
+    try:
+        resp = client.post("/api/ingest", json={
+            "unit_id": "unit-1",
+            "readings": [{"amplitude_v": 0.72}],
+        })
+        assert resp.status_code == 400
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
