@@ -423,9 +423,11 @@ def test_find_gaps_detects_a_large_gap_but_not_normal_spacing():
 
 
 def test_completeness_pct_reflects_missing_samples():
+    # completeness_pct is measured over the fixed COMPLETENESS_WINDOW_S
+    # (60s, same as the rolling buffers' own retention) -- posting every
+    # other second across the full window should read ~50%.
     state = _UnitsState()
-    # 30 expected samples over 30s at 1/s, but only post every other second.
-    for i in range(0, 30, 2):
+    for i in range(0, 60, 2):
         state.add_reading("unit-1", UnitReading(t=float(i), freq_hz=50.0))
 
     snapshot = state.snapshot()
@@ -435,12 +437,36 @@ def test_completeness_pct_reflects_missing_samples():
 
 def test_completeness_pct_full_when_no_samples_missing():
     state = _UnitsState()
-    for i in range(30):
+    for i in range(60):
         state.add_reading("unit-1", UnitReading(t=float(i), freq_hz=50.0))
 
     snapshot = state.snapshot()
     unit1 = next(u for u in snapshot if u["id"] == "unit-1")
     assert unit1["completeness_pct"] == pytest.approx(100.0, abs=1.0)
+
+
+def test_completeness_pct_drops_despite_a_burst_denser_than_1hz():
+    # Regression test for the count/expected formula this replaced: a burst
+    # of readings all landing within the same second could inflate a raw
+    # reading count past "expected" and clamp to 100% even with a real
+    # multi-second gap elsewhere in the window -- completeness_pct must be
+    # measured by distinct seconds with data, not total reading count, so
+    # a burst's extra readings can't paper over the gap.
+    state = _UnitsState()
+    # 40 readings crammed into second 0 alone (a burst denser than 1/s).
+    for i in range(40):
+        state.add_reading("unit-1", UnitReading(t=0.025 * i, freq_hz=50.0))
+    # A real ~19s gap (t=1 to t=20), then one reading/s for the rest of the
+    # 60s window.
+    for t in range(20, 59):
+        state.add_reading("unit-1", UnitReading(t=float(t), freq_hz=50.0))
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    # Old formula: count=79, expected=58 -> 136%, clamped to 100%.
+    # New formula: 40 distinct seconds (1 from the burst + 39 resumed) of
+    # the 60s window -> ~66.7%.
+    assert unit1["completeness_pct"] == pytest.approx(66.7, abs=2.0)
 
 
 # --- Part 3: status strip data -------------------------------------------
