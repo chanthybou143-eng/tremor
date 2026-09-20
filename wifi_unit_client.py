@@ -194,6 +194,11 @@ def _wifi_service():
             pass  # e.g. "already connecting" -- next retry will catch a real failure
 
 
+PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to check
+                            # whether the collect below is actually reducing/preventing
+                            # ENOMEM failures, or whether they happen regardless
+
+
 def _post_batch(payload):
     """IngestBuffer's injected post_fn. Returns True only on a 2xx
     response. Every response is explicitly closed -- a missed .close()
@@ -203,40 +208,70 @@ def _post_batch(payload):
     build supports a timeout kwarg at all -- without one, a dead/half-open
     connection can block this call indefinitely.
 
-    micropython.mem_info() (no verbose argument -- that would also print
-    a full block-by-block heap map, not needed here) plus gc.mem_free()
-    are printed at the top of every call, i.e. every ~30s matching
-    POST_INTERVAL_S, with no extra throttling needed -- this puts "max
-    free sz" (the largest contiguous free block, the figure ENOMEM
-    actually depends on, not just total free bytes) next to every
-    success or failure, not just failures.
+    Trial 1 showed heap_free swinging through deep troughs between
+    readings taken 30s apart (as low as ~28KB total, ~12KB max contiguous
+    free block), every one of which fully recovered by the next STATUS
+    line's own gc.collect() (10s later) -- meaning most of each trough
+    was reclaimable garbage sitting uncollected, not live data. gc.collect()
+    is now called here too (gated by PRE_POST_GC_COLLECT above, so this
+    can be A/B tested rather than assumed to help), immediately before
+    mem_info()/the POST, so a POST never has to compete with garbage
+    that simply hasn't been swept yet.
+
+    Both mem_info() and gc.mem_free() are read/printed before AND after
+    the collect, so the before/after is visible. gc.mem_free() returns a
+    value, so both numbers land on the single PRE_POST line directly.
+    micropython.mem_info() does not return anything -- it only prints,
+    and there is no portable MicroPython API to read "max free sz" as a
+    number (confirmed: this is an open feature request, not an oversight
+    on this file's part -- see micropython/micropython#910) -- so its
+    before/after can only be two separate printed blocks
+    (MEM_INFO_PRE_COLLECT / MEM_INFO_POST_COLLECT), not merged into one
+    line, but they're adjacent in the log and directly comparable by eye.
     """
+    heap_free_before_collect = gc.mem_free()
+    print("# MEM_INFO_PRE_COLLECT")
     micropython.mem_info()
-    print("# PRE_POST heap_free={}".format(gc.mem_free()))
+
+    if PRE_POST_GC_COLLECT:
+        gc.collect()
+
+    heap_free_after_collect = gc.mem_free()
+    print("# MEM_INFO_POST_COLLECT")
+    micropython.mem_info()
+
+    print("# PRE_POST heap_free_before_collect={} heap_free_after_collect={}".format(
+        heap_free_before_collect, heap_free_after_collect))
 
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
         return False
     response = None
     try:
+        # Captured at the moment this function actually starts the
+        # request, so a failure line shows the state right before the
+        # attempt instead of only the aftermath -- Trial 1's POST_FAIL
+        # lines showed heap_free well above 350KB, read after
+        # urequests.post() had already unwound and likely freed whatever
+        # it failed to allocate, which told us almost nothing about the
+        # actual moment of failure. This still isn't the literal instant
+        # of the internal allocation failure inside urequests (only
+        # instrumenting urequests itself -- branch
+        # fix-memcrash-manual-post, not part of this branch -- can get
+        # that granularity), but it's the closest this branch can get
+        # without doing that.
+        heap_free_at_try_start = gc.mem_free()
         response = urequests.post(INGEST_URL, json=payload)
         ok = 200 <= response.status_code < 300
         if not ok:
-            # Diagnostic only -- return value/behaviour below is unchanged
-            # either way. Added after a soak where every POST in one
-            # incarnation failed and the log had no trace of why: this
-            # branch and the except below are the only places that decide
-            # False, so this is where the reason has to be captured.
-            # heap_free is read here as-is, with no gc.collect() first
-            # (unlike the STATUS line) -- forcing a collection right at
-            # the failure would itself perturb the exact state being
-            # diagnosed.
-            print("# POST_FAIL reason=http_status status={} heap_free={}".format(
-                response.status_code, gc.mem_free()))
+            print("# POST_FAIL reason=http_status status={} heap_free_at_try_start={} "
+                  "heap_free_now={}".format(
+                response.status_code, heap_free_at_try_start, gc.mem_free()))
         return ok
     except Exception as exc:
-        print("# POST_FAIL reason=exception type={} msg={} heap_free={}".format(
-            type(exc).__name__, exc, gc.mem_free()))
+        print("# POST_FAIL reason=exception type={} msg={} heap_free_at_try_start={} "
+              "heap_free_now={}".format(
+            type(exc).__name__, exc, heap_free_at_try_start, gc.mem_free()))
         return False
     finally:
         if response is not None:
