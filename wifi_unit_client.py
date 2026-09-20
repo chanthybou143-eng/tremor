@@ -42,13 +42,44 @@ import time
 
 import micropython
 import network
-import urequests
 from machine import ADC, UART, Pin, Timer
+
+# NEEDS VERIFICATION ON HARDWARE: module names below are the standard
+# MicroPython names as of recent releases (socket/ssl), with the older
+# u-prefixed names (usocket/ussl) as a fallback for firmware that hasn't
+# renamed them yet -- this port's actual naming has not been confirmed on
+# this specific build. Same reasoning for ujson/json.
+try:
+    import socket as _socket
+except ImportError:
+    import usocket as _socket
+try:
+    import ssl as _ssl
+except ImportError:
+    import ussl as _ssl
+try:
+    import json as _json
+except ImportError:
+    import ujson as _json
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
+from http_post import build_post_request
+
+# Parsed once here rather than per-POST -- INGEST_URL is fixed for the life
+# of the process. Mirrors the standard micropython-lib urequests URL
+# parsing (proto, "", host[:port], path).
+_ingest_proto, _, _ingest_host_port, _ingest_path = INGEST_URL.split("/", 3)
+if ":" in _ingest_host_port:
+    INGEST_HOST, _ingest_port_s = _ingest_host_port.split(":", 1)
+    INGEST_PORT = int(_ingest_port_s)
+else:
+    INGEST_HOST = _ingest_host_port
+    INGEST_PORT = 443 if _ingest_proto == "https:" else 80
+INGEST_PATH = _ingest_path
+INGEST_IS_TLS = _ingest_proto == "https:"
 
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
 # adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
@@ -196,12 +227,34 @@ def _wifi_service():
 
 def _post_batch(payload):
     """IngestBuffer's injected post_fn. Returns True only on a 2xx
-    response. Every response is explicitly closed -- a missed .close()
-    on urequests leaks the underlying socket, and repeated leaks exhaust
-    the Pico's socket table over an unattended multi-hour run (see module
-    docstring). NEEDS VERIFICATION ON HARDWARE: whether this urequests
-    build supports a timeout kwarg at all -- without one, a dead/half-open
-    connection can block this call indefinitely.
+    response. Every socket is explicitly closed -- a missed close leaks
+    the underlying socket, and repeated leaks exhaust the Pico's socket
+    table over an unattended multi-hour run (see module docstring).
+
+    This does the HTTPS POST by hand (connect -> TLS wrap -> write ->
+    read the status line) instead of calling urequests.post(), which was
+    the previous implementation (see branch fix-memcrash-array-buffers,
+    this branch's base) and is functionally equivalent -- same return
+    contract, same socket-closing guarantee -- but was an opaque single
+    call with no way to see which internal step an OSError came from.
+    That distinction matters: a soak hit `OSError: [Errno 12] ENOMEM`
+    from inside urequests.post() with no indication whether it was
+    DNS/connect, the TLS handshake, writing the request, or reading the
+    response, all of which allocate. `stage` below is updated before each
+    step so a POST_FAIL line says exactly which one was running. Only the
+    status line is read -- nothing here needs the response body.
+
+    The actual request bytes are built by http_post.build_post_request
+    (host-testable -- see tests/test_http_post.py), reviewed specifically
+    against PythonAnywhere's known behaviour: it holds a response for
+    ~15s on any connection not explicitly told to close, regardless of
+    HTTP version (see the keep-alive investigation, commit history) --
+    build_post_request always sends "Connection: close" explicitly, plus
+    Host and a Content-Length computed from the encoded body's byte
+    length (not character count -- see that module's own test for why
+    the distinction matters). server_hostname=INGEST_HOST is passed to
+    the TLS wrap for SNI, since the target is a shared host
+    (pythonanywhere.com) that needs it to route to the right site.
 
     micropython.mem_info() (no verbose argument -- that would also print
     a full block-by-block heap map, not needed here) plus gc.mem_free()
@@ -210,37 +263,54 @@ def _post_batch(payload):
     free sz" (the largest contiguous free block, the figure ENOMEM
     actually depends on, not just total free bytes) next to every
     success or failure, not just failures.
+
+    NEEDS VERIFICATION ON HARDWARE: this has not run on this device. The
+    connect/wrap/write/read sequence mirrors the standard micropython-lib
+    urequests structure closely to minimize deviation from what's already
+    proven to work, but it is a genuine reimplementation, not a refactor.
+    Also unverified: whether this socket/ssl module supports a read
+    timeout at all (the same open question urequests carried -- without
+    one, a dead/half-open connection can block this call indefinitely).
     """
     micropython.mem_info()
     print("# PRE_POST heap_free={}".format(gc.mem_free()))
 
     if not wlan.isconnected():
-        print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
+        print("# POST_FAIL stage=connect reason=wifi_disconnected heap_free={}".format(
+            gc.mem_free()))
         return False
-    response = None
+
+    stage = "connect"
+    s = None
     try:
-        response = urequests.post(INGEST_URL, json=payload)
-        ok = 200 <= response.status_code < 300
+        body = _json.dumps(payload).encode()
+        request = build_post_request(INGEST_HOST, INGEST_PATH, body)
+        addr = _socket.getaddrinfo(INGEST_HOST, INGEST_PORT)[0][-1]
+        s = _socket.socket()
+        s.connect(addr)
+
+        if INGEST_IS_TLS:
+            stage = "tls_wrap"
+            s = _ssl.wrap_socket(s, server_hostname=INGEST_HOST)
+
+        stage = "write"
+        s.write(request)
+
+        stage = "read"
+        status_line = s.readline()
+        status_code = int(status_line.split(b" ", 2)[1])
+        ok = 200 <= status_code < 300
         if not ok:
-            # Diagnostic only -- return value/behaviour below is unchanged
-            # either way. Added after a soak where every POST in one
-            # incarnation failed and the log had no trace of why: this
-            # branch and the except below are the only places that decide
-            # False, so this is where the reason has to be captured.
-            # heap_free is read here as-is, with no gc.collect() first
-            # (unlike the STATUS line) -- forcing a collection right at
-            # the failure would itself perturb the exact state being
-            # diagnosed.
-            print("# POST_FAIL reason=http_status status={} heap_free={}".format(
-                response.status_code, gc.mem_free()))
+            print("# POST_FAIL stage=read reason=http_status status={} heap_free={}".format(
+                status_code, gc.mem_free()))
         return ok
     except Exception as exc:
-        print("# POST_FAIL reason=exception type={} msg={} heap_free={}".format(
-            type(exc).__name__, exc, gc.mem_free()))
+        print("# POST_FAIL stage={} reason=exception type={} msg={} heap_free={}".format(
+            stage, type(exc).__name__, exc, gc.mem_free()))
         return False
     finally:
-        if response is not None:
-            response.close()
+        if s is not None:
+            s.close()
 
 
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
