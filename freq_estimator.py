@@ -151,7 +151,7 @@ def moving_average(samples, window, n=None, out=None):
 # ---------------------------------------------------------------------------
 
 def find_zero_crossings(timestamps, samples, dc_offset=0.0, rising_only=True,
-                         hysteresis=0.0):
+                         hysteresis=0.0, n=None):
     """
     Find interpolated zero-crossing times (relative to dc_offset).
 
@@ -170,13 +170,20 @@ def find_zero_crossings(timestamps, samples, dc_offset=0.0, rising_only=True,
     -- the re-arm threshold becomes "< 0", which any noise-induced dip below
     zero satisfies immediately, so it's not actually a special case in the
     code, just a degenerate hysteresis band.
+
+    n (optional, default None): valid length of timestamps/samples, for a
+    caller passing oversized, reused buffers (see chunk_summary.py's
+    summarize_chunk) -- indices past n-1 are never read. Default (None)
+    is unchanged: n is taken from len(samples).
     """
+    if n is None:
+        n = len(samples)
     crossings = []
     prev_t = timestamps[0]
     prev_y = samples[0] - dc_offset
     armed = True  # ready to detect a rising crossing
 
-    for i in range(1, len(samples)):
+    for i in range(1, n):
         t = timestamps[i]
         y = samples[i] - dc_offset
 
@@ -224,7 +231,7 @@ def frequency_from_crossings(crossings):
 
 
 def estimate_frequency(timestamps, samples, dc_offset=0.0, hysteresis=0.05,
-                        filter_window_s=0.0):
+                        filter_window_s=0.0, n=None):
     """
     Convenience wrapper: samples in -> single averaged frequency estimate
     out, plus the per-cycle estimates for inspection.
@@ -252,16 +259,24 @@ def estimate_frequency(timestamps, samples, dc_offset=0.0, hysteresis=0.05,
     set larger than the signal amplitude) -- silently returning a None
     frequency is a trap for any caller that goes on to do arithmetic with
     it.
+
+    n (optional, default None): valid length of timestamps/samples, for a
+    caller passing oversized, reused buffers. Threaded through to both
+    moving_average and find_zero_crossings so indices past n-1 are never
+    read regardless of which branch below runs. Default (None) is
+    unchanged: n is taken from len(samples).
     """
+    if n is None:
+        n = len(samples)
     if filter_window_s > 0.0:
         sample_rate_hz = 1.0 / (timestamps[1] - timestamps[0])
         window_samples = max(1, round(filter_window_s * sample_rate_hz))
-        filtered = moving_average(samples, window_samples)
+        filtered = moving_average(samples, window_samples, n=n)
     else:
         filtered = samples
 
     crossings = find_zero_crossings(timestamps, filtered, dc_offset=dc_offset,
-                                     hysteresis=hysteresis)
+                                     hysteresis=hysteresis, n=n)
     per_cycle = frequency_from_crossings(crossings)
     if not per_cycle:
         raise ValueError(

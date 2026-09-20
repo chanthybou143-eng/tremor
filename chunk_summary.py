@@ -63,10 +63,6 @@ def _boxcar_gain(window_samples, sample_rate_hz, freq_hz=NOMINAL_GRID_FREQ_HZ):
     return abs(math.sin(window_samples * theta) / (window_samples * math.sin(theta)))
 
 
-def _mean(values):
-    return sum(values) / len(values)
-
-
 def _median(values):
     ordered = sorted(values)
     n = len(ordered)
@@ -113,50 +109,50 @@ def summarize_chunk(timestamps, raw_voltages,
     data past index n-1) and a reusable scratch list as `filtered_buf` for
     moving_average to write into instead of allocating. Every read of
     `timestamps`/`raw_voltages`/the filtered signal below is bounded to
-    `n`, so stale data past that index is never touched. Default behaviour
-    (n=None) is unchanged from before this parameter existed: n is taken
-    from len(timestamps) and no buffer is reused.
+    `n` *by index* -- no slicing -- so stale data past that index is never
+    touched and nothing here allocates a new list of its own. Default
+    behaviour (n=None) is unchanged from before this parameter existed: n
+    is taken from len(timestamps).
     """
-    reusing_buffers = n is not None
     if n is None:
         n = len(timestamps)
     if n < 2:
         raise DegenerateTimestampsError(
             "need at least 2 timestamps to compute a sample rate, got {}".format(n))
-    ts = timestamps[:n] if reusing_buffers else timestamps
-    span = ts[-1] - ts[0]
+    span = timestamps[n - 1] - timestamps[0]
     if span <= 0:
         raise DegenerateTimestampsError(
             "non-positive timestamp span ({}) across {} samples -- "
-            "first={} last={}".format(span, n, ts[0], ts[-1]))
+            "first={} last={}".format(span, n, timestamps[0], timestamps[n - 1]))
     sample_rate_hz = (n - 1) / span
     window_samples = max(1, round(filter_window_s * sample_rate_hz))
-    filtered_out = moving_average(raw_voltages, window_samples, n=n, out=filtered_buf)
-    filtered = filtered_out[:n] if reusing_buffers else filtered_out
+    filtered = moving_average(raw_voltages, window_samples, n=n, out=filtered_buf)
 
-    dc_offset = _mean(filtered)
-    # Accumulator loop instead of _mean([(v-dc_offset)**2 for v in
-    # filtered]): that listcomp is exactly what crashed most often in
-    # production (chunk_summary.py:121, 14 of 19 MemoryErrors in a single
-    # soak) -- MicroPython grows a listcomp's result via repeated append
-    # the same as a manual loop, so even though `filtered` here is already
-    # a right-sized, already-allocated list, building a *second* ~1030
-    # element list right next to it (both alive at once, mid-chunk, right
-    # after `filtered` and `raw_voltages` were themselves just built) is
-    # exactly the kind of back-to-back large-allocation burst that trips
-    # the doubling-growth allocator under fragmentation. An accumulator
-    # never allocates a list at all, regardless of whether filtered_buf is
-    # in use, so this fix applies unconditionally, not just in reuse mode.
+    # dc_offset and variance are both plain accumulator loops bounded by
+    # `n`, not _mean()/a listcomp over `filtered` -- `filtered` may be an
+    # oversized, reused buffer (stale past index n-1), and slicing it down
+    # to filtered[:n] first (the previous approach) was itself exactly the
+    # kind of per-chunk allocation this fix removes: a fresh ~4.6KB list
+    # every chunk, and the actual site of a MemoryError in production
+    # (chunk_summary.py:135) even though the slice itself is a one-shot,
+    # correctly-sized MicroPython allocation, not a doubling-growth one --
+    # under severe heap pressure a one-shot allocation can still fail.
+    # Indexing bounded by n allocates nothing at all, regardless of mode.
+    dc_sum = 0.0
+    for i in range(n):
+        dc_sum += filtered[i]
+    dc_offset = dc_sum / n
+
     variance_acc = 0.0
-    for v in filtered:
-        variance_acc += (v - dc_offset) ** 2
-    variance = variance_acc / len(filtered)
+    for i in range(n):
+        variance_acc += (filtered[i] - dc_offset) ** 2
+    variance = variance_acc / n
     amplitude = (2 * variance) ** 0.5 / _boxcar_gain(window_samples, sample_rate_hz)
     hysteresis = hysteresis_fraction * amplitude
 
     _mean_freq, per_cycle = estimate_frequency(
-        ts, filtered, dc_offset=dc_offset,
-        hysteresis=hysteresis, filter_window_s=0.0,
+        timestamps, filtered, dc_offset=dc_offset,
+        hysteresis=hysteresis, filter_window_s=0.0, n=n,
     )
     frequency_hz = _median([f for _, f in per_cycle])
     return frequency_hz, amplitude

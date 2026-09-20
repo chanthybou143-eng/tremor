@@ -149,3 +149,29 @@ def test_frequency_from_crossings_matches_known_period():
     crossings = [0.0, 0.02, 0.04, 0.06]  # 20ms period -> 50Hz
     estimates = frequency_from_crossings(crossings)
     assert all(f == pytest.approx(50.0) for _, f in estimates)
+
+
+def test_find_zero_crossings_ignores_stale_data_past_n():
+    ts, ys = generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=0.1, seed=9)
+    n = len(ts)
+    capacity = n + 500
+    ts_oversized = list(ts) + [ts[-1] + 1000.0] * (capacity - n)  # garbage, way out of order
+    ys_oversized = list(ys) + [9999.0] * (capacity - n)           # garbage amplitude
+
+    expected = find_zero_crossings(ts, ys)
+    actual = find_zero_crossings(ts_oversized, ys_oversized, n=n)
+    assert actual == expected
+
+
+def test_estimate_frequency_ignores_stale_data_past_n():
+    ts, ys = generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=0.5, seed=10)
+    n = len(ts)
+    capacity = n + 500
+    ts_oversized = list(ts) + [ts[-1] + 1000.0] * (capacity - n)
+    ys_oversized = list(ys) + [9999.0] * (capacity - n)
+
+    expected_freq, expected_per_cycle = estimate_frequency(ts, ys)
+    actual_freq, actual_per_cycle = estimate_frequency(ts_oversized, ys_oversized, n=n)
+
+    assert actual_freq == expected_freq
+    assert actual_per_cycle == expected_per_cycle
