@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import itertools
 import time
 
 import pytest
 
-from tremor.webapp import _UnitsState, _smoothed_history, create_app
+from tremor.rocof import rocof_from_window
+from tremor.webapp import (
+    MAX_ROCOF_GAP_S,
+    ROCOF_PLAUSIBILITY_LIMIT_HZ_S,
+    ROCOF_WINDOW_S,
+    GAP_THRESHOLD_S,
+    STALE_THRESHOLD_S,
+    _find_gaps,
+    _gps_utc_delta_s,
+    _UnitsState,
+    _smoothed_history,
+    create_app,
+)
 from tremor.units import UnitReading
 
 
@@ -214,3 +227,275 @@ def test_api_ingest_rejects_missing_frequency():
         assert resp.status_code == 400
     finally:
         app.config["TREMOR_SHUTDOWN"]()
+
+
+# --- Part 1: RoCoF cross-batch/restart-boundary fix -------------------------
+#
+# Reproduces the production incident (7714d2a): a crash-triggered restart's
+# first (small) batch landed close enough in real submission time to the
+# tail of the pre-crash batch still in the 60s window that the OLD
+# reconstructed-timestamp-based fit saw an artificially tiny apparent gap,
+# producing a real -22.953 Hz/s reading. Mechanism: every batch's
+# timestamps are independently reconstructed from that batch's own receipt
+# time (see /api/ingest's docstring) -- two different batches' reconstructed
+# times were never safe to compare directly, regardless of how small the
+# apparent gap between them looked.
+
+def test_reproduces_the_impossible_rocof_if_batches_were_naively_bridged():
+    """Demonstrates the bug's mechanism concretely, independent of the
+    server's own eligibility guard: feeding rocof_from_window the exact
+    kind of naively-reconstructed timestamps two close-together batches
+    would produce yields a physically impossible slope, the same order of
+    magnitude as the production incident's -22.953 Hz/s. This is the
+    "show the impossible value" reproduction the fix is judged against --
+    the *next* test confirms the actual server code no longer produces it.
+
+    The exact gap (20ms) is illustrative, not a measurement -- the real
+    incident's underlying batch never got its timestamps logged before it
+    crashed (see wifi_unit_client.py's git history), so the precise gap
+    that occurred there is unknown. A copy of that night's device-side log
+    (logs/wifi_soak_20260919_203209.log) shows the device's own
+    crash-to-reconnect cycle was consistently ~1.0-1.02s -- but that's the
+    DEVICE's reconnect time, not the SERVER-RECEIPT gap between the two
+    POSTs that actually drives this bug: at a 1s gap even a large
+    frequency swing stays under ROCOF_PLAUSIBILITY_LIMIT_HZ_S (a Δf of
+    5+Hz would be needed, not "ordinary chunk noise" anymore), so
+    whatever the real receipt-time gap was, it was necessarily much
+    smaller than the device's own reconnect cycle -- consistent with 20ms
+    being the right order of magnitude for a reproduction, even though
+    the literal figure is chosen, not measured. What's reproduced here is
+    the *mechanism* (two independently-reconstructed batch timestamps
+    landing unrealistically close together in receipt time), which is
+    what the fix addresses.
+    """
+    # Batch 1 (pre-crash): 8 readings/s ending at 50.00Hz, reconstructed
+    # backward from receipt time 1000.0 (matches /api/ingest's own formula).
+    n1 = 8
+    batch1_ts = [1000.0 - (n1 - 1 - i) * 1.0 for i in range(n1)]
+    batch1_fs = [50.00] * n1
+    # Batch 2 (post-restart, landing only 20ms later in real submission
+    # time -- a fast crash-to-reconnect cycle): a single reading at a
+    # genuinely different but unremarkable frequency (0.5Hz swing, well
+    # within normal chunk-to-chunk variation).
+    batch2_ts = [1000.02]
+    batch2_fs = [49.50]
+
+    # The OLD behavior: bridge the last point of batch 1 with batch 2's
+    # point purely on reconstructed time, no eligibility check at all.
+    window_ts = batch1_ts[-1:] + batch2_ts
+    window_fs = batch1_fs[-1:] + batch2_fs
+    naive_slope = rocof_from_window(window_ts, window_fs)
+
+    assert abs(naive_slope) > ROCOF_PLAUSIBILITY_LIMIT_HZ_S, (
+        "expected this scenario to reproduce a physically impossible slope "
+        f"(got {naive_slope} Hz/s) -- if this fails, the reproduction itself "
+        "no longer matches the incident shape"
+    )
+
+
+def test_server_does_not_bridge_close_batches_without_gps_confirmation(monkeypatch):
+    """The actual fix, exercised through the real /api/ingest HTTP path
+    with the exact batch shape from the reproduction above (no gps_utc_s
+    on either batch, matching a device that hasn't acquired PPS lock --
+    also the incident's real condition, since GPS-synced-and-still-wrong
+    was never the failure mode)."""
+    app = create_app(simulated_units=[])
+    client = app.test_client()
+    try:
+        # chain + repeat: the two POSTs need exactly these two values, but
+        # snapshot()'s own `now = time.time()` call afterward needs one
+        # more -- hold at the last value rather than run out.
+        times = itertools.chain([1000.0, 1000.02], itertools.repeat(1000.02))
+        monkeypatch.setattr("tremor.webapp.time.time", lambda: next(times))
+
+        client.post("/api/ingest", json={
+            "unit_id": "unit-1",
+            "readings": [{"frequency_hz": 50.00} for _ in range(8)],
+        })
+        resp = client.post("/api/ingest", json={
+            "unit_id": "unit-1",
+            "readings": [{"frequency_hz": 49.50}],
+        })
+        assert resp.status_code == 202
+
+        data = client.get("/api/units").get_json()
+        unit1 = next(u for u in data if u["id"] == "unit-1")
+
+        # No eligible cross-batch pair exists (different batch_ids, no GPS
+        # on either side) -- batch 2's reading contributes no new RoCoF
+        # point, so the last stored value stays whatever batch 1's own
+        # (8 identical readings, same batch) least-squares fit produced --
+        # ~0, modulo floating-point noise, never the naive-bridge value.
+        assert unit1["rocof_hz_s"] == pytest.approx(0.0, abs=1e-6)
+        assert all(abs(r) <= ROCOF_PLAUSIBILITY_LIMIT_HZ_S for _t, r in unit1["rocof_history"])
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_gps_confirmed_small_gap_bridges_batches_correctly():
+    """The fix's positive case: two different batches, but BOTH readings
+    carry a real GPS UTC timestamp confirming they really are close
+    together -- this should compute a normal, correct RoCoF, not refuse
+    just because it's a different batch_id. Otherwise the fix would be
+    overcorrecting: a real unit that restarts cleanly with GPS already
+    locked shouldn't lose a legitimate reading at the seam.
+    """
+    state = _UnitsState()
+    b1 = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=1000.0, freq_hz=50.00, gps_utc_s=41000.0), batch_id=b1)
+    b2 = state.next_batch_id()
+    # 0.5s later by GPS, a different batch, but the server's own `t` guess
+    # could easily disagree slightly -- GPS should be preferred regardless.
+    state.add_reading("unit-1", UnitReading(t=1050.0, freq_hz=50.02, gps_utc_s=41000.5), batch_id=b2)
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    # True slope: 0.02Hz / 0.5s = 0.04 Hz/s
+    assert unit1["rocof_hz_s"] == pytest.approx(0.04, abs=0.01)
+
+
+def test_gps_delta_folds_midnight_rollover():
+    # 23:59:59.5 -> 00:00:00.5 is a real 1.0s gap, not a ~-86399s one.
+    assert _gps_utc_delta_s(0.5, 86399.5) == pytest.approx(1.0)
+    assert _gps_utc_delta_s(86399.5, 0.5) == pytest.approx(-1.0)
+
+
+def test_rocof_plausibility_backstop_excludes_and_counts_implausible_slopes():
+    state = _UnitsState()
+    t = 0.0
+    # Same batch (None batch_id, trusted `t`) but a wildly discontinuous
+    # frequency jump -- the backstop must catch this independent of the
+    # cross-batch guard, since same-batch data can still be bad data.
+    for freq in [50.0, 50.0, 90.0]:
+        state.add_reading("unit-1", UnitReading(t=t, freq_hz=freq))
+        t += 0.1
+
+    slot = state._slots["unit-1"]
+    assert slot.rocof_skipped_implausible_count >= 1
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert all(abs(r) <= ROCOF_PLAUSIBILITY_LIMIT_HZ_S for _t, r in unit1["rocof_history"])
+
+
+def test_rocof_boundary_skip_is_counted():
+    state = _UnitsState()
+    b1 = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=1000.0, freq_hz=50.0), batch_id=b1)
+    state.add_reading("unit-1", UnitReading(t=1000.5, freq_hz=50.01), batch_id=b1)
+    b2 = state.next_batch_id()
+    # Different batch, close in reconstructed t, no GPS -- must be
+    # skipped and counted, not silently bridged.
+    state.add_reading("unit-1", UnitReading(t=1000.9, freq_hz=49.5), batch_id=b2)
+
+    slot = state._slots["unit-1"]
+    assert slot.rocof_skipped_boundary_count >= 1
+
+
+def test_max_rocof_gap_rejects_a_real_but_too_large_gap_even_with_gps():
+    # A gap inside ROCOF_WINDOW_S's candidate pool (so it's actually
+    # considered) but beyond MAX_ROCOF_GAP_S's stricter bridging limit --
+    # confirms the two constants do different jobs, not just one filter.
+    assert MAX_ROCOF_GAP_S < ROCOF_WINDOW_S, "test assumes a distinguishable zone exists"
+    gap_s = (MAX_ROCOF_GAP_S + ROCOF_WINDOW_S) / 2
+
+    state = _UnitsState()
+    b1 = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=1000.0, freq_hz=50.0, gps_utc_s=41000.0), batch_id=b1)
+    b2 = state.next_batch_id()
+    state.add_reading(
+        "unit-1",
+        UnitReading(t=1000.0 + gap_s, freq_hz=50.5, gps_utc_s=41000.0 + gap_s),
+        batch_id=b2,
+    )
+    slot = state._slots["unit-1"]
+    assert slot.rocof_skipped_boundary_count >= 1
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["rocof_hz_s"] == 0.0
+
+
+# --- Part 2: gaps and completeness -------------------------------------
+
+def test_find_gaps_detects_a_large_gap_but_not_normal_spacing():
+    points = [(0.0, 50.0), (1.0, 50.0), (2.0, 50.0), (2.0 + GAP_THRESHOLD_S + 1, 50.0)]
+    gaps = _find_gaps(points)
+    assert gaps == [[2.0, 2.0 + GAP_THRESHOLD_S + 1]]
+
+
+def test_completeness_pct_reflects_missing_samples():
+    state = _UnitsState()
+    # 30 expected samples over 30s at 1/s, but only post every other second.
+    for i in range(0, 30, 2):
+        state.add_reading("unit-1", UnitReading(t=float(i), freq_hz=50.0))
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["completeness_pct"] == pytest.approx(50.0, abs=5.0)
+
+
+def test_completeness_pct_full_when_no_samples_missing():
+    state = _UnitsState()
+    for i in range(30):
+        state.add_reading("unit-1", UnitReading(t=float(i), freq_hz=50.0))
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["completeness_pct"] == pytest.approx(100.0, abs=1.0)
+
+
+# --- Part 3: status strip data -------------------------------------------
+
+def test_stale_status_uses_wall_clock_not_reading_relative_time():
+    # Regression test: staleness must be judged against real wall-clock
+    # time since the server last heard from the unit, not against the
+    # reading's own `t` -- SyntheticUnitFeed's `t` is a process-relative
+    # elapsed counter starting near 0, which would make every synthetic
+    # unit look "stale" (now - t ~= now, always huge) if staleness
+    # incorrectly compared against `t` directly.
+    state = _UnitsState()
+    state.add_reading("unit-1", UnitReading(t=0.02, freq_hz=50.0))  # tiny, non-wall-clock t
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["status"] == "live"
+    assert unit1["seconds_since_last_reading"] < 1.0
+
+
+def test_stale_status_after_threshold_elapses(monkeypatch):
+    state = _UnitsState()
+    state.add_reading("unit-1", UnitReading(t=0.0, freq_hz=50.0))
+
+    real_time = time.time
+    monkeypatch.setattr(
+        "tremor.webapp.time.time", lambda: real_time() + STALE_THRESHOLD_S + 1
+    )
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["status"] == "stale"
+
+
+def test_gps_locked_reflects_most_recent_reading_only():
+    state = _UnitsState()
+    state.add_reading("unit-1", UnitReading(t=0.0, freq_hz=50.0, gps_utc_s=41000.0))
+    state.add_reading("unit-1", UnitReading(t=1.0, freq_hz=50.0, gps_utc_s=None))  # lock lost
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    # last_gps_utc_s is sticky (last non-None value); gps_locked must NOT
+    # be, or a unit that lost lock would still claim to be locked.
+    assert unit1["gps_utc_s"] == 41000.0
+    assert unit1["gps_locked"] is False
+
+
+def test_samples_per_minute_counts_recent_readings():
+    state = _UnitsState()
+    for i in range(70):  # 70 readings, 1/s, t=0..69
+        state.add_reading("unit-1", UnitReading(t=float(i), freq_hz=50.0))
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    # latest_t=69.0; readings with t in [9.0, 69.0] satisfy `latest_t - t
+    # <= 60.0` inclusive -- that's i=9..69, 61 readings, not a plain 60/70
+    # split (the boundary is inclusive, same convention READOUT_WINDOW_S's
+    # filter already uses elsewhere in this file).
+    assert unit1["samples_per_minute"] == 61
