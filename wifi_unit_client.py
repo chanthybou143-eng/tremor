@@ -305,11 +305,13 @@ _elapsed_us_total = 0
 # FLOAT_TYPECODE (see its own comment above -- unverified pending
 # check_float_precision.py).
 _chunk_ticks = array.array("I", [0] * CHUNK_CAPACITY)     # raw time.ticks_us() per sample -- for gps_utc_s lookup
-_chunk_ts_s = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)    # elapsed seconds per sample -- summarize_chunk's timestamps
+_chunk_ts_s = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)    # chunk-relative elapsed seconds per sample -- summarize_chunk's timestamps
 _chunk_counts = array.array("H", [0] * CHUNK_CAPACITY)    # raw u16 ADC counts per sample -- converted to volts below
 _voltages = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)      # scratch buffer for the volts-converted chunk
 _filtered_buf = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)  # scratch buffer for summarize_chunk's filtered signal
 _chunk_len = 0
+_chunk_start_us = 0  # _elapsed_us_total at the current chunk's first sample --
+                      # see _chunk_ts_s's own comment in the main loop below
 chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY samples --
                                     # extra samples past capacity are dropped and counted here,
                                     # same "count, don't silently lose" contract as overflow_count
@@ -334,8 +336,31 @@ while True:
         _last_consumed_ticks = raw_ticks
 
         if _chunk_len < CHUNK_CAPACITY:
+            if _chunk_len == 0:
+                # First sample of a new chunk -- this becomes the
+                # reference point _chunk_ts_s is measured from. See its
+                # own comment below for why.
+                _chunk_start_us = _elapsed_us_total
             _chunk_ticks[_chunk_len] = raw_ticks
-            _chunk_ts_s[_chunk_len] = _elapsed_us_total / 1e6
+            # Chunk-relative, not _elapsed_us_total/1e6 (session-cumulative)
+            # directly: chunk_summary.py/freq_estimator.py only ever use
+            # differences between _chunk_ts_s values (span, zero-crossing
+            # interpolation), never an absolute value, so a chunk-relative
+            # timestamp is numerically equivalent for every downstream
+            # calculation -- but it keeps the magnitude bounded to
+            # roughly [0, CHUNK_S] regardless of how long the process has
+            # been running, instead of growing for hours. That bound
+            # matters because FLOAT_TYPECODE='f' (single precision, this
+            # is a rp2 board): float32's step size at ~1030s of session
+            # time is already ~0.24ms, close to the ~0.97ms raw sample
+            # interval at ADC_SAMPLE_HZ=1030, and by ~10h it's ~3.9ms --
+            # *wider* than the sample interval, meaning consecutive
+            # samples' cumulative timestamps could round to the same
+            # float32 value. A chunk-relative value never exceeds
+            # ~1.2s, where float32's step size is a few microseconds --
+            # utterly negligible next to the ~970us sample interval, for
+            # as long as this process runs.
+            _chunk_ts_s[_chunk_len] = (_elapsed_us_total - _chunk_start_us) / 1e6
             _chunk_counts[_chunk_len] = raw_count
             _chunk_len += 1
         else:
