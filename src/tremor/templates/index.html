@@ -31,7 +31,53 @@
   .subtitle {
     color: var(--muted);
     font-size: 0.9rem;
-    margin: 0 0 24px 0;
+    margin: 0 0 20px 0;
+  }
+  .status-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 24px;
+  }
+  .status-chip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 0.8rem;
+  }
+  .status-chip .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--offline);
+    flex: none;
+  }
+  .status-chip.live .dot { background: #4dd68a; }
+  .status-chip.stale .dot { background: var(--accent-rocof); }
+  .status-chip .chip-label {
+    font-weight: 600;
+  }
+  .status-chip .chip-detail {
+    color: var(--muted);
+  }
+  .status-chip .gps-chip {
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .status-chip .gps-chip.locked {
+    background: rgba(77, 214, 138, 0.15);
+    color: #4dd68a;
+  }
+  .status-chip .gps-chip.unlocked {
+    background: rgba(255, 159, 77, 0.15);
+    color: var(--accent-rocof);
   }
   .grid {
     display: grid;
@@ -44,8 +90,22 @@
     border-radius: 10px;
     padding: 20px;
   }
-  .card.offline {
+  .card.offline, .card.stale {
     opacity: 0.55;
+  }
+  .stale-banner {
+    background: rgba(255, 159, 77, 0.12);
+    border: 1px solid rgba(255, 159, 77, 0.35);
+    color: var(--accent-rocof);
+    font-size: 0.8rem;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 10px;
+  }
+  .completeness {
+    color: var(--muted);
+    font-size: 0.75rem;
+    margin-top: 8px;
   }
   .card-header {
     display: flex;
@@ -97,6 +157,7 @@
 <body>
   <h1>TREMOR — Unit Dashboard</h1>
   <p class="subtitle">Frequency and RoCoF per unit · live feed · polling every 1s</p>
+  <div class="status-strip" id="statusStrip"></div>
   <div class="grid" id="grid"></div>
 
 <script>
@@ -111,6 +172,34 @@ const chartsById = {};
 Chart.defaults.color = '#8a919b';       // matches --muted
 Chart.defaults.borderColor = 'rgba(255, 255, 255, 0.08)'; // light, subtle gridlines
 
+// Optional gap shading (Part 2) as a small inline plugin rather than an
+// extra CDN library -- Chart.js's own plugin API already covers this, and
+// the fewer external scripts a page loads, the faster it loads.
+const gapShadingPlugin = {
+  id: 'gapShading',
+  beforeDraw(chart) {
+    const gaps = chart.config.options.plugins.gapShading?.gaps || [];
+    if (!gaps.length) return;
+    const { ctx, chartArea, scales } = chart;
+    if (!chartArea) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+    for (const [x0, x1] of gaps) {
+      const left = scales.x.getPixelForValue(x0);
+      const right = scales.x.getPixelForValue(x1);
+      ctx.fillRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
+    }
+    ctx.restore();
+  },
+};
+Chart.register(gapShadingPlugin);
+
+// GAP_THRESHOLD_S's frontend twin: the server is the single source of
+// truth for WHICH spans count as gaps (see unit.gaps/rocof_gaps below),
+// this is only used to insert the actual line-break point a hair inside
+// a detected gap's start.
+const GAP_BREAK_EPSILON_S = 1e-3;
+
 function makeCard(unit) {
   const card = document.createElement('div');
   card.className = 'card';
@@ -119,6 +208,7 @@ function makeCard(unit) {
       <span class="label"></span>
       <span class="status"></span>
     </div>
+    <div class="stale-banner" hidden></div>
     <div class="readings">
       <div class="reading freq">
         <div class="value">--</div>
@@ -130,6 +220,7 @@ function makeCard(unit) {
       </div>
     </div>
     <div class="chart-container"><canvas></canvas></div>
+    <div class="completeness"></div>
     <div class="no-data" hidden>No data yet</div>
   `;
   grid.appendChild(card);
@@ -147,6 +238,7 @@ function makeCard(unit) {
           yAxisID: 'yFreq',
           pointRadius: 0,
           borderWidth: 1.5,
+          spanGaps: false,               // Part 2: break the line, don't join across a gap
         },
         {
           label: 'RoCoF (Hz/s)',
@@ -156,6 +248,7 @@ function makeCard(unit) {
           yAxisID: 'yRocof',
           pointRadius: 0,
           borderWidth: 1.5,
+          spanGaps: false,
         },
         {
           label: '',                     // hidden from the legend (see filter below)
@@ -178,6 +271,7 @@ function makeCard(unit) {
         legend: {
           labels: { filter: (item) => item.text !== '' },
         },
+        gapShading: { gaps: [] },  // populated per-poll in updateChart
       },
       scales: {
         x: {
@@ -202,6 +296,24 @@ function makeCard(unit) {
   return card;
 }
 
+// Builds a Chart.js dataset array from (t, value) points plus the
+// server's own [start_t, end_t] gap list (see webapp.py's _find_gaps):
+// a null-y point is inserted just inside each gap's start so the line
+// breaks there (spanGaps: false on the dataset) instead of drawing a
+// straight, misleading connector across missing data -- exactly the
+// "bursts joined by connectors" look the original RoCoF bug produced.
+function buildGappedSeries(points, gaps, latestT) {
+  const gapStarts = new Set(gaps.map(([start]) => start));
+  const data = [];
+  for (const [t, value] of points) {
+    data.push({ x: t - latestT, y: value });
+    if (gapStarts.has(t)) {
+      data.push({ x: t - latestT + GAP_BREAK_EPSILON_S, y: null });
+    }
+  }
+  return data;
+}
+
 function updateChart(chart, unit) {
   const freqHistory = unit.history || [];
   const rocofHistory = unit.rocof_history || [];
@@ -212,11 +324,16 @@ function updateChart(chart, unit) {
     rocofHistory.length ? rocofHistory[rocofHistory.length - 1][0] : -Infinity,
   );
 
-  chart.data.datasets[0].data = freqHistory.map(([t, f]) => ({ x: t - latestT, y: f }));
-  chart.data.datasets[1].data = rocofHistory.map(([t, r]) => ({ x: t - latestT, y: r }));
+  chart.data.datasets[0].data = buildGappedSeries(freqHistory, unit.gaps || [], latestT);
+  chart.data.datasets[1].data = buildGappedSeries(rocofHistory, unit.rocof_gaps || [], latestT);
 
   const xMin = chart.data.datasets[0].data.length ? chart.data.datasets[0].data[0].x : -60;
   chart.data.datasets[2].data = [{ x: xMin, y: 50.0 }, { x: 0, y: 50.0 }]; // 50Hz reference line
+
+  // Shade both series' gaps on the same chart area (frequency's gaps in
+  // particular -- RoCoF gaps are usually a subset/superset of those).
+  const shadeGaps = (unit.gaps || []).map(([t0, t1]) => [t0 - latestT, t1 - latestT]);
+  chart.options.plugins.gapShading.gaps = shadeGaps;
 
   chart.update('none'); // 'none' = skip animation
 }
@@ -226,34 +343,88 @@ function updateCard(card, unit) {
   const statusEl = card.querySelector('.status');
   statusEl.textContent = unit.status;
   statusEl.className = 'status ' + unit.status;
-  card.classList.toggle('offline', unit.status !== 'live');
+  card.classList.toggle('offline', unit.status === 'offline');
+  card.classList.toggle('stale', unit.status === 'stale');
 
   const noData = card.querySelector('.no-data');
   const chartContainer = card.querySelector('.chart-container');
   const readings = card.querySelector('.readings');
+  const staleBanner = card.querySelector('.stale-banner');
+  const completeness = card.querySelector('.completeness');
 
-  if (unit.status !== 'live') {
+  if (unit.status === 'offline') {
     noData.hidden = false;
     chartContainer.hidden = true;
     readings.hidden = true;
+    staleBanner.hidden = true;
+    completeness.textContent = '';
     return;
   }
   noData.hidden = true;
   chartContainer.hidden = false;
   readings.hidden = false;
 
+  // "stale" (Part 3): reported before, but not recently -- grey out (see
+  // .card.stale) and show a clear message, but keep the last-known
+  // chart/readings visible rather than hiding them like "offline" does.
+  if (unit.status === 'stale') {
+    const ago = Math.round(unit.seconds_since_last_reading);
+    staleBanner.textContent = `No update in ${ago}s — showing last known values`;
+    staleBanner.hidden = false;
+  } else {
+    staleBanner.hidden = true;
+  }
+
   card.querySelector('.reading.freq .value').textContent = unit.freq_hz.toFixed(3);
   const rocof = unit.rocof_hz_s;
   card.querySelector('.reading.rocof .value').textContent =
     (rocof >= 0 ? '+' : '') + rocof.toFixed(3);
 
+  if (unit.completeness_pct != null) {
+    completeness.textContent =
+      `${unit.completeness_pct.toFixed(0)}% data completeness (last 60s, ` +
+      `${unit.samples_per_minute} samples/min)`;
+  }
+
   updateChart(chartsById[unit.id], unit);
+}
+
+function updateStatusStrip(units) {
+  const strip = document.getElementById('statusStrip');
+  if (units.length === 0) {
+    strip.innerHTML = '<div class="status-chip"><span class="chip-detail">No units yet</span></div>';
+    return;
+  }
+  strip.innerHTML = units.map((unit) => {
+    const lastUpdate = unit.seconds_since_last_reading != null
+      ? `last update ${Math.round(unit.seconds_since_last_reading)}s ago`
+      : 'no data yet';
+    // GPS lock is only shown when we actually know something about it --
+    // gps_locked is null for a unit that's never reported at all, per the
+    // task's "omit rather than fake it" requirement.
+    const gpsChip = unit.gps_locked != null
+      ? `<span class="gps-chip ${unit.gps_locked ? 'locked' : 'unlocked'}">` +
+        `GPS ${unit.gps_locked ? 'locked' : 'no lock'}</span>`
+      : '';
+    const rate = unit.status !== 'offline' ? `${unit.samples_per_minute} samples/min` : '';
+    return `
+      <div class="status-chip ${unit.status}">
+        <span class="dot"></span>
+        <span class="chip-label">${unit.label}</span>
+        <span class="chip-detail">${unit.status}</span>
+        <span class="chip-detail">${lastUpdate}</span>
+        ${gpsChip}
+        <span class="chip-detail">${rate}</span>
+      </div>
+    `;
+  }).join('');
 }
 
 async function poll() {
   try {
     const res = await fetch('/api/units');
     const units = await res.json();
+    updateStatusStrip(units);
     for (const unit of units) {
       if (!cardsById[unit.id]) {
         cardsById[unit.id] = makeCard(unit);

@@ -333,7 +333,7 @@ class _UnitsState:
                         freq_hz=None, rocof_hz_s=None, history=[], rocof_history=[],
                         amplitude_v=None, gps_utc_s=None, gps_locked=None,
                         seconds_since_last_reading=None, samples_per_minute=0,
-                        completeness_pct=None, gaps=[],
+                        completeness_pct=None, gaps=[], rocof_gaps=[],
                     ))
                     continue
                 latest_t = slot.freq[-1].t
@@ -375,6 +375,10 @@ class _UnitsState:
                     samples_per_minute=samples_per_minute,
                     completeness_pct=completeness_pct,
                     gaps=_find_gaps(history_points),
+                    # RoCoF has its own, independent gaps -- the eligibility
+                    # guard above can exclude a point from rocof_history even
+                    # when the frequency line has no gap there at all.
+                    rocof_gaps=_find_gaps([(t, r) for t, r in slot.rocof]),
                 ))
             return out
 
