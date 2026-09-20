@@ -45,7 +45,7 @@ import urequests
 from machine import ADC, UART, Pin, Timer
 
 from pps_time_sync import PPSTimeSync
-from chunk_summary import summarize_chunk
+from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
@@ -196,6 +196,7 @@ _last_status_ticks = t0
 peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
 post_attempts = 0  # a flush() where the buffer was actually non-empty -- excludes no-op flushes
 post_successes = 0
+dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_summary.py
 
 _wifi_service()
 
@@ -222,6 +223,27 @@ while True:
             frequency_hz, amplitude_v = summarize_chunk(_chunk_ts_s, voltages)
             gps_utc_s = sync.ticks_to_utc(_chunk_ticks[-1])
             buffer.append(frequency_hz, amplitude_v, gps_utc_s)
+        except DegenerateTimestampsError as exc:
+            # Distinguished from the routine ValueError skip below
+            # specifically so this rarer failure is counted and its
+            # context logged -- see chunk_summary.py's docstring: this is
+            # what used to crash the process with a bare ZeroDivisionError.
+            # since_last_post_us tells us whether this coincided with a
+            # POST attempt (a blocking urequests.post() call stalls the
+            # main loop, so a collision caused by a burst of catch-up
+            # drains right after a long stall would show a small value
+            # here); ring buffer overflow_count is logged alongside since
+            # the same blocking-stall mechanism is the known cause of that
+            # too, so a correlation between the two would be visible.
+            dup_timestamp_count += 1
+            since_last_post_us = time.ticks_diff(time.ticks_us(), _last_post_ticks)
+            print("# DUP_TIMESTAMP elapsed_s={:.1f} n={} first={} last={} "
+                  "since_last_post_us={} overflow_count={} error={}".format(
+                _elapsed_us_total / 1e6, len(_chunk_ts_s),
+                _chunk_ts_s[0] if _chunk_ts_s else None,
+                _chunk_ts_s[-1] if _chunk_ts_s else None,
+                since_last_post_us, overflow_count, exc,
+            ))
         except ValueError:
             pass  # too few crossings this chunk -- skip it, same as overnight_log.py
         _chunk_ticks = []
@@ -269,8 +291,9 @@ while True:
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
               "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
-              "post_successes={}".format(
+              "post_successes={} dup_timestamp_count={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
+            dup_timestamp_count,
         ))

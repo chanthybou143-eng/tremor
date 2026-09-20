@@ -16,6 +16,21 @@ import math
 
 from freq_estimator import estimate_frequency, moving_average
 
+
+class DegenerateTimestampsError(ValueError):
+    """Raised when a chunk has fewer than 2 timestamps, or its first and
+    last timestamps are equal (a non-positive span) -- can't derive a
+    sample rate from it. Subclasses ValueError so any caller that already
+    catches ValueError broadly (the existing "too few zero crossings"
+    contract below) keeps working unchanged; callers that want to count
+    or log this specific, rarer failure mode separately can catch this
+    subclass first. See wifi_unit_client.py's dup_timestamp_count for why
+    this needs to be distinguishable: a duplicate/degenerate timestamp
+    caused a real production crash (ZeroDivisionError, since fixed) and
+    is worth tracking on its own, not folding into the routine
+    "too few crossings" skip path.
+    """
+
 HYSTERESIS_FRACTION = 0.05  # of amplitude -- same constant overnight_log.py uses
 
 # Chosen so a boxcar of this length nulls the ~150Hz 3rd harmonic at the
@@ -69,12 +84,36 @@ def summarize_chunk(timestamps, raw_voltages,
     amplitude_v), mirroring overnight_log.py's dc_offset -> amplitude ->
     hysteresis -> estimate_frequency chain.
 
-    Raises ValueError (propagated from estimate_frequency) if fewer than 2
-    zero crossings are found in this chunk -- same "don't silently return
-    a bogus reading" contract as estimate_frequency itself; callers should
-    skip this chunk rather than treat it as a reading of 0.
+    Raises DegenerateTimestampsError (a ValueError subclass) if the chunk
+    has fewer than 2 timestamps, or a non-positive span (first == last --
+    e.g. two ring-buffer entries landed on an identical elapsed-time value).
+    Previously this computed the rate from just the first two timestamps
+    (1.0 / (timestamps[1] - timestamps[0])), which crashed with
+    ZeroDivisionError in production when those two specific samples
+    happened to collide, even though the rest of the chunk was fine.
+    Using the whole chunk's span is both more robust (a single early
+    collision no longer zeroes out the whole calculation, since the
+    chunk's overall span stays positive) and a more accurate rate
+    estimate in the general case (averaged over ~1s of samples, not just
+    the first gap).
+
+    Also raises ValueError (propagated from estimate_frequency, not this
+    class) if fewer than 2 zero crossings are found -- same "don't
+    silently return a bogus reading" contract as estimate_frequency
+    itself; callers should skip this chunk rather than treat it as a
+    reading of 0. Both are ValueError, so a caller that doesn't care to
+    distinguish them can catch just ValueError, same as before.
     """
-    sample_rate_hz = 1.0 / (timestamps[1] - timestamps[0])
+    n = len(timestamps)
+    if n < 2:
+        raise DegenerateTimestampsError(
+            "need at least 2 timestamps to compute a sample rate, got {}".format(n))
+    span = timestamps[-1] - timestamps[0]
+    if span <= 0:
+        raise DegenerateTimestampsError(
+            "non-positive timestamp span ({}) across {} samples -- "
+            "first={} last={}".format(span, n, timestamps[0], timestamps[-1]))
+    sample_rate_hz = (n - 1) / span
     window_samples = max(1, round(filter_window_s * sample_rate_hz))
     filtered = moving_average(raw_voltages, window_samples)
 
