@@ -86,7 +86,7 @@ def generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=2.0,
 # 2. Simple moving-average pre-filter (noise reduction before crossing detect)
 # ---------------------------------------------------------------------------
 
-def moving_average(samples, window):
+def moving_average(samples, window, n=None, out=None):
     """
     Simple boxcar low-pass filter. Cheap enough for MicroPython (just a
     running sum), and enough to knock down high-frequency ADC noise before
@@ -101,19 +101,48 @@ def moving_average(samples, window):
     content -- fine for frequency estimation, since a constant delay
     cancels out of the *difference* between two crossing times, but keep
     it in mind if timestamps ever need to line up with raw samples.
-    """
-    if window <= 1:
-        return list(samples)
 
-    out = []
+    n/out (both optional, default None): a caller that wants to avoid
+    allocating a fresh ~chunk-length list every call (see
+    chunk_summary.py's summarize_chunk and its own n/filtered_buf
+    parameters) passes the valid length of `samples` as `n` (it may be a
+    longer, oversized buffer with stale data past index n-1, never read
+    here) and a reusable list at least `n` long as `out`, which is filled
+    by index instead of grown via append and then returned. Default
+    behaviour (n=None, out=None) is unchanged: n is taken from
+    len(samples) and a fresh list is allocated and returned, exactly as
+    before these parameters existed.
+    """
+    if n is None:
+        n = len(samples)
+
+    if window <= 1:
+        if out is None:
+            return list(samples)[:n] if n != len(samples) else list(samples)
+        for i in range(n):
+            out[i] = samples[i]
+        return out
+
     acc = 0.0
     buf = []
-    for x in samples:
+    if out is None:
+        out = []
+        for i in range(n):
+            x = samples[i]
+            buf.append(x)
+            acc += x
+            if len(buf) > window:
+                acc -= buf.pop(0)
+            out.append(acc / len(buf))
+        return out
+
+    for i in range(n):
+        x = samples[i]
         buf.append(x)
         acc += x
         if len(buf) > window:
             acc -= buf.pop(0)
-        out.append(acc / len(buf))
+        out[i] = acc / len(buf)
     return out
 
 
