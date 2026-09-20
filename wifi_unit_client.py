@@ -186,7 +186,7 @@ def _post_batch(payload):
     connection can block this call indefinitely.
     """
     if not wlan.isconnected():
-        print("# POST_FAIL reason=wifi_disconnected")
+        print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
         return False
     response = None
     try:
@@ -198,10 +198,16 @@ def _post_batch(payload):
             # incarnation failed and the log had no trace of why: this
             # branch and the except below are the only places that decide
             # False, so this is where the reason has to be captured.
-            print("# POST_FAIL reason=http_status status={}".format(response.status_code))
+            # heap_free is read here as-is, with no gc.collect() first
+            # (unlike the STATUS line) -- forcing a collection right at
+            # the failure would itself perturb the exact state being
+            # diagnosed.
+            print("# POST_FAIL reason=http_status status={} heap_free={}".format(
+                response.status_code, gc.mem_free()))
         return ok
     except Exception as exc:
-        print("# POST_FAIL reason=exception type={} msg={}".format(type(exc).__name__, exc))
+        print("# POST_FAIL reason=exception type={} msg={} heap_free={}".format(
+            type(exc).__name__, exc, gc.mem_free()))
         return False
     finally:
         if response is not None:
