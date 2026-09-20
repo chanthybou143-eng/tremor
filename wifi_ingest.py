@@ -101,16 +101,43 @@ class IngestBuffer:
     third buffer.
 
     flush()'s one remaining allocation: building the wire payload needs a
-    real list of exactly `count` reading-dicts (a preallocated pool of
-    max_readings dicts is mutated in place, then sliced to `[:count]`) --
-    a single, exactly-sized allocation (MicroPython's list slicing is
-    list_new(n) + a direct copy, not incremental append-growth -- verified
-    against py/objlist.c earlier in this effort), not the doubling-growth
-    pattern that caused every crash so far. It's the one allocation this
-    file couldn't eliminate without either an unverified assumption that
-    ujson.dumps can serialize a custom non-list iterable, or building the
-    JSON string by hand here too (which would duplicate work http_post.py
-    already does and expand this file's job well beyond buffering).
+    real list of dicts. An earlier version of this file preallocated a
+    max_readings-sized pool of dicts and mutated them in place -- removed
+    after it turned out to be a genuine bug, not just an optimization
+    that happened to be safe: any post_fn (or anything downstream of it)
+    that retains a *reference* to payload["readings"] past its own call
+    -- rather than fully, synchronously consuming it, e.g. a test
+    collecting sent readings for later inspection, exactly what
+    tests/test_wifi_ingest.py's own concurrency test does -- would later
+    see those same dict objects mutated by a *subsequent* flush(),
+    corrupting whatever it thought it had captured. Reproduced directly
+    (see commit history): with the shared pool, a 4-thread concurrent
+    append/flush stress test lost entire threads' worth of readings to
+    exactly this aliasing, replaced by duplicates of later data -- not a
+    locking bug (the ring-buffer locking was and is correct), and not a
+    timing flake either (it reproduced deterministically once a
+    downstream consumer retained references, and vanished once it copied
+    values out instead). The real client's own post_fn (urequests.post(
+    url, json=payload), which serializes to a request body synchronously
+    within that one call and never retains payload afterward) likely
+    never hit this in practice, but "likely fine given how the one
+    current caller happens to behave" isn't a safe contract for a
+    reusable buffer.
+
+    Fixed by building a fresh, small list of dicts every flush() instead
+    of reusing one: safe specifically *because* max_readings_per_post
+    bounds it to a small number (60 by default -- see
+    wifi_unit_client.py's MAX_READINGS_PER_POST) well below the size
+    where MicroPython's list-growth doubling becomes a fragmentation risk
+    (the crash pattern this whole effort exists to avoid needed
+    something in the hundreds of elements, not a few dozen). This
+    tradeoff only holds if a caller actually passes a small
+    max_readings_per_post; the default (None -> max_readings, i.e.
+    uncapped, for backward compatibility with callers that don't set
+    one) reintroduces that original risk for that specific call pattern
+    -- documented here rather than hidden, since the real deployment
+    always passes an explicit small cap and this is the one path that
+    doesn't.
 
     len(buffer) is read unlocked (see __len__) -- a plain count read can't
     observe a torn/corrupted state, only a slightly stale value, and
@@ -132,14 +159,6 @@ class IngestBuffer:
 
         self._storages = [_RingStorage(max_readings), _RingStorage(max_readings)]
         self._active = 0
-
-        # Reused across every flush() -- mutated in place, then sliced to
-        # the actual count (see class docstring's note on that one
-        # remaining allocation).
-        self._reading_dicts = [
-            {"frequency_hz": 0.0, "amplitude_v": None, "gps_utc_s": None}
-            for _ in range(max_readings)
-        ]
 
     def __len__(self):
         return self._storages[self._active].count  # unlocked -- see class docstring
@@ -168,16 +187,24 @@ class IngestBuffer:
         finally:
             self._lock.release()
 
-    def _build_payload(self, buf):
-        for i in range(buf.count):
+    def _build_payload(self, buf, n):
+        # A fresh list of n dicts every call, not a reused/mutated pool --
+        # see the class docstring for why reuse was a real aliasing bug,
+        # not just an optimization. Safe as a fresh allocation specifically
+        # because n is bounded small by max_readings_per_post; this is not
+        # safe to call with a large n (see the docstring's caveat about the
+        # uncapped default).
+        readings = []
+        for i in range(n):
             idx = (buf.head + i) % self._max_readings
-            d = self._reading_dicts[i]
-            d["frequency_hz"] = buf.freq[idx]
-            d["amplitude_v"] = buf.amp[idx] if buf.has_amp[idx] else None
-            d["gps_utc_s"] = buf.gps[idx] if buf.has_gps[idx] else None
+            readings.append({
+                "frequency_hz": buf.freq[idx],
+                "amplitude_v": buf.amp[idx] if buf.has_amp[idx] else None,
+                "gps_utc_s": buf.gps[idx] if buf.has_gps[idx] else None,
+            })
         return {
             "unit_id": self.unit_id,
-            "readings": self._reading_dicts[:buf.count],
+            "readings": readings,
         }
 
     def _merge_failed_batch(self, send_buf, current):
