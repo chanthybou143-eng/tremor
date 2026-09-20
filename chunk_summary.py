@@ -78,7 +78,8 @@ def _median(values):
 
 def summarize_chunk(timestamps, raw_voltages,
                      hysteresis_fraction=HYSTERESIS_FRACTION,
-                     filter_window_s=FILTER_WINDOW_S):
+                     filter_window_s=FILTER_WINDOW_S,
+                     n=None, filtered_buf=None):
     """Reduce one chunk's worth of (timestamps, raw_voltages) -- ~1s of
     samples, same as overnight_log.py's CHUNK_S -- to (frequency_hz,
     amplitude_v), mirroring overnight_log.py's dc_offset -> amplitude ->
@@ -103,27 +104,58 @@ def summarize_chunk(timestamps, raw_voltages,
     itself; callers should skip this chunk rather than treat it as a
     reading of 0. Both are ValueError, so a caller that doesn't care to
     distinguish them can catch just ValueError, same as before.
+
+    n/filtered_buf (both optional, default None): a caller that reuses
+    fixed-capacity buffers across chunks (see wifi_unit_client.py -- this
+    is the fix for the MemoryError crash loop caused by building a fresh
+    ~1030-element list every ~1s) passes the *valid length* of `timestamps`/
+    `raw_voltages` as `n` (they may be longer, oversized buffers with stale
+    data past index n-1) and a reusable scratch list as `filtered_buf` for
+    moving_average to write into instead of allocating. Every read of
+    `timestamps`/`raw_voltages`/the filtered signal below is bounded to
+    `n`, so stale data past that index is never touched. Default behaviour
+    (n=None) is unchanged from before this parameter existed: n is taken
+    from len(timestamps) and no buffer is reused.
     """
-    n = len(timestamps)
+    reusing_buffers = n is not None
+    if n is None:
+        n = len(timestamps)
     if n < 2:
         raise DegenerateTimestampsError(
             "need at least 2 timestamps to compute a sample rate, got {}".format(n))
-    span = timestamps[-1] - timestamps[0]
+    ts = timestamps[:n] if reusing_buffers else timestamps
+    span = ts[-1] - ts[0]
     if span <= 0:
         raise DegenerateTimestampsError(
             "non-positive timestamp span ({}) across {} samples -- "
-            "first={} last={}".format(span, n, timestamps[0], timestamps[-1]))
+            "first={} last={}".format(span, n, ts[0], ts[-1]))
     sample_rate_hz = (n - 1) / span
     window_samples = max(1, round(filter_window_s * sample_rate_hz))
-    filtered = moving_average(raw_voltages, window_samples)
+    filtered_out = moving_average(raw_voltages, window_samples, n=n, out=filtered_buf)
+    filtered = filtered_out[:n] if reusing_buffers else filtered_out
 
     dc_offset = _mean(filtered)
-    variance = _mean([(v - dc_offset) ** 2 for v in filtered])
+    # Accumulator loop instead of _mean([(v-dc_offset)**2 for v in
+    # filtered]): that listcomp is exactly what crashed most often in
+    # production (chunk_summary.py:121, 14 of 19 MemoryErrors in a single
+    # soak) -- MicroPython grows a listcomp's result via repeated append
+    # the same as a manual loop, so even though `filtered` here is already
+    # a right-sized, already-allocated list, building a *second* ~1030
+    # element list right next to it (both alive at once, mid-chunk, right
+    # after `filtered` and `raw_voltages` were themselves just built) is
+    # exactly the kind of back-to-back large-allocation burst that trips
+    # the doubling-growth allocator under fragmentation. An accumulator
+    # never allocates a list at all, regardless of whether filtered_buf is
+    # in use, so this fix applies unconditionally, not just in reuse mode.
+    variance_acc = 0.0
+    for v in filtered:
+        variance_acc += (v - dc_offset) ** 2
+    variance = variance_acc / len(filtered)
     amplitude = (2 * variance) ** 0.5 / _boxcar_gain(window_samples, sample_rate_hz)
     hysteresis = hysteresis_fraction * amplitude
 
     _mean_freq, per_cycle = estimate_frequency(
-        timestamps, filtered, dc_offset=dc_offset,
+        ts, filtered, dc_offset=dc_offset,
         hysteresis=hysteresis, filter_window_s=0.0,
     )
     frequency_hz = _median([f for _, f in per_cycle])
