@@ -40,6 +40,7 @@ import array
 import gc
 import time
 
+import micropython
 import network
 import urequests
 from machine import ADC, UART, Pin, Timer
@@ -81,7 +82,24 @@ CHUNK_S = 1.0            # one summarized reading per second, same cadence as ov
 # hundreds of KB nominally free (confirmed: every crash logged heap_free
 # well over 350KB while failing to allocate exactly 8192 bytes). A margin
 # over the nominal ~1030 covers normal timer jitter without ever growing.
+# Lowering it further isn't well justified: with array.array buffers
+# below, each extra slot of margin costs only its flat itemsize (a few
+# bytes), not the boxed-float overhead a plain list paid per slot -- the
+# margin is now cheap, and real chunks have been observed needing up to
+# ~1148 samples (inferred from a crash requiring a slice sized past 1030
+# during unrelated heap pressure), so 1200 stays a reasonable ceiling.
 CHUNK_CAPACITY = 1200
+
+# NEEDS VERIFICATION ON HARDWARE: this assumes single-precision floats
+# (MICROPY_FLOAT_IMPL_FLOAT), the common default for the rp2 port since
+# RP2040/RP2350 have no double-precision FPU -- but this has not been
+# confirmed on this specific build. Run check_float_precision.py (repo
+# root) on-device before flashing this file: if it prints "double", change
+# this to 'd' first. Getting it wrong doesn't crash anything (array.array
+# silently truncates values to fit 'f'), but it would store frequency/
+# amplitude/timestamp readings at less precision than this build's floats
+# actually support, and 'd' costs only 4 more bytes/slot.
+FLOAT_TYPECODE = "f"
 # Single source of truth for how often buffer.flush() POSTs a batch.
 # Raised from 8s to 30s: a persistent/keep-alive connection was
 # investigated and found not viable against this specific PythonAnywhere
@@ -184,7 +202,18 @@ def _post_batch(payload):
     docstring). NEEDS VERIFICATION ON HARDWARE: whether this urequests
     build supports a timeout kwarg at all -- without one, a dead/half-open
     connection can block this call indefinitely.
+
+    micropython.mem_info() (no verbose argument -- that would also print
+    a full block-by-block heap map, not needed here) plus gc.mem_free()
+    are printed at the top of every call, i.e. every ~30s matching
+    POST_INTERVAL_S, with no extra throttling needed -- this puts "max
+    free sz" (the largest contiguous free block, the figure ENOMEM
+    actually depends on, not just total free bytes) next to every
+    success or failure, not just failures.
     """
+    micropython.mem_info()
+    print("# PRE_POST heap_free={}".format(gc.mem_free()))
+
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
         return False
@@ -225,11 +254,26 @@ _elapsed_us_total = 0
 # stale leftover from a previous chunk and must never be read -- every
 # consumer below is bounded to _chunk_len, not len(...), specifically to
 # guard against that.
-_chunk_ticks = [0] * CHUNK_CAPACITY    # raw time.ticks_us() per sample -- for gps_utc_s lookup
-_chunk_ts_s = [0.0] * CHUNK_CAPACITY   # elapsed seconds per sample -- summarize_chunk's timestamps
-_chunk_counts = [0] * CHUNK_CAPACITY   # raw u16 ADC counts per sample -- converted to volts below
-_voltages = [0.0] * CHUNK_CAPACITY     # scratch buffer for the volts-converted chunk
-_filtered_buf = [0.0] * CHUNK_CAPACITY  # scratch buffer for summarize_chunk's filtered signal
+#
+# array.array, not plain lists: a plain list of floats still boxes each
+# individual value (a separate heap object per element) even though the
+# list itself is pre-sized -- only the backing pointer array was fixed,
+# not the ~1030 float objects it points to, which were freshly allocated
+# and freed every chunk regardless of the list-growth fix. array.array
+# stores packed, unboxed values instead, so filling these buffers by
+# index allocates nothing at all: indexing/reading/rewriting existing
+# slots is unchanged (array.array supports the exact same arr[i]/
+# arr[i]=x/len(arr) interface as a list), and the stale-data guards
+# above are unaffected. counts uses 'H' (raw ADC u16, matches ring_raw's
+# own typecode) and ticks uses 'I', both narrower than a list's 4-byte
+# pointer slot for at least one of them; the float buffers use
+# FLOAT_TYPECODE (see its own comment above -- unverified pending
+# check_float_precision.py).
+_chunk_ticks = array.array("I", [0] * CHUNK_CAPACITY)     # raw time.ticks_us() per sample -- for gps_utc_s lookup
+_chunk_ts_s = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)    # elapsed seconds per sample -- summarize_chunk's timestamps
+_chunk_counts = array.array("H", [0] * CHUNK_CAPACITY)    # raw u16 ADC counts per sample -- converted to volts below
+_voltages = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)      # scratch buffer for the volts-converted chunk
+_filtered_buf = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)  # scratch buffer for summarize_chunk's filtered signal
 _chunk_len = 0
 chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY samples --
                                     # extra samples past capacity are dropped and counted here,
