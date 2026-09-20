@@ -121,12 +121,28 @@ class IngestBuffer:
     starting point, not a measured ceiling -- see the WiFi client's design
     notes on Pico 2 W heap headroom under WiFi+TLS; retune once
     gc.mem_free() has actually been checked on real hardware.
+
+    max_readings_per_post (default: max_readings, i.e. uncapped -- the
+    caller passes a real value, see wifi_unit_client.py's
+    MAX_READINGS_PER_POST) bounds how many readings a single flush()
+    call ever sends: at most the *oldest* max_readings_per_post of
+    whatever's currently buffered. A fully-buffered flush is otherwise a
+    single JSON body proportional to max_readings (48,635 bytes measured
+    at 600) -- one large contiguous allocation nobody had reason to bound
+    before the buffer itself could actually reach that size. Anything
+    left over after a capped send stays buffered for the next scheduled
+    flush() at the normal cadence -- this never triggers an extra POST of
+    its own, since an unscheduled extra network call would itself be one
+    more multi-second blocking stall.
     """
 
-    def __init__(self, unit_id, post_fn, max_readings=600):
+    def __init__(self, unit_id, post_fn, max_readings=600, max_readings_per_post=None):
         self.unit_id = unit_id
         self._post_fn = post_fn
         self._max_readings = max_readings
+        self._max_readings_per_post = (
+            max_readings if max_readings_per_post is None else max_readings_per_post
+        )
         self._lock = _thread.allocate_lock()
         self.dropped_count = 0
 
@@ -168,8 +184,8 @@ class IngestBuffer:
         finally:
             self._lock.release()
 
-    def _build_payload(self, buf):
-        for i in range(buf.count):
+    def _build_payload(self, buf, n):
+        for i in range(n):
             idx = (buf.head + i) % self._max_readings
             d = self._reading_dicts[i]
             d["frequency_hz"] = buf.freq[idx]
@@ -177,7 +193,7 @@ class IngestBuffer:
             d["gps_utc_s"] = buf.gps[idx] if buf.has_gps[idx] else None
         return {
             "unit_id": self.unit_id,
-            "readings": self._reading_dicts[:buf.count],
+            "readings": self._reading_dicts[:n],
         }
 
     def _merge_failed_batch(self, send_buf, current):
@@ -211,7 +227,8 @@ class IngestBuffer:
         send_buf.count = 0
 
     def flush(self):
-        """Attempt to send everything currently buffered.
+        """Attempt to send buffered readings, at most
+        max_readings_per_post of them (the oldest first) in this one call.
 
         Returns True if the batch was accepted (post_fn returned truthy).
         Returns False if the POST failed for any reason, including post_fn
@@ -219,6 +236,14 @@ class IngestBuffer:
         class docstring) to retry on the next call. A no-op (returns True)
         when the buffer is empty, so callers can call this unconditionally
         on a timer without checking len() first.
+
+        Whether the POST succeeded or not, anything past the first
+        max_readings_per_post readings is left for a later flush() call --
+        never sent by looping again here. That reuses the exact same
+        merge-back-in-chronological-order logic either way (a held-back
+        remainder after a successful partial send and an un-sent batch
+        after a failure are both "readings still waiting to go out,
+        oldest first, in front of whatever arrived since").
         """
         self._lock.acquire()
         try:
@@ -229,7 +254,8 @@ class IngestBuffer:
         finally:
             self._lock.release()
 
-        payload = self._build_payload(send_buf)
+        n_to_send = min(send_buf.count, self._max_readings_per_post)
+        payload = self._build_payload(send_buf, n_to_send)
         try:
             ok = self._post_fn(payload)
         except Exception:
@@ -238,9 +264,12 @@ class IngestBuffer:
         self._lock.acquire()
         try:
             if ok:
-                send_buf.head = 0
-                send_buf.count = 0
-            else:
+                # advance past exactly what was sent -- any remainder
+                # (buffered readings beyond max_readings_per_post) stays
+                # in send_buf, to be merged back below same as a failure
+                send_buf.head = (send_buf.head + n_to_send) % self._max_readings
+                send_buf.count -= n_to_send
+            if send_buf.count > 0:
                 current = self._storages[self._active]
                 self._merge_failed_batch(send_buf, current)
         finally:
