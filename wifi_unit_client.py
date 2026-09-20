@@ -231,6 +231,14 @@ _consecutive_failures = 0
 _current_post_interval_s = POST_INTERVAL_S  # read by the main loop instead of the
                                               # POST_INTERVAL_S constant directly --
                                               # see BACKOFF_MULTIPLIER's comment
+readings_sent_ok = 0  # cumulative individual readings actually accepted by the
+                       # server (not POST attempts -- a single POST's batch size
+                       # varies, especially once MAX_READINGS_PER_POST capping is
+                       # draining a backlog), so this can be reconciled directly
+                       # against the server's own received count
+max_consecutive_failures = 0  # highest _consecutive_failures streak seen so far,
+                                # this run -- distinct from the current streak,
+                                # which resets to 0 on the next success
 
 
 def _post_batch(payload):
@@ -277,7 +285,7 @@ def _post_batch(payload):
     wifi_disconnected, which returns before any of this and is already
     retried on its own independent timer by _wifi_service().
     """
-    global _consecutive_failures, _current_post_interval_s
+    global _consecutive_failures, _current_post_interval_s, readings_sent_ok, max_consecutive_failures
 
     heap_free_before_collect = gc.mem_free()
     print("# MEM_INFO_PRE_COLLECT")
@@ -331,10 +339,13 @@ def _post_batch(payload):
             response.close()
 
     if ok:
+        readings_sent_ok += len(payload["readings"])
         _consecutive_failures = 0
         _current_post_interval_s = POST_INTERVAL_S
     else:
         _consecutive_failures += 1
+        if _consecutive_failures > max_consecutive_failures:
+            max_consecutive_failures = _consecutive_failures
         _current_post_interval_s = min(
             _current_post_interval_s * BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
         if _consecutive_failures >= CONSECUTIVE_FAILURE_GC_THRESHOLD:
@@ -527,9 +538,11 @@ while True:
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
               "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
-              "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={}".format(
+              "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={} "
+              "readings_sent_ok={} max_consecutive_failures={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
             dup_timestamp_count, chunk_capacity_overflow_count,
+            readings_sent_ok, max_consecutive_failures,
         ))
