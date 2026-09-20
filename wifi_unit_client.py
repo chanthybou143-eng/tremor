@@ -112,6 +112,22 @@ FLOAT_TYPECODE = "f"
 # than 8s did, at the cost of a longer worst-case delay before a reading
 # reaches the dashboard.
 POST_INTERVAL_S = 30.0
+# After a POST actually attempted and failed (not wifi_disconnected --
+# that's already handled by _wifi_service()'s own independent 5s retry
+# timer, a different failure mode), the effective interval between
+# attempts doubles, capped, instead of retrying every POST_INTERVAL_S
+# regardless -- an overnight soak's failure runs were consistently 12-17
+# consecutive attempts 30s apart before crashing, so backing off gives a
+# struggling connection room rather than hammering it at a fixed rate.
+# BACKOFF_CAP_S=240 (8x) is a reasoned starting point matching that
+# observed run length, not a measured optimum -- NEEDS VERIFICATION ON
+# HARDWARE whether it actually shortens or prevents a failure run.
+BACKOFF_MULTIPLIER = 2.0
+BACKOFF_CAP_S = 240.0
+# After this many consecutive failures, force an extra gc.collect() (and
+# explicitly drop this frame's socket/response reference first) rather
+# than waiting for the routine ones -- see _post_batch's docstring.
+CONSECUTIVE_FAILURE_GC_THRESHOLD = 3
 # ~30 readings/batch at POST_INTERVAL_S=30s and one reading/s (CHUNK_S)
 # -- 600 is a ~20x margin over one normal batch, and the outage-tolerance
 # semantics (drop-oldest once buffered readings span ~10 minutes) are
@@ -198,6 +214,11 @@ PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to 
                             # whether the collect below is actually reducing/preventing
                             # ENOMEM failures, or whether they happen regardless
 
+_consecutive_failures = 0
+_current_post_interval_s = POST_INTERVAL_S  # read by the main loop instead of the
+                                              # POST_INTERVAL_S constant directly --
+                                              # see BACKOFF_MULTIPLIER's comment
+
 
 def _post_batch(payload):
     """IngestBuffer's injected post_fn. Returns True only on a 2xx
@@ -228,7 +249,23 @@ def _post_batch(payload):
     before/after can only be two separate printed blocks
     (MEM_INFO_PRE_COLLECT / MEM_INFO_POST_COLLECT), not merged into one
     line, but they're adjacent in the log and directly comparable by eye.
+    A third snapshot (MEM_INFO_TRY_START) repeats this right at the top
+    of the try block, as close to the actual urequests.post() call as
+    code can get without modifying it -- unavoidably almost identical to
+    MEM_INFO_POST_COLLECT a few lines above (nothing but the
+    wlan.isconnected() check runs in between), but captured separately
+    since it's the tightest bound available on "state immediately before
+    the risky call" without instrumenting urequests itself (branch
+    fix-memcrash-manual-post does that; this branch doesn't).
+
+    Backoff and extra cleanup on a failure run: see BACKOFF_MULTIPLIER/
+    CONSECUTIVE_FAILURE_GC_THRESHOLD's own comments. Only a POST actually
+    attempted and failed (http_status or exception) counts -- not
+    wifi_disconnected, which returns before any of this and is already
+    retried on its own independent timer by _wifi_service().
     """
+    global _consecutive_failures, _current_post_interval_s
+
     heap_free_before_collect = gc.mem_free()
     print("# MEM_INFO_PRE_COLLECT")
     micropython.mem_info()
@@ -246,8 +283,12 @@ def _post_batch(payload):
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
         return False
+
     response = None
+    ok = False
     try:
+        print("# MEM_INFO_TRY_START")
+        micropython.mem_info()
         # Captured at the moment this function actually starts the
         # request, so a failure line shows the state right before the
         # attempt instead of only the aftermath -- Trial 1's POST_FAIL
@@ -267,15 +308,34 @@ def _post_batch(payload):
             print("# POST_FAIL reason=http_status status={} heap_free_at_try_start={} "
                   "heap_free_now={}".format(
                 response.status_code, heap_free_at_try_start, gc.mem_free()))
-        return ok
     except Exception as exc:
         print("# POST_FAIL reason=exception type={} msg={} heap_free_at_try_start={} "
               "heap_free_now={}".format(
             type(exc).__name__, exc, heap_free_at_try_start, gc.mem_free()))
-        return False
+        ok = False
     finally:
         if response is not None:
             response.close()
+
+    if ok:
+        _consecutive_failures = 0
+        _current_post_interval_s = POST_INTERVAL_S
+    else:
+        _consecutive_failures += 1
+        _current_post_interval_s = min(
+            _current_post_interval_s * BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
+        if _consecutive_failures >= CONSECUTIVE_FAILURE_GC_THRESHOLD:
+            response = None  # explicitly drop the (already-closed) reference
+                               # before forcing this extra collect, in case
+                               # anything it still held onto is what's
+                               # keeping a would-be-free block unreachable
+            print("# MEM_INFO_BEFORE_EXTRA_COLLECT consecutive_failures={}".format(
+                _consecutive_failures))
+            micropython.mem_info()
+            gc.collect()
+            print("# MEM_INFO_AFTER_EXTRA_COLLECT")
+            micropython.mem_info()
+    return ok
 
 
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
@@ -433,7 +493,10 @@ while True:
         peak_buffered = current_buffered
 
     now = time.ticks_us()
-    if time.ticks_diff(now, _last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
+    # _current_post_interval_s, not the POST_INTERVAL_S constant directly --
+    # it backs off past 30s after consecutive failures and resets to 30s on
+    # the next success (see _post_batch's docstring / BACKOFF_MULTIPLIER).
+    if time.ticks_diff(now, _last_post_ticks) >= _current_post_interval_s * 1_000_000:
         _last_post_ticks = now
         if current_buffered > 0:
             post_attempts += 1
