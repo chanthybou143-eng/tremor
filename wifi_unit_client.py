@@ -68,6 +68,20 @@ MAX_DRAIN_PER_PASS = 128  # see adc_stream_gps.py: bounds one drain so GPS
                           # UART servicing and WiFi/POST bookkeeping always get a turn
 
 CHUNK_S = 1.0            # one summarized reading per second, same cadence as overnight_log.py
+# Fixed capacity for one chunk's worth of samples (~ADC_SAMPLE_HZ * CHUNK_S
+# ~= 1030 nominal), preallocated once below and reused every chunk instead
+# of building fresh lists each time. This is the fix for the MemoryError
+# crash loop seen in production: every chunk, three ~1030-element lists
+# were each built via .append()/listcomp (_chunk_ts_s etc. filling up,
+# voltages = [...], and moving_average's own output list), and MicroPython
+# grows a list's backing array by doubling on overflow -- at ~1030 items
+# that's a transition from 1024 to 2048 slots, i.e. one fresh *contiguous*
+# 8192-byte block (2048 slots * 4 bytes/slot on this 32-bit target) needed
+# every single time, which can fail under heap fragmentation even with
+# hundreds of KB nominally free (confirmed: every crash logged heap_free
+# well over 350KB while failing to allocate exactly 8192 bytes). A margin
+# over the nominal ~1030 covers normal timer jitter without ever growing.
+CHUNK_CAPACITY = 1200
 # Single source of truth for how often buffer.flush() POSTs a batch.
 # Raised from 8s to 30s: a persistent/keep-alive connection was
 # investigated and found not viable against this specific PythonAnywhere
@@ -188,9 +202,22 @@ buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_RE
 
 _last_consumed_ticks = t0
 _elapsed_us_total = 0
-_chunk_ticks = []      # raw time.ticks_us() per sample -- for gps_utc_s lookup
-_chunk_ts_s = []       # elapsed seconds per sample -- summarize_chunk's timestamps
-_chunk_counts = []     # raw u16 ADC counts per sample -- converted to volts below
+# Fixed-capacity buffers, allocated once here and reused every chunk by
+# writing to index _chunk_len (never .append()'d/reallocated) -- see
+# CHUNK_CAPACITY above for why. Only indices [0, _chunk_len) hold valid
+# data for the *current* chunk; everything from _chunk_len onward is
+# stale leftover from a previous chunk and must never be read -- every
+# consumer below is bounded to _chunk_len, not len(...), specifically to
+# guard against that.
+_chunk_ticks = [0] * CHUNK_CAPACITY    # raw time.ticks_us() per sample -- for gps_utc_s lookup
+_chunk_ts_s = [0.0] * CHUNK_CAPACITY   # elapsed seconds per sample -- summarize_chunk's timestamps
+_chunk_counts = [0] * CHUNK_CAPACITY   # raw u16 ADC counts per sample -- converted to volts below
+_voltages = [0.0] * CHUNK_CAPACITY     # scratch buffer for the volts-converted chunk
+_filtered_buf = [0.0] * CHUNK_CAPACITY  # scratch buffer for summarize_chunk's filtered signal
+_chunk_len = 0
+chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY samples --
+                                    # extra samples past capacity are dropped and counted here,
+                                    # same "count, don't silently lose" contract as overflow_count
 _last_post_ticks = t0
 _last_status_ticks = t0
 peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
@@ -211,17 +238,31 @@ while True:
         _elapsed_us_total += time.ticks_diff(raw_ticks, _last_consumed_ticks)
         _last_consumed_ticks = raw_ticks
 
-        _chunk_ticks.append(raw_ticks)
-        _chunk_ts_s.append(_elapsed_us_total / 1e6)
-        _chunk_counts.append(raw_count)
+        if _chunk_len < CHUNK_CAPACITY:
+            _chunk_ticks[_chunk_len] = raw_ticks
+            _chunk_ts_s[_chunk_len] = _elapsed_us_total / 1e6
+            _chunk_counts[_chunk_len] = raw_count
+            _chunk_len += 1
+        else:
+            # CHUNK_CAPACITY's margin over the nominal ~1030 samples/chunk
+            # wasn't enough this time -- drop the extra samples (same
+            # "count, don't silently lose" contract as the ADC ring
+            # buffer's own overflow_count) rather than grow the buffer,
+            # which would defeat the whole point of preallocating it.
+            chunk_capacity_overflow_count += 1
 
     # Once ~CHUNK_S worth of samples has accumulated, reduce it to one
-    # (frequency_hz, amplitude_v, gps_utc_s) reading and buffer it.
-    if _chunk_ts_s and (_chunk_ts_s[-1] - _chunk_ts_s[0]) >= CHUNK_S:
-        voltages = [count * ADC_VOLTAGE_SCALE for count in _chunk_counts]
+    # (frequency_hz, amplitude_v, gps_utc_s) reading and buffer it. Every
+    # index used below is bounded to _chunk_len, not len(...) -- these are
+    # fixed-capacity buffers reused every chunk (see CHUNK_CAPACITY), so
+    # indices past _chunk_len hold stale data from a previous chunk.
+    if _chunk_len > 0 and (_chunk_ts_s[_chunk_len - 1] - _chunk_ts_s[0]) >= CHUNK_S:
+        for _i in range(_chunk_len):
+            _voltages[_i] = _chunk_counts[_i] * ADC_VOLTAGE_SCALE
         try:
-            frequency_hz, amplitude_v = summarize_chunk(_chunk_ts_s, voltages)
-            gps_utc_s = sync.ticks_to_utc(_chunk_ticks[-1])
+            frequency_hz, amplitude_v = summarize_chunk(
+                _chunk_ts_s, _voltages, n=_chunk_len, filtered_buf=_filtered_buf)
+            gps_utc_s = sync.ticks_to_utc(_chunk_ticks[_chunk_len - 1])
             buffer.append(frequency_hz, amplitude_v, gps_utc_s)
         except DegenerateTimestampsError as exc:
             # Distinguished from the routine ValueError skip below
@@ -239,16 +280,14 @@ while True:
             since_last_post_us = time.ticks_diff(time.ticks_us(), _last_post_ticks)
             print("# DUP_TIMESTAMP elapsed_s={:.1f} n={} first={} last={} "
                   "since_last_post_us={} overflow_count={} error={}".format(
-                _elapsed_us_total / 1e6, len(_chunk_ts_s),
-                _chunk_ts_s[0] if _chunk_ts_s else None,
-                _chunk_ts_s[-1] if _chunk_ts_s else None,
+                _elapsed_us_total / 1e6, _chunk_len,
+                _chunk_ts_s[0] if _chunk_len else None,
+                _chunk_ts_s[_chunk_len - 1] if _chunk_len else None,
                 since_last_post_us, overflow_count, exc,
             ))
         except ValueError:
             pass  # too few crossings this chunk -- skip it, same as overnight_log.py
-        _chunk_ticks = []
-        _chunk_ts_s = []
-        _chunk_counts = []
+        _chunk_len = 0
 
     if uart.any():
         chunk = uart.read(GPS_READ_CHUNK_BYTES)
@@ -291,9 +330,9 @@ while True:
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
               "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
-              "post_successes={} dup_timestamp_count={}".format(
+              "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
-            dup_timestamp_count,
+            dup_timestamp_count, chunk_capacity_overflow_count,
         ))
