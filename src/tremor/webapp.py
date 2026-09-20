@@ -49,9 +49,15 @@ SPARKLINE_SMOOTHING_WINDOW_S = 0.2
 # Real per-reading cadence for an ingested batch -- matches
 # wifi_unit_client.py's CHUNK_S and overnight_log.py's CHUNK_S (both 1.0s),
 # the one-reading-per-second convention used throughout this project. Used
-# to space out a batch's timestamps realistically (see /api/ingest), and
-# as the assumed rate for the "expected" side of completeness_pct below.
+# to space out a batch's timestamps realistically (see /api/ingest).
 READING_INTERVAL_S = 1.0
+# The window completeness_pct is measured over -- deliberately the same
+# WINDOW_S the rolling buffers themselves retain (60s), not some shorter
+# adaptive span: long enough to span several real restart cycles (the
+# client's own POST_INTERVAL_S is 30s) without a single missed POST making
+# the figure swing wildly, and it matches what the UI already labels
+# ("last 60s") so the two agree.
+COMPLETENESS_WINDOW_S = WINDOW_S
 
 # RoCoF cross-batch safety (see _fit_time_for_point). A batch/restart
 # boundary's reconstructed `t` values are each independently anchored to
@@ -351,10 +357,21 @@ class _UnitsState:
                 # unit's own timeline" uses that timeline's own reference point.
                 samples_per_minute = len([p for p in slot.freq if latest_t - p.t <= 60.0])
 
-                span_s = min(WINDOW_S, latest_t - slot.freq[0].t) if len(slot.freq) > 1 else 0.0
-                expected = span_s / READING_INTERVAL_S
-                completeness_pct = (
-                    min(100.0, 100.0 * len(slot.freq) / expected) if expected > 0 else 100.0
+                # Distinct whole seconds with at least one reading, not raw
+                # reading count -- count/expected let a burst of readings
+                # denser than 1/s (perfectly normal jitter, not an error)
+                # paper over a genuine multi-second gap elsewhere in the
+                # same window, since the extra readings inflated the
+                # numerator enough to still hit the 100% cap. Counting
+                # distinct seconds instead means only real time coverage
+                # counts, regardless of how many readings land in any one
+                # of them.
+                seconds_with_data = {
+                    int(p.t // 1.0) for p in slot.freq
+                    if latest_t - p.t <= COMPLETENESS_WINDOW_S
+                }
+                completeness_pct = min(
+                    100.0, 100.0 * len(seconds_with_data) / COMPLETENESS_WINDOW_S
                 )
 
                 out.append(dict(
