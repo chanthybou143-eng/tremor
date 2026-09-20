@@ -2,11 +2,11 @@
 endpoint in batches, retrying on failure instead of dropping data.
 
 Deliberately isolated from network.WLAN/urequests (see wifi_unit_client.py
-for that glue) so this buffering/eviction logic -- pure Python, zero
-imports beyond the stdlib -- runs and is testable under desktop CPython,
-same portability reasoning as freq_estimator.py. The actual HTTP POST is
-injected as a callable rather than imported directly, so tests can swap in
-a fake one without needing MicroPython's network stack.
+for that glue) so this buffering/eviction logic -- pure Python, only
+array/_thread beyond the stdlib -- runs and is testable under desktop
+CPython, same portability reasoning as freq_estimator.py. The actual HTTP
+POST is injected as a callable rather than imported directly, so tests can
+swap in a fake one without needing MicroPython's network stack.
 
 Genuinely concurrent as of the wifi_unit_client.py dual-core redesign:
 append() runs on core 0 (from the ADC-reduction path) while flush() runs
@@ -16,9 +16,53 @@ _thread is used rather than threading specifically because it's the one
 threading-flavoured module both CPython and MicroPython provide under the
 same name with a compatible allocate_lock() API, so this file needs no
 platform branching to stay host-testable.
+
+Fixed-capacity storage, not a plain growing list: the previous
+implementation (self._buf = []; self._buf.append(...)) was the actual
+crash site in a 12.5-hour overnight soak of the array.array chunk-buffer
+fix -- 4 restarts, all at this file's old line 76 (self._buf.append),
+every one preceded by a run of failed POSTs that left the buffer growing
+by one reading per second with nothing draining it. That's the exact same
+bug class as the original chunk_summary.py crash this whole effort started
+from (MicroPython grows a list's backing array by doubling on overflow,
+needing a fresh contiguous block every transition, which can fail under
+heap fragmentation even with plenty nominally free) -- just in a buffer
+nobody had reason to suspect until it grew large enough, during a failure
+run, to hit one of those transitions itself.
 """
 
 import _thread
+import array
+
+FLOAT_TYPECODE = "f"  # NEEDS VERIFICATION ON HARDWARE, not assumed: matches
+                       # wifi_unit_client.py's FLOAT_TYPECODE and the same
+                       # check_float_precision.py result -- use 'd' here
+                       # too if that script prints "double".
+
+
+class _RingStorage:
+    """Fixed-capacity storage for one FIFO's worth of buffered readings --
+    preallocated once, filled/read by index, never resized. IngestBuffer
+    keeps two of these (see its own docstring for why) and swaps which one
+    is "active" instead of allocating a fresh one on every flush().
+
+    amplitude_v/gps_utc_s can legitimately be None (amplitude_v isn't in
+    practice, given summarize_chunk always returns a real float, but the
+    public append() signature never enforced that; gps_utc_s genuinely is
+    None before PPS sync) -- array('f', ...) can't hold None, so a
+    parallel has_amp/has_gps flag byte per slot records whether the float
+    slot is meaningful, same idea the task asked for GPS specifically,
+    applied to both for a uniform, simple scheme.
+    """
+
+    def __init__(self, capacity):
+        self.freq = array.array(FLOAT_TYPECODE, [0.0] * capacity)
+        self.amp = array.array(FLOAT_TYPECODE, [0.0] * capacity)
+        self.has_amp = bytearray(capacity)
+        self.gps = array.array(FLOAT_TYPECODE, [0.0] * capacity)
+        self.has_gps = bytearray(capacity)
+        self.head = 0
+        self.count = 0
 
 
 class IngestBuffer:
@@ -34,21 +78,44 @@ class IngestBuffer:
     data with no trace). Only a genuinely full buffer drops anything here,
     and every drop is counted in dropped_count.
 
-    Locking is deliberately minimal-hold-time: the lock protects only the
-    list swap in append()/flush(), never the network call itself -- flush()
-    swaps self._buf for an empty list under the lock, releases it, and only
-    then builds the payload and calls post_fn. Holding the lock across the
-    POST would serialize append() (core 0, real-time-ish) against a
-    multi-second network call (core 1), which is exactly the stall this
-    split was meant to avoid. On failure, the un-sent batch is merged back
-    in chronological order (failed batch first, then whatever append()
-    added during the POST) under a second short lock, with max_readings
-    re-applied to the merged result.
+    Storage is two preallocated _RingStorage instances, swapped by
+    flipping self._active -- the same swap-not-copy trick the previous
+    plain-list implementation used (to_send = self._buf; self._buf = []),
+    just with both sides preallocated so neither append() nor flush()
+    allocates a new list/array. A single ring buffer can't do this safely:
+    resetting its own head/count to "empty" so append() could reuse freed
+    slots would let a fast append() overwrite data still being read out
+    for the slow, network-bound POST still in flight. With two buffers,
+    the moment flush() flips self._active, every new append() goes to the
+    *other*, already-empty one -- the buffer being sent is never touched
+    again until flush() itself either resets it (success) or merges its
+    leftover content back in (failure), both after the POST has returned.
 
-    len(buffer) is read unlocked (see __len__) -- a plain list length read
-    can't observe a torn/corrupted state, only a slightly stale count, and
-    that's an acceptable tradeoff for a status readout, not something worth
-    a lock acquisition for.
+    On failure, the un-sent batch is merged back in chronological order
+    (failed batch first/older, then whatever append() added during the
+    POST) with max_readings re-applied, dropping the oldest of the *failed*
+    batch first if the combined total overflows -- same policy as before.
+    The merge works by extending the buffer that received in-flight
+    appends *backward* into its own spare capacity (a ring buffer can
+    prepend by moving head back, no data movement) rather than needing a
+    third buffer.
+
+    flush()'s one remaining allocation: building the wire payload needs a
+    real list of exactly `count` reading-dicts (a preallocated pool of
+    max_readings dicts is mutated in place, then sliced to `[:count]`) --
+    a single, exactly-sized allocation (MicroPython's list slicing is
+    list_new(n) + a direct copy, not incremental append-growth -- verified
+    against py/objlist.c earlier in this effort), not the doubling-growth
+    pattern that caused every crash so far. It's the one allocation this
+    file couldn't eliminate without either an unverified assumption that
+    ujson.dumps can serialize a custom non-list iterable, or building the
+    JSON string by hand here too (which would duplicate work http_post.py
+    already does and expand this file's job well beyond buffering).
+
+    len(buffer) is read unlocked (see __len__) -- a plain count read can't
+    observe a torn/corrupted state, only a slightly stale value, and
+    that's an acceptable tradeoff for a status readout, not something
+    worth a lock acquisition for.
 
     max_readings default of 600 (~10 minutes at one reading/sec) is a
     starting point, not a measured ceiling -- see the WiFi client's design
@@ -60,22 +127,88 @@ class IngestBuffer:
         self.unit_id = unit_id
         self._post_fn = post_fn
         self._max_readings = max_readings
-        self._buf = []  # list of (frequency_hz, amplitude_v, gps_utc_s) tuples
         self._lock = _thread.allocate_lock()
         self.dropped_count = 0
 
+        self._storages = [_RingStorage(max_readings), _RingStorage(max_readings)]
+        self._active = 0
+
+        # Reused across every flush() -- mutated in place, then sliced to
+        # the actual count (see class docstring's note on that one
+        # remaining allocation).
+        self._reading_dicts = [
+            {"frequency_hz": 0.0, "amplitude_v": None, "gps_utc_s": None}
+            for _ in range(max_readings)
+        ]
+
     def __len__(self):
-        return len(self._buf)  # unlocked -- see class docstring
+        return self._storages[self._active].count  # unlocked -- see class docstring
 
     def append(self, frequency_hz, amplitude_v, gps_utc_s=None):
         self._lock.acquire()
         try:
-            if len(self._buf) >= self._max_readings:
-                self._buf.pop(0)  # drop oldest -- keep the buffer bounded, favor recent data
+            buf = self._storages[self._active]
+            idx = (buf.head + buf.count) % self._max_readings
+            if buf.count >= self._max_readings:
+                buf.head = (buf.head + 1) % self._max_readings  # drop oldest
                 self.dropped_count += 1
-            self._buf.append((frequency_hz, amplitude_v, gps_utc_s))
+            else:
+                buf.count += 1
+            buf.freq[idx] = frequency_hz
+            if amplitude_v is None:
+                buf.has_amp[idx] = 0
+            else:
+                buf.amp[idx] = amplitude_v
+                buf.has_amp[idx] = 1
+            if gps_utc_s is None:
+                buf.has_gps[idx] = 0
+            else:
+                buf.gps[idx] = gps_utc_s
+                buf.has_gps[idx] = 1
         finally:
             self._lock.release()
+
+    def _build_payload(self, buf):
+        for i in range(buf.count):
+            idx = (buf.head + i) % self._max_readings
+            d = self._reading_dicts[i]
+            d["frequency_hz"] = buf.freq[idx]
+            d["amplitude_v"] = buf.amp[idx] if buf.has_amp[idx] else None
+            d["gps_utc_s"] = buf.gps[idx] if buf.has_gps[idx] else None
+        return {
+            "unit_id": self.unit_id,
+            "readings": self._reading_dicts[:buf.count],
+        }
+
+    def _merge_failed_batch(self, send_buf, current):
+        """Prepend send_buf's un-sent readings (chronologically older) in
+        front of current's readings (arrived during the POST, so
+        chronologically newer) by extending current backward into its own
+        free capacity. Drops send_buf's own oldest first if the combined
+        total would exceed max_readings -- walking backward from
+        send_buf's newest item and stopping after the number of slots
+        actually available naturally keeps the newest items and skips the
+        oldest, without needing to compute which indices to skip
+        separately.
+        """
+        free_slots = self._max_readings - current.count
+        n_to_prepend = send_buf.count
+        if n_to_prepend > free_slots:
+            self.dropped_count += n_to_prepend - free_slots
+            n_to_prepend = free_slots
+
+        for i in range(n_to_prepend):
+            src_idx = (send_buf.head + send_buf.count - 1 - i) % self._max_readings
+            current.head = (current.head - 1) % self._max_readings
+            current.freq[current.head] = send_buf.freq[src_idx]
+            current.amp[current.head] = send_buf.amp[src_idx]
+            current.has_amp[current.head] = send_buf.has_amp[src_idx]
+            current.gps[current.head] = send_buf.gps[src_idx]
+            current.has_gps[current.head] = send_buf.has_gps[src_idx]
+        current.count += n_to_prepend
+
+        send_buf.head = 0
+        send_buf.count = 0
 
     def flush(self):
         """Attempt to send everything currently buffered.
@@ -89,35 +222,27 @@ class IngestBuffer:
         """
         self._lock.acquire()
         try:
-            to_send = self._buf
-            self._buf = []
+            send_buf = self._storages[self._active]
+            if send_buf.count == 0:
+                return True
+            self._active = 1 - self._active  # new append()s go to the other, empty buffer
         finally:
             self._lock.release()
 
-        if not to_send:
-            return True
-
-        payload = {
-            "unit_id": self.unit_id,
-            "readings": [
-                {"frequency_hz": f, "amplitude_v": a, "gps_utc_s": g}
-                for f, a, g in to_send
-            ],
-        }
+        payload = self._build_payload(send_buf)
         try:
             ok = self._post_fn(payload)
         except Exception:
             ok = False
 
-        if not ok:
-            self._lock.acquire()
-            try:
-                merged = to_send + self._buf  # failed batch first (older), then anything appended during the POST
-                overflow = len(merged) - self._max_readings
-                if overflow > 0:
-                    self.dropped_count += overflow
-                    merged = merged[overflow:]  # drop oldest -- same bound/policy as append()
-                self._buf = merged
-            finally:
-                self._lock.release()
+        self._lock.acquire()
+        try:
+            if ok:
+                send_buf.head = 0
+                send_buf.count = 0
+            else:
+                current = self._storages[self._active]
+                self._merge_failed_batch(send_buf, current)
+        finally:
+            self._lock.release()
         return ok
