@@ -186,12 +186,22 @@ def _post_batch(payload):
     connection can block this call indefinitely.
     """
     if not wlan.isconnected():
+        print("# POST_FAIL reason=wifi_disconnected")
         return False
     response = None
     try:
         response = urequests.post(INGEST_URL, json=payload)
-        return 200 <= response.status_code < 300
-    except Exception:
+        ok = 200 <= response.status_code < 300
+        if not ok:
+            # Diagnostic only -- return value/behaviour below is unchanged
+            # either way. Added after a soak where every POST in one
+            # incarnation failed and the log had no trace of why: this
+            # branch and the except below are the only places that decide
+            # False, so this is where the reason has to be captured.
+            print("# POST_FAIL reason=http_status status={}".format(response.status_code))
+        return ok
+    except Exception as exc:
+        print("# POST_FAIL reason=exception type={} msg={}".format(type(exc).__name__, exc))
         return False
     finally:
         if response is not None:
