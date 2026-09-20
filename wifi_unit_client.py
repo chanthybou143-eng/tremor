@@ -377,6 +377,14 @@ _consecutive_failures = 0
 _current_post_interval_s = POST_INTERVAL_S  # read by the main loop instead of the
                                               # POST_INTERVAL_S constant directly --
                                               # see BACKOFF_MULTIPLIER's comment
+readings_sent_ok = 0  # cumulative individual readings actually accepted by the
+                       # server (not POST attempts -- a single POST's batch size
+                       # varies, especially once MAX_READINGS_PER_POST capping is
+                       # draining a backlog), so this can be reconciled directly
+                       # against the server's own received count
+max_consecutive_failures = 0  # highest _consecutive_failures streak seen so far,
+                                # this run -- distinct from the current streak,
+                                # which resets to 0 on the next success
 
 
 def _post_batch(payload):
@@ -442,7 +450,7 @@ def _post_batch(payload):
         heap_free_before_collect, heap_free_after_collect))
 
     global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count
-    global _consecutive_failures, _current_post_interval_s
+    global _consecutive_failures, _current_post_interval_s, readings_sent_ok, max_consecutive_failures
 
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected stage=n/a heap_free={}".format(gc.mem_free()))
@@ -501,10 +509,13 @@ def _post_batch(payload):
         ok = False
 
     if ok:
+        readings_sent_ok += len(payload["readings"])
         _consecutive_failures = 0
         _current_post_interval_s = POST_INTERVAL_S
     else:
         _consecutive_failures += 1
+        if _consecutive_failures > max_consecutive_failures:
+            max_consecutive_failures = _consecutive_failures
         _current_post_interval_s = min(
             _current_post_interval_s * BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
         if _consecutive_failures >= CONSECUTIVE_FAILURE_GC_THRESHOLD:
@@ -728,7 +739,7 @@ while True:
               "longest_post_duration_s={:.3f} last_post_duration_ms={} slow_post_count={} "
               "stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
-              "stage_fail_read_response={}".format(
+              "stage_fail_read_response={} readings_sent_ok={} max_consecutive_failures={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -737,4 +748,5 @@ while True:
             stage_failure_counts["dns"], stage_failure_counts["connect"],
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
             stage_failure_counts["read_response"],
+            readings_sent_ok, max_consecutive_failures,
         ))
