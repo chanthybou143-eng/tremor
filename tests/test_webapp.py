@@ -391,6 +391,32 @@ def test_rocof_boundary_skip_is_counted():
     assert slot.rocof_skipped_boundary_count >= 1
 
 
+def test_rocof_suppressed_count_sums_both_reasons_in_snapshot():
+    # rocof_suppressed_count (the dashboard-facing field) must be the sum of
+    # both internal counters -- a boundary skip and an implausible-slope
+    # skip -- so an operator sees one total regardless of which reason
+    # triggered it.
+    state = _UnitsState()
+    b1 = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=1000.0, freq_hz=50.0), batch_id=b1)
+    state.add_reading("unit-1", UnitReading(t=1000.5, freq_hz=50.01), batch_id=b1)
+    b2 = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=1000.9, freq_hz=49.5), batch_id=b2)  # boundary skip
+
+    t = 1002.0
+    for freq in [50.0, 50.0, 90.0]:  # implausible-slope skip, same batch
+        state.add_reading("unit-1", UnitReading(t=t, freq_hz=freq), batch_id=b2)
+        t += 0.1
+
+    slot = state._slots["unit-1"]
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["rocof_suppressed_count"] == (
+        slot.rocof_skipped_boundary_count + slot.rocof_skipped_implausible_count
+    )
+    assert unit1["rocof_suppressed_count"] >= 2
+
+
 def test_max_rocof_gap_rejects_a_real_but_too_large_gap_even_with_gps():
     # A gap inside ROCOF_WINDOW_S's candidate pool (so it's actually
     # considered) but beyond MAX_ROCOF_GAP_S's stricter bridging limit --

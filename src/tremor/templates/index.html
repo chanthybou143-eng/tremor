@@ -107,6 +107,11 @@
     font-size: 0.75rem;
     margin-top: 8px;
   }
+  .rocof-suppressed {
+    color: var(--accent-rocof);
+    font-size: 0.75rem;
+    margin-top: 4px;
+  }
   .card-header {
     display: flex;
     justify-content: space-between;
@@ -221,6 +226,7 @@ function makeCard(unit) {
     </div>
     <div class="chart-container"><canvas></canvas></div>
     <div class="completeness"></div>
+    <div class="rocof-suppressed" hidden></div>
     <div class="no-data" hidden>No data yet</div>
   `;
   grid.appendChild(card);
@@ -351,6 +357,7 @@ function updateCard(card, unit) {
   const readings = card.querySelector('.readings');
   const staleBanner = card.querySelector('.stale-banner');
   const completeness = card.querySelector('.completeness');
+  const rocofSuppressed = card.querySelector('.rocof-suppressed');
 
   if (unit.status === 'offline') {
     noData.hidden = false;
@@ -358,6 +365,7 @@ function updateCard(card, unit) {
     readings.hidden = true;
     staleBanner.hidden = true;
     completeness.textContent = '';
+    rocofSuppressed.hidden = true;
     return;
   }
   noData.hidden = true;
@@ -384,6 +392,20 @@ function updateCard(card, unit) {
     completeness.textContent =
       `${unit.completeness_pct.toFixed(0)}% data completeness (last 60s, ` +
       `${unit.samples_per_minute} samples/min)`;
+  }
+
+  // Separately labelled from completeness -- a suppressed RoCoF point is a
+  // point the server refused to compute/plot at all (a batch-boundary
+  // refusal or the plausibility backstop), not a matter of raw sample
+  // coverage, so it belongs in its own line rather than folded into the
+  // completeness text.
+  if (unit.rocof_suppressed_count > 0) {
+    rocofSuppressed.textContent =
+      `${unit.rocof_suppressed_count} RoCoF point` +
+      `${unit.rocof_suppressed_count === 1 ? '' : 's'} suppressed (implausible or batch-boundary)`;
+    rocofSuppressed.hidden = false;
+  } else {
+    rocofSuppressed.hidden = true;
   }
 
   updateChart(chartsById[unit.id], unit);
