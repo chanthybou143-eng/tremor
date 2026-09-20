@@ -487,6 +487,36 @@ def test_gps_locked_reflects_most_recent_reading_only():
     assert unit1["gps_locked"] is False
 
 
+def test_rocof_gaps_reflects_the_rocof_series_not_the_frequency_series():
+    # rocof has its own gap detection, independent of the frequency series'
+    # `gaps`. A run of rapid, single-reading "restarts" (no GPS, so nothing
+    # can bridge) skips RoCoF for each of them individually -- none of those
+    # skips is a gap on its own -- but frequency keeps arriving every 1s
+    # throughout, so by the time two readings finally land back in the same
+    # batch and produce a RoCoF point again, real time has moved on far
+    # enough that it shows up as a gap in the RoCoF series specifically.
+    state = _UnitsState()
+
+    b_a = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=0.0, freq_hz=50.0), batch_id=b_a)
+    state.add_reading("unit-1", UnitReading(t=1.0, freq_hz=50.1), batch_id=b_a)  # first RoCoF point, t=1.0
+
+    for t in range(2, 8):  # t=2..7, each its own batch: every one skipped, never bridges
+        state.add_reading("unit-1", UnitReading(t=float(t), freq_hz=50.0), batch_id=state.next_batch_id())
+
+    b_b = state.next_batch_id()
+    state.add_reading("unit-1", UnitReading(t=8.0, freq_hz=50.0), batch_id=b_b)
+    state.add_reading("unit-1", UnitReading(t=9.0, freq_hz=50.2), batch_id=b_b)  # next RoCoF point, t=9.0
+
+    slot = state._slots["unit-1"]
+    assert slot.rocof_skipped_boundary_count >= 6
+
+    snapshot = state.snapshot()
+    unit1 = next(u for u in snapshot if u["id"] == "unit-1")
+    assert unit1["gaps"] == []  # frequency arrived every 1s throughout, never a real gap
+    assert unit1["rocof_gaps"] == [[1.0, 9.0]]  # but RoCoF has an 8s hole where restarts kept skipping it
+
+
 def test_samples_per_minute_counts_recent_readings():
     state = _UnitsState()
     for i in range(70):  # 70 readings, 1/s, t=0..69
