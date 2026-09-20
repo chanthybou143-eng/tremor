@@ -49,8 +49,107 @@ SPARKLINE_SMOOTHING_WINDOW_S = 0.2
 # Real per-reading cadence for an ingested batch -- matches
 # wifi_unit_client.py's CHUNK_S and overnight_log.py's CHUNK_S (both 1.0s),
 # the one-reading-per-second convention used throughout this project. Used
-# to space out a batch's timestamps realistically (see /api/ingest).
+# to space out a batch's timestamps realistically (see /api/ingest), and
+# as the assumed rate for the "expected" side of completeness_pct below.
 READING_INTERVAL_S = 1.0
+
+# RoCoF cross-batch safety (see _fit_time_for_point). A batch/restart
+# boundary's reconstructed `t` values are each independently anchored to
+# that batch's own receipt time -- see /api/ingest's docstring -- so two
+# points from different batches can land far closer together in
+# reconstructed time than they really were, even though each side's `t` is
+# individually reasonable. This is what produced a real -22.953 Hz/s
+# reading in production (see 7714d2a and the incident writeup in
+# wifi_unit_client.py's git history): a crash-triggered restart's first
+# small batch landed close enough to the tail of the pre-crash batch still
+# in the 60s window to fool rocof_from_window. Fixed by: preferring
+# per-reading GPS UTC timestamps (a real, independent clock) for the time
+# axis whenever both points have one, and refusing to bridge two different
+# non-GPS-confirmed batches at all, rather than trusting reconstructed `t`
+# across a boundary it was never safe to cross.
+# Deliberately tighter than ROCOF_WINDOW_S (which only bounds the initial
+# candidate pool -- see add_reading) so bridging a gap requires it to be
+# comfortably inside that pool, not merely at its edge: READING_INTERVAL_S
+# is 1.0s, so 1.5s already covers a couple of missed/delayed readings
+# without approaching ROCOF_WINDOW_S's 2.0s pool radius.
+MAX_ROCOF_GAP_S = 1.5
+# Generous backstop independent of the above: real grid RoCoF protection
+# settings (e.g. AEMO's) sit at a few Hz/s even for extreme contingencies,
+# so several Hz/s of margin above that is still "physically impossible if
+# exceeded" territory, not a tight clamp on genuine grid events.
+ROCOF_PLAUSIBILITY_LIMIT_HZ_S = 5.0
+# "Something's actually wrong" cadence for gap detection/chart breaking --
+# comfortably above ordinary ~1s jitter, well below a real outage.
+GAP_THRESHOLD_S = 5.0
+# 3x the real client's POST_INTERVAL_S (30s) -- tolerates one missed POST
+# cycle without immediately flagging a unit as stale, but flags a second
+# consecutive miss. Status strip/chart greying (see snapshot()) uses this.
+STALE_THRESHOLD_S = 90.0
+
+GPS_SECONDS_PER_DAY = 86400.0
+
+
+def _gps_utc_delta_s(a: float, b: float) -> float:
+    """a - b in seconds, folding a UTC-seconds-of-day midnight wraparound
+    into (-12h, 12h] -- mirrors pps_time_sync.py's feed_nmea() fold (the
+    on-device equivalent); this is the one place the server does its own
+    gps_utc_s arithmetic, so the same fold is needed here."""
+    delta = a - b
+    if delta > GPS_SECONDS_PER_DAY / 2:
+        delta -= GPS_SECONDS_PER_DAY
+    elif delta < -GPS_SECONDS_PER_DAY / 2:
+        delta += GPS_SECONDS_PER_DAY
+    return delta
+
+
+@dataclass(frozen=True)
+class _FreqPoint:
+    """One stored frequency sample. batch_id/gps_utc_s are None for
+    anything that isn't from a real /api/ingest batch (a synthetic feed's
+    readings, or a direct _UnitsState.add_reading() call as tests do) --
+    those sources produce `t` continuously and natively (never
+    reconstructed from a batch's receipt time), so they're always trusted,
+    matching this dashboard's behavior before the RoCoF fix below."""
+    t: float
+    freq_hz: float
+    batch_id: Optional[int] = None
+    gps_utc_s: Optional[float] = None
+
+
+def _fit_time_for_point(
+    newest: _FreqPoint, point: _FreqPoint, max_gap_s: float
+) -> Optional[float]:
+    """Returns the time value to use for `point` in a RoCoF least-squares
+    fit anchored to `newest`'s own `t` axis, or None if it isn't safe to
+    include `point` in the fit at all.
+
+    Preference order: (1) if both points carry a real GPS UTC timestamp,
+    use that -- it's an independent, trustworthy clock, immune to the
+    batch-reconstruction issue, so it's preferred even for two points in
+    the very same batch. (2) Otherwise, if `point` is from the same batch
+    as `newest`, or either is from a trusted (non-ingest) source, its
+    existing `t` is safe to use directly. (3) Otherwise -- two different
+    real-ingest batches with no GPS confirmation available -- refuse;
+    there is no safe way to compare their reconstructed timestamps.
+
+    In all cases the resulting span must be positive and within
+    max_gap_s, or the point is excluded regardless of source.
+    """
+    if point is newest:
+        return newest.t
+
+    if newest.gps_utc_s is not None and point.gps_utc_s is not None:
+        gap = _gps_utc_delta_s(newest.gps_utc_s, point.gps_utc_s)
+        if 0 < gap <= max_gap_s:
+            return newest.t - gap
+        return None  # GPS itself says too far apart (or non-monotonic)
+
+    if newest.batch_id is None or point.batch_id is None or newest.batch_id == point.batch_id:
+        if 0 < newest.t - point.t <= max_gap_s:
+            return point.t
+        return None
+
+    return None  # different real-ingest batches, no GPS to confirm -- refuse
 
 # Small, plausible per-unit calibration/noise variation -- all units track
 # the same true_grid_freq_hz() (see units.py), only their independent ADC
@@ -89,17 +188,47 @@ def _smoothed_history(
     return smoothed
 
 
+def _find_gaps(points: List[Tuple[float, float]]) -> List[List[float]]:
+    """Returns [start_t, end_t] for each consecutive pair of ``points``
+    (list of ``(t, freq_hz)``) more than GAP_THRESHOLD_S apart -- server
+    is the single source of truth for what counts as a gap (one
+    definition, used by both the completeness figure and the frontend's
+    chart-breaking), rather than duplicating the threshold in JS."""
+    gaps = []
+    for (t0, _f0), (t1, _f1) in zip(points, points[1:]):
+        if t1 - t0 > GAP_THRESHOLD_S:
+            gaps.append([t0, t1])
+    return gaps
+
+
 @dataclass
 class _UnitSlot:
     unit_id: str
     label: str
-    freq: Deque[Tuple[float, float]] = field(default_factory=deque)
+    freq: Deque[_FreqPoint] = field(default_factory=deque)
     rocof: Deque[Tuple[float, float]] = field(default_factory=deque)
     # Only populated by real ingested readings (see /api/ingest below) --
     # SyntheticUnitFeed's readings never carry amplitude_v, so this stays
     # empty for the synthetic units.
     amplitude: Deque[Tuple[float, float]] = field(default_factory=deque)
     last_gps_utc_s: Optional[float] = None
+    # Whether the MOST RECENT reading specifically carried a gps_utc_s --
+    # distinct from last_gps_utc_s (which only ever updates on a non-None
+    # value, so it can't tell you if lock was lost since). This is the
+    # honest "is GPS locked right now" signal for the status strip: real,
+    # derived from what the device actually reported, not inferred/faked.
+    gps_locked: bool = False
+    # Counted, not silently dropped -- see _fit_time_for_point/module docstring.
+    rocof_skipped_boundary_count: int = 0
+    rocof_skipped_implausible_count: int = 0
+    # Real wall-clock time.time() at the last add_reading() call --
+    # deliberately NOT derived from the reading's own `t`, since `t` is on
+    # a different timescale per source (real ingest: time.time()-based;
+    # SyntheticUnitFeed: a process-relative elapsed counter starting at 0).
+    # Staleness is a wall-clock question ("how long ago did the server
+    # actually last hear from this unit") regardless of what timescale the
+    # reading itself uses for chart ordering.
+    last_seen_wall_time: float = field(default_factory=time.time)
 
 
 class _UnitsState:
@@ -112,39 +241,89 @@ class _UnitsState:
     def __init__(self):
         self._lock = threading.Lock()
         self._slots: Dict[str, _UnitSlot] = {}
+        self._next_batch_id = 1
 
-    def add_reading(self, unit_id: str, reading: UnitReading) -> None:
+    def next_batch_id(self) -> int:
+        """One id per /api/ingest call, shared across units -- only
+        uniqueness matters (see _fit_time_for_point), not per-unit scoping."""
+        with self._lock:
+            batch_id = self._next_batch_id
+            self._next_batch_id += 1
+            return batch_id
+
+    def add_reading(
+        self, unit_id: str, reading: UnitReading, batch_id: Optional[int] = None
+    ) -> None:
         with self._lock:
             slot = self._slots.get(unit_id)
             if slot is None:
                 slot = _UnitSlot(unit_id=unit_id, label=_default_label(unit_id))
                 self._slots[unit_id] = slot
-            slot.freq.append((reading.t, reading.freq_hz))
-            self._trim(slot.freq, reading.t)
+
+            point = _FreqPoint(
+                t=reading.t, freq_hz=reading.freq_hz,
+                batch_id=batch_id, gps_utc_s=reading.gps_utc_s,
+            )
+            slot.freq.append(point)
+            self._trim(slot.freq, reading.t, key=lambda p: p.t)
 
             if reading.amplitude_v is not None:
                 slot.amplitude.append((reading.t, reading.amplitude_v))
                 self._trim(slot.amplitude, reading.t)
             if reading.gps_utc_s is not None:
                 slot.last_gps_utc_s = reading.gps_utc_s
+            slot.gps_locked = reading.gps_utc_s is not None
+            slot.last_seen_wall_time = time.time()
 
-            window = [
-                (t, f) for t, f in slot.freq if reading.t - t <= ROCOF_WINDOW_S
+            # Candidate pool: near in reconstructed `t` OR, when both sides
+            # have GPS, confirmed near by that independent clock -- using
+            # `t` alone here would let it reject a point GPS proves is
+            # genuinely close but whose reconstructed `t` (built
+            # independently per batch) happens to disagree, which is
+            # exactly the kind of mistrust in `t` this fix exists to avoid.
+            # _fit_time_for_point still does the authoritative eligibility
+            # and span check below; this only decides the initial pool.
+            candidates = [
+                p for p in slot.freq
+                if reading.t - p.t <= ROCOF_WINDOW_S
+                or (
+                    reading.gps_utc_s is not None and p.gps_utc_s is not None
+                    and 0 <= _gps_utc_delta_s(reading.gps_utc_s, p.gps_utc_s) <= ROCOF_WINDOW_S
+                )
             ]
-            if len(window) >= 2:
-                ts = [p[0] for p in window]
-                fs = [p[1] for p in window]
-                slope = rocof_from_window(ts, fs)
+            fit_ts: List[float] = []
+            fit_fs: List[float] = []
+            for p in candidates:
+                fit_t = _fit_time_for_point(point, p, MAX_ROCOF_GAP_S)
+                if fit_t is None:
+                    continue
+                fit_ts.append(fit_t)
+                fit_fs.append(p.freq_hz)
+
+            if len(fit_ts) >= 2:
+                slope = rocof_from_window(fit_ts, fit_fs)
                 if slope is not None:
-                    slot.rocof.append((reading.t, slope))
-                    self._trim(slot.rocof, reading.t)
+                    if abs(slope) <= ROCOF_PLAUSIBILITY_LIMIT_HZ_S:
+                        slot.rocof.append((reading.t, slope))
+                        self._trim(slot.rocof, reading.t)
+                    else:
+                        slot.rocof_skipped_implausible_count += 1
+            elif len(candidates) >= 2:
+                # There were enough nearby points by time alone, but
+                # eligibility filtering (batch boundary / no GPS
+                # confirmation) knocked the usable set below 2 -- this is
+                # the case the fix exists for, not just "not enough data
+                # yet" (that's the len(candidates) < 2 case, left silent
+                # exactly as before this fix).
+                slot.rocof_skipped_boundary_count += 1
 
     @staticmethod
-    def _trim(buf: Deque[Tuple[float, float]], latest_t: float) -> None:
-        while buf and latest_t - buf[0][0] > WINDOW_S:
+    def _trim(buf, latest_t: float, key=lambda item: item[0]) -> None:
+        while buf and latest_t - key(buf[0]) > WINDOW_S:
             buf.popleft()
 
     def snapshot(self) -> List[dict]:
+        now = time.time()
         with self._lock:
             out = []
             for slot in self._slots.values():
@@ -152,27 +331,50 @@ class _UnitsState:
                     out.append(dict(
                         id=slot.unit_id, label=slot.label, status="offline",
                         freq_hz=None, rocof_hz_s=None, history=[], rocof_history=[],
-                        amplitude_v=None, gps_utc_s=None,
+                        amplitude_v=None, gps_utc_s=None, gps_locked=None,
+                        seconds_since_last_reading=None, samples_per_minute=0,
+                        completeness_pct=None, gaps=[],
                     ))
                     continue
-                latest_t = slot.freq[-1][0]
-                recent = [f for t, f in slot.freq if latest_t - t <= READOUT_WINDOW_S]
+                latest_t = slot.freq[-1].t
+                seconds_since_last_reading = now - slot.last_seen_wall_time
+                is_stale = seconds_since_last_reading > STALE_THRESHOLD_S
+                recent = [p.freq_hz for p in slot.freq if latest_t - p.t <= READOUT_WINDOW_S]
                 recent_amplitude = [
                     a for t, a in slot.amplitude if latest_t - t <= READOUT_WINDOW_S
                 ]
+                history_points = [(p.t, p.freq_hz) for p in slot.freq]
+                # latest_t, not wall-clock `now` -- same reasoning as
+                # last_seen_wall_time's comment: a reading's own `t` isn't
+                # wall-clock-comparable for every source (SyntheticUnitFeed's
+                # is process-relative), so "how many in the last 60s of this
+                # unit's own timeline" uses that timeline's own reference point.
+                samples_per_minute = len([p for p in slot.freq if latest_t - p.t <= 60.0])
+
+                span_s = min(WINDOW_S, latest_t - slot.freq[0].t) if len(slot.freq) > 1 else 0.0
+                expected = span_s / READING_INTERVAL_S
+                completeness_pct = (
+                    min(100.0, 100.0 * len(slot.freq) / expected) if expected > 0 else 100.0
+                )
+
                 out.append(dict(
                     id=slot.unit_id,
                     label=slot.label,
-                    status="live",
+                    status="stale" if is_stale else "live",
                     freq_hz=statistics.median(recent),
                     rocof_hz_s=slot.rocof[-1][1] if slot.rocof else 0.0,
-                    history=[list(p) for p in _smoothed_history(list(slot.freq))],
+                    history=[list(p) for p in _smoothed_history(history_points)],
                     # Not smoothed like history -- rocof_from_window's least-squares
                     # fit over ROCOF_WINDOW_S is already far less noisy than raw
                     # per-cycle frequency, so there's nothing extra to gain here.
                     rocof_history=[list(p) for p in slot.rocof],
                     amplitude_v=statistics.median(recent_amplitude) if recent_amplitude else None,
                     gps_utc_s=slot.last_gps_utc_s,
+                    gps_locked=slot.gps_locked,
+                    seconds_since_last_reading=seconds_since_last_reading,
+                    samples_per_minute=samples_per_minute,
+                    completeness_pct=completeness_pct,
+                    gaps=_find_gaps(history_points),
                 ))
             return out
 
@@ -269,13 +471,17 @@ def create_app(
 
         now = time.time()
         n = len(parsed)
+        batch_id = state.next_batch_id()  # see _fit_time_for_point: every reading in
+                                           # this POST shares one id, distinguishing
+                                           # "same batch" from "different batch" for
+                                           # the RoCoF cross-batch guard
         for i, (freq_hz, amplitude_v, gps_utc_s) in enumerate(parsed):
             state.add_reading(unit_id, UnitReading(
                 t=now - (n - 1 - i) * READING_INTERVAL_S,
                 freq_hz=freq_hz,
                 amplitude_v=amplitude_v,
                 gps_utc_s=gps_utc_s,
-            ))
+            ), batch_id=batch_id)
 
         return jsonify(accepted=len(parsed)), 202
 
