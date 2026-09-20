@@ -206,6 +206,81 @@ def test_wraparound_survives_a_failed_cycle_mid_stream():
     assert [r["frequency_hz"] for r in readings] == [_f32(float(i)) for i in (3, 4, 5, 6)]
 
 
+def test_max_readings_per_post_sends_only_the_oldest_slice():
+    buf = IngestBuffer("unit-1", post_fn=None, max_readings=200, max_readings_per_post=3)
+    for i in range(10):
+        buf.append(float(i), 0.7, None)
+
+    readings = _flush_and_capture(buf)
+    assert [r["frequency_hz"] for r in readings] == [_f32(f) for f in (0.0, 1.0, 2.0)]
+    assert len(buf) == 7  # the other 7 stayed buffered
+
+
+def test_max_readings_per_post_remainder_drains_over_later_cycles_no_extra_post():
+    sent_batches = []
+
+    def _post_fn(payload):
+        sent_batches.append([r["frequency_hz"] for r in payload["readings"]])
+        return True
+
+    buf = IngestBuffer("unit-1", post_fn=_post_fn, max_readings=200, max_readings_per_post=3)
+    for i in range(10):
+        buf.append(float(i), 0.7, None)
+
+    # Each flush() call here represents one scheduled cycle -- exactly one
+    # POST per call, never an internal retry-until-drained loop (that
+    # would be an extra, unscheduled POST, exactly what capping is meant
+    # to avoid).
+    buf.flush()
+    assert len(sent_batches) == 1
+    assert len(buf) == 7
+
+    while len(buf) > 0:
+        buf.flush()
+
+    assert len(sent_batches) == 4  # 1 + 3 more scheduled-cadence calls to drain 7 at cap 3
+    assert sent_batches == [
+        [_f32(float(i)) for i in (0.0, 1.0, 2.0)],
+        [_f32(float(i)) for i in (3.0, 4.0, 5.0)],
+        [_f32(float(i)) for i in (6.0, 7.0, 8.0)],
+        [_f32(9.0)],
+    ]
+
+
+def test_max_readings_per_post_remainder_merges_correctly_with_new_appends():
+    buf = IngestBuffer("unit-1", post_fn=None, max_readings=200, max_readings_per_post=2)
+
+    def _post_fn(payload):
+        buf.append(99.0, 0.7, None)  # arrives mid-POST, after the held-back remainder chronologically
+        return True
+
+    buf._post_fn = _post_fn
+    for i in range(5):
+        buf.append(float(i), 0.7, None)  # 0,1,2,3,4 buffered
+
+    buf.flush()  # sends 0,1 (cap=2); 2,3,4 held back; 99 arrives mid-POST
+    assert len(buf) == 4  # 2,3,4 (held back) + 99 (arrived during the POST)
+
+    sent_order = []
+    while len(buf) > 0:
+        readings = _flush_and_capture(buf)
+        sent_order.extend(r["frequency_hz"] for r in readings)
+    assert sent_order == [_f32(f) for f in (2.0, 3.0, 4.0, 99.0)]
+
+
+def test_max_readings_per_post_defaults_to_uncapped():
+    # No max_readings_per_post given -- must reproduce the old, uncapped
+    # behaviour exactly (all the tests above this point in the file rely
+    # on this default).
+    buf = IngestBuffer("unit-1", post_fn=None, max_readings=200)
+    for i in range(150):
+        buf.append(float(i), 0.7, None)
+
+    readings = _flush_and_capture(buf)
+    assert len(readings) == 150
+    assert len(buf) == 0
+
+
 def test_concurrent_append_and_flush_lose_nothing():
     # Real OS threads (CPython's _thread/threading genuinely preempts, even
     # under the GIL) -- this is the actual concurrency IngestBuffer now

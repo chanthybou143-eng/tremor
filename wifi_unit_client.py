@@ -147,6 +147,19 @@ POST_INTERVAL_S = 30.0
 # often flush() is called. See the bench-run report (commit history) for
 # the actually-observed peak.
 MAX_BUFFERED_READINGS = 600
+# Caps a single flush()'s POST body -- uncapped, a fully-buffered flush
+# (600 readings) is a ~48.6KB JSON body (measured directly), a single
+# allocation-heavy contiguous write nobody had reason to bound before the
+# buffer itself could actually reach that size. 60 is ~2x the normal
+# ~28-30 readings/cycle at POST_INTERVAL_S=30s/CHUNK_S=1s -- comfortable
+# headroom for ordinary timing jitter, so normal operation is never
+# capped, while a real backlog drains over several ordinary-cadence
+# cycles instead of one large POST. The remainder is left buffered for
+# the next scheduled flush(), not sent immediately -- an extra POST right
+# away would be one more multi-second blocking call competing with ADC
+# ring-buffer draining, the same kind of stall that causes ring-buffer
+# overflow_count in the first place.
+MAX_READINGS_PER_POST = 60
 
 WIFI_RETRY_INTERVAL_S = 5    # how often to kick off a fresh connect attempt while down
 STATUS_INTERVAL_S = 10
@@ -449,7 +462,8 @@ def _post_batch(payload):
         return False
 
 
-buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
+buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS,
+                       max_readings_per_post=MAX_READINGS_PER_POST)
 
 _last_consumed_ticks = t0
 _elapsed_us_total = 0
