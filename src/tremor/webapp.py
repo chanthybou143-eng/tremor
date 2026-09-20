@@ -340,6 +340,7 @@ class _UnitsState:
                         amplitude_v=None, gps_utc_s=None, gps_locked=None,
                         seconds_since_last_reading=None, samples_per_minute=0,
                         completeness_pct=None, gaps=[], rocof_gaps=[],
+                        rocof_suppressed_count=0,
                     ))
                     continue
                 latest_t = slot.freq[-1].t
@@ -396,6 +397,15 @@ class _UnitsState:
                     # guard above can exclude a point from rocof_history even
                     # when the frequency line has no gap there at all.
                     rocof_gaps=_find_gaps([(t, r) for t, r in slot.rocof]),
+                    # Both reasons a candidate RoCoF point was excluded rather
+                    # than plotted (see _fit_time_for_point / the plausibility
+                    # check above) -- surfaced as one total so an operator can
+                    # see at a glance that suppression is happening, without
+                    # needing to know the two internal reasons apart.
+                    rocof_suppressed_count=(
+                        slot.rocof_skipped_boundary_count
+                        + slot.rocof_skipped_implausible_count
+                    ),
                 ))
             return out
 
