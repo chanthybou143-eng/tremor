@@ -40,14 +40,45 @@ import array
 import gc
 import time
 
+import micropython
 import network
-import urequests
 from machine import ADC, UART, Pin, Timer
+
+# NEEDS VERIFICATION ON HARDWARE: module names below are the standard
+# MicroPython names as of recent releases (socket/ssl), with the older
+# u-prefixed names (usocket/ussl) as a fallback for firmware that hasn't
+# renamed them yet -- this port's actual naming has not been confirmed on
+# this specific build. Same reasoning for ujson/json.
+try:
+    import socket as _socket
+except ImportError:
+    import usocket as _socket
+try:
+    import ssl as _ssl
+except ImportError:
+    import ussl as _ssl
+try:
+    import json as _json
+except ImportError:
+    import ujson as _json
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
+
+# Parsed once here rather than per-POST -- INGEST_URL is fixed for the life
+# of the process. Mirrors the standard micropython-lib urequests URL
+# parsing (proto, "", host[:port], path).
+_ingest_proto, _, _ingest_host_port, _ingest_path = INGEST_URL.split("/", 3)
+if ":" in _ingest_host_port:
+    INGEST_HOST, _ingest_port_s = _ingest_host_port.split(":", 1)
+    INGEST_PORT = int(_ingest_port_s)
+else:
+    INGEST_HOST = _ingest_host_port
+    INGEST_PORT = 443 if _ingest_proto == "https:" else 80
+INGEST_PATH = _ingest_path
+INGEST_IS_TLS = _ingest_proto == "https:"
 
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
 # adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
@@ -81,7 +112,24 @@ CHUNK_S = 1.0            # one summarized reading per second, same cadence as ov
 # hundreds of KB nominally free (confirmed: every crash logged heap_free
 # well over 350KB while failing to allocate exactly 8192 bytes). A margin
 # over the nominal ~1030 covers normal timer jitter without ever growing.
+# Lowering it further isn't well justified: with array.array buffers
+# below, each extra slot of margin costs only its flat itemsize (a few
+# bytes), not the boxed-float overhead a plain list paid per slot -- the
+# margin is now cheap, and real chunks have been observed needing up to
+# ~1148 samples (inferred from a crash requiring a slice sized past 1030
+# during unrelated heap pressure), so 1200 stays a reasonable ceiling.
 CHUNK_CAPACITY = 1200
+
+# NEEDS VERIFICATION ON HARDWARE: this assumes single-precision floats
+# (MICROPY_FLOAT_IMPL_FLOAT), the common default for the rp2 port since
+# RP2040/RP2350 have no double-precision FPU -- but this has not been
+# confirmed on this specific build. Run check_float_precision.py (repo
+# root) on-device before flashing this file: if it prints "double", change
+# this to 'd' first. Getting it wrong doesn't crash anything (array.array
+# silently truncates values to fit 'f'), but it would store frequency/
+# amplitude/timestamp readings at less precision than this build's floats
+# actually support, and 'd' costs only 4 more bytes/slot.
+FLOAT_TYPECODE = "f"
 # Single source of truth for how often buffer.flush() POSTs a batch.
 # Raised from 8s to 30s: a persistent/keep-alive connection was
 # investigated and found not viable against this specific PythonAnywhere
@@ -178,40 +226,75 @@ def _wifi_service():
 
 def _post_batch(payload):
     """IngestBuffer's injected post_fn. Returns True only on a 2xx
-    response. Every response is explicitly closed -- a missed .close()
-    on urequests leaks the underlying socket, and repeated leaks exhaust
-    the Pico's socket table over an unattended multi-hour run (see module
-    docstring). NEEDS VERIFICATION ON HARDWARE: whether this urequests
-    build supports a timeout kwarg at all -- without one, a dead/half-open
-    connection can block this call indefinitely.
+    response. Every socket is explicitly closed -- a missed close leaks
+    the underlying socket, and repeated leaks exhaust the Pico's socket
+    table over an unattended multi-hour run (see module docstring).
+
+    This does the HTTPS POST by hand (connect -> TLS wrap -> write ->
+    read the status line) instead of calling urequests.post(), which was
+    the previous implementation and is functionally equivalent -- same
+    return contract, same socket-closing guarantee -- but was an opaque
+    single call with no way to see which internal step an OSError came
+    from. That distinction matters now: a soak hit `OSError: [Errno 12]
+    ENOMEM` from inside urequests.post() with no indication whether it
+    was DNS/connect, the TLS handshake, writing the request, or reading
+    the response, all of which allocate. `stage` below is updated before
+    each step so a POST_FAIL line says exactly which one was running.
+    Only the status line is read -- nothing here needs the response body.
+
+    NEEDS VERIFICATION ON HARDWARE: this has not run on this device.
+    It mirrors the standard micropython-lib urequests request() structure
+    closely (same URL parsing, same connect/wrap/write/read sequence) to
+    minimize deviation from what's already proven to work, but it is a
+    genuine reimplementation, not a refactor, and needs its own bench
+    validation before being trusted -- also whether this socket/ssl
+    module supports a read timeout at all (the same open question
+    urequests carried: without one, a dead/half-open connection can
+    block this call indefinitely).
     """
     if not wlan.isconnected():
-        print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
+        print("# POST_FAIL stage=connect reason=wifi_disconnected heap_free={}".format(
+            gc.mem_free()))
         return False
-    response = None
+
+    micropython.mem_info(1)
+    print("# PRE_POST heap_free={}".format(gc.mem_free()))
+
+    stage = "connect"
+    s = None
     try:
-        response = urequests.post(INGEST_URL, json=payload)
-        ok = 200 <= response.status_code < 300
+        body = _json.dumps(payload).encode()
+        addr = _socket.getaddrinfo(INGEST_HOST, INGEST_PORT)[0][-1]
+        s = _socket.socket()
+        s.connect(addr)
+
+        if INGEST_IS_TLS:
+            stage = "tls_wrap"
+            s = _ssl.wrap_socket(s, server_hostname=INGEST_HOST)
+
+        stage = "write"
+        s.write("POST /{} HTTP/1.0\r\n".format(INGEST_PATH).encode())
+        s.write("Host: {}\r\n".format(INGEST_HOST).encode())
+        s.write(b"Content-Type: application/json\r\n")
+        s.write("Content-Length: {}\r\n".format(len(body)).encode())
+        s.write(b"Connection: close\r\n\r\n")
+        s.write(body)
+
+        stage = "read"
+        status_line = s.readline()
+        status_code = int(status_line.split(b" ", 2)[1])
+        ok = 200 <= status_code < 300
         if not ok:
-            # Diagnostic only -- return value/behaviour below is unchanged
-            # either way. Added after a soak where every POST in one
-            # incarnation failed and the log had no trace of why: this
-            # branch and the except below are the only places that decide
-            # False, so this is where the reason has to be captured.
-            # heap_free is read here as-is, with no gc.collect() first
-            # (unlike the STATUS line) -- forcing a collection right at
-            # the failure would itself perturb the exact state being
-            # diagnosed.
-            print("# POST_FAIL reason=http_status status={} heap_free={}".format(
-                response.status_code, gc.mem_free()))
+            print("# POST_FAIL stage=read reason=http_status status={} heap_free={}".format(
+                status_code, gc.mem_free()))
         return ok
     except Exception as exc:
-        print("# POST_FAIL reason=exception type={} msg={} heap_free={}".format(
-            type(exc).__name__, exc, gc.mem_free()))
+        print("# POST_FAIL stage={} reason=exception type={} msg={} heap_free={}".format(
+            stage, type(exc).__name__, exc, gc.mem_free()))
         return False
     finally:
-        if response is not None:
-            response.close()
+        if s is not None:
+            s.close()
 
 
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
@@ -225,11 +308,26 @@ _elapsed_us_total = 0
 # stale leftover from a previous chunk and must never be read -- every
 # consumer below is bounded to _chunk_len, not len(...), specifically to
 # guard against that.
-_chunk_ticks = [0] * CHUNK_CAPACITY    # raw time.ticks_us() per sample -- for gps_utc_s lookup
-_chunk_ts_s = [0.0] * CHUNK_CAPACITY   # elapsed seconds per sample -- summarize_chunk's timestamps
-_chunk_counts = [0] * CHUNK_CAPACITY   # raw u16 ADC counts per sample -- converted to volts below
-_voltages = [0.0] * CHUNK_CAPACITY     # scratch buffer for the volts-converted chunk
-_filtered_buf = [0.0] * CHUNK_CAPACITY  # scratch buffer for summarize_chunk's filtered signal
+#
+# array.array, not plain lists: a plain list of floats still boxes each
+# individual value (a separate heap object per element) even though the
+# list itself is pre-sized -- only the backing pointer array was fixed,
+# not the ~1030 float objects it points to, which were freshly allocated
+# and freed every chunk regardless of the list-growth fix. array.array
+# stores packed, unboxed values instead, so filling these buffers by
+# index allocates nothing at all: indexing/reading/rewriting existing
+# slots is unchanged (array.array supports the exact same arr[i]/
+# arr[i]=x/len(arr) interface as a list), and the stale-data guards
+# above are unaffected. counts uses 'H' (raw ADC u16, matches ring_raw's
+# own typecode) and ticks uses 'I', both narrower than a list's 4-byte
+# pointer slot for at least one of them; the float buffers use
+# FLOAT_TYPECODE (see its own comment above -- unverified pending
+# check_float_precision.py).
+_chunk_ticks = array.array("I", [0] * CHUNK_CAPACITY)     # raw time.ticks_us() per sample -- for gps_utc_s lookup
+_chunk_ts_s = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)    # elapsed seconds per sample -- summarize_chunk's timestamps
+_chunk_counts = array.array("H", [0] * CHUNK_CAPACITY)    # raw u16 ADC counts per sample -- converted to volts below
+_voltages = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)      # scratch buffer for the volts-converted chunk
+_filtered_buf = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)  # scratch buffer for summarize_chunk's filtered signal
 _chunk_len = 0
 chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY samples --
                                     # extra samples past capacity are dropped and counted here,
