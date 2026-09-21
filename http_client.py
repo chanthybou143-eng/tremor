@@ -106,6 +106,25 @@ SOCKET_OP_TIMEOUT_S = 4.0
 POST_DEADLINE_S = 10.0
 
 
+def parse_https_url(url):
+    """Splits a URL of the form "https://host[:port]/path" into
+    (host, port, path). Only supports https (port defaults to 443), and
+    only a bare host[:port]/path shape -- no query string/auth/etc. --
+    since this project has exactly one POST endpoint (wifi_config.py's
+    INGEST_URL), not a general HTTP client. Intentionally minimal rather
+    than a full RFC 3986 parser, and rather than depending on
+    urequests.post()'s own (removed) URL-parsing for this.
+    """
+    if not url.startswith("https://"):
+        raise ValueError("only https:// URLs are supported: {!r}".format(url))
+    rest = url[len("https://"):]
+    host_port, _, path = rest.partition("/")
+    path = "/" + path
+    host, _, port_str = host_port.partition(":")
+    port = int(port_str) if port_str else 443
+    return host, port, path
+
+
 def _check_deadline(deadline_at, stage, now_fn):
     if now_fn() >= deadline_at:
         raise PostStageError(stage, "overall_deadline_exceeded")

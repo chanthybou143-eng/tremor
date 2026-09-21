@@ -16,7 +16,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from http_client import PostStageError, POST_DEADLINE_S, timeout_post  # noqa: E402
+from http_client import (  # noqa: E402
+    PostStageError,
+    POST_DEADLINE_S,
+    parse_https_url,
+    timeout_post,
+)
+
+
+def test_parse_https_url_splits_host_port_path():
+    assert parse_https_url("https://tremorgrid.pythonanywhere.com/api/ingest") == (
+        "tremorgrid.pythonanywhere.com", 443, "/api/ingest")
+
+
+def test_parse_https_url_with_explicit_port():
+    assert parse_https_url("https://example.invalid:8443/x") == ("example.invalid", 8443, "/x")
+
+
+def test_parse_https_url_rejects_non_https():
+    with pytest.raises(ValueError):
+        parse_https_url("http://example.invalid/x")
 
 
 def _fake_getaddrinfo(host, port):

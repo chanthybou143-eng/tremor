@@ -10,12 +10,21 @@ stays single-core-only going forward (see wifi_ingest.py/git history).
 Written against adc_stream_gps.py's proven ADC-ring-buffer/GPS-UART-polling
 design (same wraparound-safe ticks accumulator, same GPS_READ_CHUNK_BYTES
 reasoning), with chunk_summary.py and wifi_ingest.py tested under desktop
-Python. Known MicroPython WiFi/urequests gotchas this was written to
-survive -- see the inline comments at each relevant point: no WiFi
-auto-reconnect (_wifi_service), urequests responses must be .close()'d or
-sockets leak (_post_batch), no default socket timeout in most urequests
-forks (_post_batch), and a blocking POST can stall the main loop for
-longer than the ring buffer's headroom (RING_CAPACITY).
+Python. Known MicroPython WiFi gotchas this was written to survive -- see
+the inline comments at each relevant point: no WiFi auto-reconnect
+(_wifi_service), and a blocking POST can stall the main loop for longer
+than the ring buffer's headroom (RING_CAPACITY).
+
+That last one used to be theoretical. Trial 3 hit it for real: a ~2min
+WiFi outage produced a ~7min main-loop freeze via urequests.post(),
+which has no socket timeout in most MicroPython forks -- confirmed by
+elapsed_s staying flat while wall-clock time advanced and the ADC ring
+buffer's overflow counter jumping by ~400,000 during the stall. _post_batch
+now calls http_client.timeout_post() instead, which bounds every
+individual socket operation (SOCKET_OP_TIMEOUT_S) and the whole POST
+attempt (POST_DEADLINE_S) -- see that module for why both are needed. A
+machine.WDT backstops the case that software bound itself fails (see
+WDT_TIMEOUT_MS below).
 
 POST_INTERVAL_S raised from 8s to 30s to reduce how often the ~2.1-2.6s
 DNS+TCP+TLS handshake gets paid per hour -- a persistent/keep-alive
@@ -38,17 +47,24 @@ adc_stream_gps.py itself, is touched by this script.
 
 import array
 import gc
+import json  # NEEDS VERIFICATION ON HARDWARE: assumes this build exposes the
+             # module as "json" (current MicroPython/micropython-lib name);
+             # older forks only had it as "ujson" -- urequests.post(json=...)
+             # did this same dumps() internally, so this isn't a NEW
+             # dependency, just now an explicit, visible one.
 import time
 
 import micropython
 import network
-import urequests
-from machine import ADC, UART, Pin, Timer
+from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
+from http_client import PostStageError, parse_https_url, timeout_post
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
+
+INGEST_HOST, INGEST_PORT, INGEST_PATH = parse_https_url(INGEST_URL)
 
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
 # adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
@@ -194,6 +210,47 @@ def _wifi_service():
             pass  # e.g. "already connecting" -- next retry will catch a real failure
 
 
+# machine.WDT, once started, CANNOT be stopped/disabled from software on
+# the rp2 port -- there is no wdt.deinit(), only wdt.feed() or letting it
+# expire and reset the board. So this is a build-time choice, not a
+# runtime one: set WDT_TIMEOUT_MS to None and reflash before doing any
+# mpremote maintenance (a paused REPL session, a long fs cp/ls -- anything
+# that legitimately stops this loop from running for a while) -- otherwise
+# the watchdog resets the board mid-session with no way to pause it first.
+#
+# This is a backstop, not the primary defense: POST_DEADLINE_S
+# (http_client.py) is what's SUPPOSED to bound a stuck POST to ~10s in
+# software. This watchdog exists for the case that bound itself fails --
+# e.g. if a low-level TLS handshake call doesn't actually honour
+# sock.settimeout() the way plain socket send/recv do, a real risk this
+# hasn't been run against real hardware to rule out (see the Trial 4
+# report). http_client.timeout_post()'s feed_fn is wired below to
+# wdt.feed, called at every stage transition and before every individual
+# read -- not just once per full POST -- so this watchdog only needs to
+# survive the GAP BETWEEN two feeds, not the whole POST_DEADLINE_S. That
+# gap is bounded by SOCKET_OP_TIMEOUT_S=4s if settimeout is actually
+# working; 8000ms gives 2x margin over that for scheduler/GC jitter.
+#
+# NEEDS VERIFICATION ON HARDWARE: the RP2040 datasheet documents an
+# ~8.388s maximum single-period hardware watchdog timeout (24-bit
+# counter at a fixed tick rate). Whether the Pico 2's RP2350 (a different
+# chip revision) shares that cap, and whether MicroPython's rp2 WDT
+# driver enforces or extends it, is unconfirmed -- 8000ms was chosen to
+# stay under the assumed cap either way; there's no need to raise it even
+# if real hardware allows more, since it's sized around the per-feed gap
+# (SOCKET_OP_TIMEOUT_S), not the full POST_DEADLINE_S.
+WDT_TIMEOUT_MS = 8000  # None disables the watchdog entirely (see above)
+
+wdt = None
+if WDT_TIMEOUT_MS is not None:
+    wdt = WDT(timeout=WDT_TIMEOUT_MS)
+
+
+def _feed_wdt():
+    if wdt is not None:
+        wdt.feed()
+
+
 PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to check
                             # whether the collect below is actually reducing/preventing
                             # ENOMEM failures, or whether they happen regardless
@@ -201,12 +258,16 @@ PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to 
 
 def _post_batch(payload):
     """IngestBuffer's injected post_fn. Returns True only on a 2xx
-    response. Every response is explicitly closed -- a missed .close()
-    on urequests leaks the underlying socket, and repeated leaks exhaust
-    the Pico's socket table over an unattended multi-hour run (see module
-    docstring). NEEDS VERIFICATION ON HARDWARE: whether this urequests
-    build supports a timeout kwarg at all -- without one, a dead/half-open
-    connection can block this call indefinitely.
+    response. Every socket opened by timeout_post() is closed inside
+    that function itself (success or failure) -- see http_client.py.
+
+    Uses http_client.timeout_post() rather than urequests.post(): the
+    latter has no socket timeout in most MicroPython forks, so a dead/
+    half-open connection could block this call indefinitely -- exactly
+    what happened in Trial 3 (see module docstring). timeout_post()
+    bounds every individual socket operation (SOCKET_OP_TIMEOUT_S) and
+    the whole attempt (POST_DEADLINE_S), and raises PostStageError
+    (tagging which stage failed) instead of leaving that ambiguous.
 
     Trial 1 showed heap_free swinging through deep troughs between
     readings taken 30s apart (as low as ~28KB total, ~12KB max contiguous
@@ -244,38 +305,40 @@ def _post_batch(payload):
         heap_free_before_collect, heap_free_after_collect))
 
     if not wlan.isconnected():
-        print("# POST_FAIL reason=wifi_disconnected heap_free={}".format(gc.mem_free()))
+        print("# POST_FAIL reason=wifi_disconnected stage=n/a heap_free={}".format(gc.mem_free()))
         return False
-    response = None
     try:
         # Captured at the moment this function actually starts the
         # request, so a failure line shows the state right before the
         # attempt instead of only the aftermath -- Trial 1's POST_FAIL
-        # lines showed heap_free well above 350KB, read after
-        # urequests.post() had already unwound and likely freed whatever
-        # it failed to allocate, which told us almost nothing about the
-        # actual moment of failure. This still isn't the literal instant
-        # of the internal allocation failure inside urequests (only
-        # instrumenting urequests itself -- branch
-        # fix-memcrash-manual-post, not part of this branch -- can get
-        # that granularity), but it's the closest this branch can get
-        # without doing that.
+        # lines showed heap_free well above 350KB, read after the POST
+        # call had already unwound and likely freed whatever it failed
+        # to allocate, which told us almost nothing about the actual
+        # moment of failure. This still isn't the literal instant of an
+        # internal allocation failure (only instrumenting timeout_post()
+        # itself could get that granularity), but it's the closest this
+        # branch can get without doing that.
         heap_free_at_try_start = gc.mem_free()
-        response = urequests.post(INGEST_URL, json=payload)
-        ok = 200 <= response.status_code < 300
+        body_bytes = json.dumps(payload).encode("utf-8")
+        status_code, _headers, _body = timeout_post(
+            INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
+            feed_fn=_feed_wdt)
+        ok = 200 <= status_code < 300
         if not ok:
-            print("# POST_FAIL reason=http_status status={} heap_free_at_try_start={} "
+            print("# POST_FAIL reason=http_status stage=n/a status={} heap_free_at_try_start={} "
                   "heap_free_now={}".format(
-                response.status_code, heap_free_at_try_start, gc.mem_free()))
+                status_code, heap_free_at_try_start, gc.mem_free()))
         return ok
+    except PostStageError as exc:
+        print("# POST_FAIL reason={} stage={} heap_free_at_try_start={} "
+              "heap_free_now={}".format(
+            exc.reason, exc.stage, heap_free_at_try_start, gc.mem_free()))
+        return False
     except Exception as exc:
-        print("# POST_FAIL reason=exception type={} msg={} heap_free_at_try_start={} "
+        print("# POST_FAIL reason=exception stage=unknown type={} msg={} heap_free_at_try_start={} "
               "heap_free_now={}".format(
             type(exc).__name__, exc, heap_free_at_try_start, gc.mem_free()))
         return False
-    finally:
-        if response is not None:
-            response.close()
 
 
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS)
@@ -325,6 +388,9 @@ dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_su
 _wifi_service()
 
 while True:
+    _feed_wdt()  # covers everything in this iteration OTHER than a POST attempt --
+                 # timeout_post() feeds it separately, at a finer grain, during one
+
     drained = 0
     while read_idx != write_idx and drained < MAX_DRAIN_PER_PASS:
         raw_ticks = ring_ticks[read_idx]
