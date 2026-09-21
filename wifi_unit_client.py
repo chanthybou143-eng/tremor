@@ -393,7 +393,7 @@ def _post_batch(payload):
     print("# PRE_POST heap_free_before_collect={} heap_free_after_collect={}".format(
         heap_free_before_collect, heap_free_after_collect))
 
-    global longest_post_duration_s, stage_failure_counts
+    global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count
 
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected stage=n/a heap_free={}".format(gc.mem_free()))
@@ -422,9 +422,13 @@ def _post_batch(payload):
                 INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
                 feed_fn=_feed_wdt)
         finally:
-            duration_s = time.ticks_diff(time.ticks_us(), _post_start_ticks) / 1e6
+            duration_us = time.ticks_diff(time.ticks_us(), _post_start_ticks)
+            duration_s = duration_us / 1e6
+            last_post_duration_ms = duration_us // 1000
             if duration_s > longest_post_duration_s:
                 longest_post_duration_s = duration_s
+            if duration_s > SLOW_POST_THRESHOLD_S:
+                slow_post_count += 1
         ok = 200 <= status_code < 300
         if not ok:
             print("# POST_FAIL reason=http_status stage=n/a status={} heap_free_at_try_start={} "
@@ -490,6 +494,16 @@ post_successes = 0
 dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_summary.py
 longest_post_duration_s = 0.0  # wall-clock duration of the slowest _post_batch call so far,
                                 # success or failure -- see _post_batch for how it's measured
+last_post_duration_ms = 0  # duration of the MOST RECENT attempt specifically (not the max) --
+                            # Trial 4's 0.147s-vs-10s discrepancy would have been visible on the
+                            # very next STATUS line if this had existed then, without waiting for
+                            # a fresh new maximum or cross-referencing a POST_FAIL line by hand
+SLOW_POST_THRESHOLD_S = 5.0  # about half of POST_DEADLINE_S -- a POST legitimately taking
+                             # longer than this, even if it still succeeds, is well outside the
+                             # ~0.5-2.6s historical baseline and worth counting as its own signal
+slow_post_count = 0  # cumulative count of attempts (success or failure) exceeding
+                     # SLOW_POST_THRESHOLD_S -- distinct from stage_failure_counts, which only
+                     # counts outright failures; this also catches a slow-but-successful POST
 # One counter per http_client.PostStageError.stage seen so far -- shows
 # WHERE POST attempts are failing/stalling, not just how many. Includes
 # both timeout_post()'s own POST_DEADLINE_S trips and any other
@@ -634,14 +648,15 @@ while True:
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
               "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
               "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={} "
-              "longest_post_duration_s={:.3f} stage_fail_dns={} "
+              "longest_post_duration_s={:.3f} last_post_duration_ms={} slow_post_count={} "
+              "stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
               "stage_fail_read_response={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
             dup_timestamp_count, chunk_capacity_overflow_count,
-            longest_post_duration_s,
+            longest_post_duration_s, last_post_duration_ms, slow_post_count,
             stage_failure_counts["dns"], stage_failure_counts["connect"],
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
             stage_failure_counts["read_response"],
