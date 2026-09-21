@@ -433,9 +433,10 @@ def _post_batch(payload):
         return ok
     except PostStageError as exc:
         stage_failure_counts[exc.stage] = stage_failure_counts.get(exc.stage, 0) + 1
-        print("# POST_FAIL reason={} stage={} heap_free_at_try_start={} "
-              "heap_free_now={}".format(
-            exc.reason, exc.stage, heap_free_at_try_start, gc.mem_free()))
+        print("# POST_FAIL reason={} stage={} elapsed_s={} stage_duration_s={} deadline_s={} "
+              "heap_free_at_try_start={} heap_free_now={}".format(
+            exc.reason, exc.stage, exc.elapsed_s, exc.stage_duration_s, exc.deadline_s,
+            heap_free_at_try_start, gc.mem_free()))
         return False
     except Exception as exc:
         print("# POST_FAIL reason=exception stage=unknown type={} msg={} heap_free_at_try_start={} "

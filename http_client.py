@@ -39,21 +39,39 @@ class PostStageError(Exception):
     """Raised by timeout_post() for any failure, identifying which stage
     of the request was in progress. `stage` is one of "dns", "connect",
     "tls_handshake", "send", "read_response". `reason` is a short string
-    -- either the underlying OSError's message, or "operation_timed_out"
-    /"overall_deadline_exceeded" for the two timeout cases this module
-    itself detects (as opposed to lower-level exceptions it only wraps).
+    -- either the underlying OSError's message, or
+    "overall_deadline_exceeded" for the one timeout case this module
+    itself detects as opposed to wrapping a lower-level exception.
     Callers (wifi_unit_client.py's _post_batch) catch this via the
     existing broad `except Exception`, exactly like any other POST
     failure -- it's a normal Exception subclass, not a special control
     path -- but can read .stage/.reason to log which part of the request
     actually got stuck, which a bare `except Exception as exc: str(exc)`
     couldn't distinguish before this module existed.
+
+    elapsed_s/stage_duration_s/deadline_s (all via now_fn, the SAME clock
+    timeout_post() itself uses for POST_DEADLINE_S -- see that constant's
+    comment) exist specifically to make a now_fn misbehaving visible in
+    the log, not just in a debugger: elapsed_s is time since this
+    attempt started (any stage), stage_duration_s is time since the
+    CURRENT stage started, deadline_s is the configured POST_DEADLINE_S
+    for reference. Trial 4 needed manual cross-referencing against
+    wifi_unit_client.py's separately-measured (ticks_us-based)
+    longest_post_duration_s to notice that a "connect:
+    overall_deadline_exceeded" failure's REAL wall-clock duration was
+    ~0.147s, not >=10s -- these fields put that same signal directly on
+    every POST_FAIL line instead.
     """
 
-    def __init__(self, stage, reason):
+    def __init__(self, stage, reason, elapsed_s=None, stage_duration_s=None, deadline_s=None):
         self.stage = stage
         self.reason = reason
-        super().__init__("stage={} reason={}".format(stage, reason))
+        self.elapsed_s = elapsed_s
+        self.stage_duration_s = stage_duration_s
+        self.deadline_s = deadline_s
+        super().__init__(
+            "stage={} reason={} elapsed_s={} stage_duration_s={} deadline_s={}".format(
+                stage, reason, elapsed_s, stage_duration_s, deadline_s))
 
 
 # Applied via sock.settimeout() once, immediately after the socket is
@@ -125,9 +143,24 @@ def parse_https_url(url):
     return host, port, path
 
 
-def _check_deadline(deadline_at, stage, now_fn):
+def _stage_error(stage, reason, now_fn, start_at, stage_start_at):
+    """Builds a PostStageError with elapsed_s/stage_duration_s/deadline_s
+    filled in from the SAME now_fn timeout_post() itself uses -- one
+    helper so every raise site (deadline checks and wrapped OSErrors
+    alike) reports this consistently, rather than only the deadline
+    checks carrying timing information."""
+    now = now_fn()
+    return PostStageError(
+        stage, reason,
+        elapsed_s=now - start_at,
+        stage_duration_s=now - stage_start_at,
+        deadline_s=POST_DEADLINE_S,
+    )
+
+
+def _check_deadline(deadline_at, stage, now_fn, start_at, stage_start_at):
     if now_fn() >= deadline_at:
-        raise PostStageError(stage, "overall_deadline_exceeded")
+        raise _stage_error(stage, "overall_deadline_exceeded", now_fn, start_at, stage_start_at)
 
 
 def _build_request(method, host, path, body_bytes, extra_headers=None):
@@ -143,7 +176,8 @@ def _build_request(method, host, path, body_bytes, extra_headers=None):
     return "{} {} HTTP/1.1\r\n{}\r\n".format(method, path, header_lines).encode("utf-8") + body_bytes
 
 
-def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, max_header_bytes=4096):
+def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, start_at,
+                                  max_header_bytes=4096):
     """Reads one full HTTP/1.1 response from sock_like (anything with a
     .read(n) method returning bytes, or b""/None at EOF -- adapted from
     the keepalive-single-core branch's http_keepalive.py, which was
@@ -165,25 +199,31 @@ def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, max_he
     freq_estimator.estimate_frequency's docstring elsewhere in this
     repo). Returns (status_code, headers_dict, body_bytes) on success.
     """
+    stage_start_at = now_fn()  # covers the WHOLE read_response stage, not reset per read --
+                               # a failure anywhere in this function reports duration since
+                               # read_response itself began, not since the last individual read
     buf = b""
     while b"\r\n\r\n" not in buf:
-        _check_deadline(deadline_at, "read_response", now_fn)
+        _check_deadline(deadline_at, "read_response", now_fn, start_at, stage_start_at)
         feed_fn()
         try:
             chunk = sock_like.read(256)
         except OSError as exc:
-            raise PostStageError("read_response", str(exc))
+            raise _stage_error("read_response", str(exc), now_fn, start_at, stage_start_at)
         if not chunk:
-            raise PostStageError("read_response", "connection closed while reading response headers")
+            raise _stage_error("read_response", "connection closed while reading response headers",
+                                now_fn, start_at, stage_start_at)
         buf += chunk
         if len(buf) > max_header_bytes:
-            raise PostStageError("read_response", "response headers too large or malformed")
+            raise _stage_error("read_response", "response headers too large or malformed",
+                                now_fn, start_at, stage_start_at)
 
     header_bytes, _, body_start = buf.partition(b"\r\n\r\n")
     lines = header_bytes.split(b"\r\n")
     status_parts = lines[0].decode("utf-8", "replace").split(" ", 2)
     if len(status_parts) < 2:
-        raise PostStageError("read_response", "malformed status line: {!r}".format(lines[0]))
+        raise _stage_error("read_response", "malformed status line: {!r}".format(lines[0]),
+                            now_fn, start_at, stage_start_at)
     status_code = int(status_parts[1])
 
     headers = {}
@@ -193,19 +233,21 @@ def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, max_he
             headers[k.strip().lower().decode("utf-8", "replace")] = v.strip().decode("utf-8", "replace")
 
     if headers.get("transfer-encoding", "").lower() == "chunked":
-        raise PostStageError("read_response", "chunked response body not supported")
+        raise _stage_error("read_response", "chunked response body not supported",
+                            now_fn, start_at, stage_start_at)
 
     content_length = int(headers.get("content-length", "0"))
     body = body_start
     while len(body) < content_length:
-        _check_deadline(deadline_at, "read_response", now_fn)
+        _check_deadline(deadline_at, "read_response", now_fn, start_at, stage_start_at)
         feed_fn()
         try:
             chunk = sock_like.read(content_length - len(body))
         except OSError as exc:
-            raise PostStageError("read_response", str(exc))
+            raise _stage_error("read_response", str(exc), now_fn, start_at, stage_start_at)
         if not chunk:
-            raise PostStageError("read_response", "connection closed while reading response body")
+            raise _stage_error("read_response", "connection closed while reading response body",
+                                now_fn, start_at, stage_start_at)
         body += chunk
 
     return status_code, headers, body
@@ -243,42 +285,48 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
     now_fn = now_fn or time.time
     feed_fn = feed_fn or (lambda: None)
 
-    deadline_at = now_fn() + POST_DEADLINE_S
+    start_at = now_fn()
+    deadline_at = start_at + POST_DEADLINE_S
     sock = None
     ssl_sock = None
     try:
+        stage_start_at = now_fn()
         try:
             addr_info = getaddrinfo_fn(host, port)
         except OSError as exc:
-            raise PostStageError("dns", str(exc))
+            raise _stage_error("dns", str(exc), now_fn, start_at, stage_start_at)
         addr = addr_info[0][-1]
 
-        _check_deadline(deadline_at, "connect", now_fn)
+        stage_start_at = now_fn()
+        _check_deadline(deadline_at, "connect", now_fn, start_at, stage_start_at)
         feed_fn()
         try:
             sock = socket_factory()
             sock.settimeout(SOCKET_OP_TIMEOUT_S)
             sock.connect(addr)
         except OSError as exc:
-            raise PostStageError("connect", str(exc))
+            raise _stage_error("connect", str(exc), now_fn, start_at, stage_start_at)
 
-        _check_deadline(deadline_at, "tls_handshake", now_fn)
+        stage_start_at = now_fn()
+        _check_deadline(deadline_at, "tls_handshake", now_fn, start_at, stage_start_at)
         feed_fn()
         try:
             ssl_sock = ssl_wrap_fn(sock, server_hostname=host)
         except OSError as exc:
-            raise PostStageError("tls_handshake", str(exc))
+            raise _stage_error("tls_handshake", str(exc), now_fn, start_at, stage_start_at)
 
-        _check_deadline(deadline_at, "send", now_fn)
+        stage_start_at = now_fn()
+        _check_deadline(deadline_at, "send", now_fn, start_at, stage_start_at)
         feed_fn()
         request = _build_request("POST", host, path, payload_bytes, extra_headers)
         try:
             ssl_sock.write(request)
         except OSError as exc:
-            raise PostStageError("send", str(exc))
+            raise _stage_error("send", str(exc), now_fn, start_at, stage_start_at)
 
-        _check_deadline(deadline_at, "read_response", now_fn)
-        return _read_response_with_deadline(ssl_sock, deadline_at, now_fn, feed_fn)
+        stage_start_at = now_fn()
+        _check_deadline(deadline_at, "read_response", now_fn, start_at, stage_start_at)
+        return _read_response_with_deadline(ssl_sock, deadline_at, now_fn, feed_fn, start_at)
     finally:
         if ssl_sock is not None:
             try:

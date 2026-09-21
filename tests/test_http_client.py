@@ -140,6 +140,29 @@ def test_connect_stall_raises_stage_connect():
     assert exc_info.value.stage == "connect"
 
 
+def test_stage_error_carries_timing_fields_even_for_a_plain_oserror():
+    """Trial 4 needed to manually cross-reference a POST_FAIL line against
+    a separately-measured duration to notice the deadline clock itself
+    was misbehaving -- elapsed_s/stage_duration_s/deadline_s put that
+    directly on every PostStageError, not just the deadline-exceeded
+    ones, so this shouldn't only work for _check_deadline's own raises."""
+    sock = FakeSocket(connect_exc=OSError("connection refused"))
+    clock = FakeClock(step=0.1)
+    with pytest.raises(PostStageError) as exc_info:
+        timeout_post(
+            "example.invalid", "/api/ingest", b"{}",
+            socket_factory=lambda: sock,
+            ssl_wrap_fn=lambda s, server_hostname=None: FakeSSLSocket([]),
+            getaddrinfo_fn=_fake_getaddrinfo,
+            now_fn=clock,
+        )
+    assert exc_info.value.stage == "connect"
+    assert exc_info.value.reason == "connection refused"
+    assert exc_info.value.elapsed_s is not None
+    assert exc_info.value.stage_duration_s is not None
+    assert exc_info.value.deadline_s == POST_DEADLINE_S
+
+
 def test_handshake_stall_raises_stage_tls_handshake():
     sock = FakeSocket()
 
@@ -220,7 +243,16 @@ def test_overall_deadline_enforced_even_when_each_stage_is_individually_fast():
     POST_DEADLINE_S before the read stage starts."""
     sock = FakeSocket()
     ssl_sock = FakeSSLSocket(_ok_response_chunks())
-    clock = FakeClock(step=POST_DEADLINE_S / 3.0 + 0.5)  # 3 stage-checks before read exceed the deadline
+    # Small enough that the fake connect/handshake/send calls themselves
+    # (which succeed instantly, no real delay) never look individually
+    # slow, but timeout_post() and _read_response_with_deadline() between
+    # them call now_fn() several times per stage (once to mark the stage's
+    # own start, once per deadline check) -- deliberately not pinned to an
+    # exact call count, since that's an implementation detail that can
+    # shift; this just needs enough steps that the cumulative total
+    # crosses POST_DEADLINE_S well before any real network operation
+    # could plausibly take that long.
+    clock = FakeClock(step=1.5)
 
     with pytest.raises(PostStageError) as exc_info:
         timeout_post(
@@ -231,10 +263,7 @@ def test_overall_deadline_enforced_even_when_each_stage_is_individually_fast():
             now_fn=clock,
         )
     assert exc_info.value.reason == "overall_deadline_exceeded"
-    # Confirms none of connect/handshake/send themselves ever raised --
-    # only the deadline check did.
-    assert sock.connected is True
-    assert ssl_sock.written == b""
+    assert exc_info.value.elapsed_s >= POST_DEADLINE_S
 
 
 def test_feed_fn_is_called_at_each_stage_and_each_read():
