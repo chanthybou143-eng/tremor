@@ -24,7 +24,11 @@ now calls http_client.timeout_post() instead, which bounds every
 individual socket operation (SOCKET_OP_TIMEOUT_S) and the whole POST
 attempt (POST_DEADLINE_S) -- see that module for why both are needed. A
 machine.WDT backstops the case that software bound itself fails (see
-WDT_TIMEOUT_MS below).
+WDT_TIMEOUT_MS_CANDIDATES below) -- if settimeout() is silently not
+honoured during the TLS handshake specifically, this watchdog is the
+ONLY bound on that stall. reset_cause() is captured at boot and printed
+on every STATUS line, so a WDT-triggered reset is unmistakable in the
+log.
 
 POST_INTERVAL_S raised from 8s to 30s to reduce how often the ~2.1-2.6s
 DNS+TCP+TLS handshake gets paid per hour -- a persistent/keep-alive
@@ -47,15 +51,23 @@ adc_stream_gps.py itself, is touched by this script.
 
 import array
 import gc
-import json  # NEEDS VERIFICATION ON HARDWARE: assumes this build exposes the
-             # module as "json" (current MicroPython/micropython-lib name);
-             # older forks only had it as "ujson" -- urequests.post(json=...)
-             # did this same dumps() internally, so this isn't a NEW
-             # dependency, just now an explicit, visible one.
 import time
+
+try:
+    import json
+except ImportError:
+    # No precedent for either name anywhere else in this repo, and no
+    # vendored urequests.py locally to check what IT imported internally
+    # (urequests.post(json=payload) did this same dumps() call, so this
+    # isn't a new dependency, just now an explicit, visible one) -- the
+    # live device's own /lib couldn't safely be checked either (would
+    # mean touching the serial port of a running soak). Genuinely
+    # unconfirmed which name this build uses, so don't guess: try both.
+    import ujson as json
 
 import micropython
 import network
+import machine
 from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
@@ -142,6 +154,98 @@ STATUS_INTERVAL_S = 10
 ADC_VOLTAGE_SCALE = 3.3 / 65535  # raw u16 -> volts, same conversion
                                   # overnight_log.py's _parse_sample_line() applies
 
+# Captured before anything else below runs, so it reflects why THIS boot
+# happened, not some later state. Printed on every STATUS line (not just
+# once) so a WDT-triggered reset is unmistakable in the log even if you
+# only look at STATUS lines: every one printed by the process that starts
+# after a watchdog reset will show reset_cause=WDT_RESET, distinguishing
+# it from a normal power-on or a soft reset from mpremote. Looked up via
+# getattr with a sentinel default rather than `from machine import
+# WDT_RESET, ...` directly -- NEEDS VERIFICATION ON HARDWARE: not
+# confirmed that the rp2 port defines every one of these five constants
+# machine.reset_cause() docs generally list; a missing one would crash
+# this whole file at import time if imported by name instead.
+_RESET_CAUSE_NAMES = {
+    getattr(machine, "PWRON_RESET", -1): "PWRON_RESET",
+    getattr(machine, "HARD_RESET", -2): "HARD_RESET",
+    getattr(machine, "WDT_RESET", -3): "WDT_RESET",
+    getattr(machine, "DEEPSLEEP_RESET", -4): "DEEPSLEEP_RESET",
+    getattr(machine, "SOFT_RESET", -5): "SOFT_RESET",
+}
+BOOT_RESET_CAUSE = machine.reset_cause()
+BOOT_RESET_CAUSE_NAME = _RESET_CAUSE_NAMES.get(BOOT_RESET_CAUSE, "UNKNOWN({})".format(BOOT_RESET_CAUSE))
+
+# Tried in order at boot; the first machine.WDT() accepts without raising
+# is used. () or None disables the watchdog entirely -- this is a
+# build-time choice, not a runtime one, since rp2's WDT has no
+# deinit()/disable once started (only .feed(), or letting it expire) --
+# set this to () and reflash before any mpremote maintenance session (a
+# paused REPL, a long fs cp/ls -- anything that legitimately stops this
+# loop from running for a while), since there's no way to pause an armed
+# watchdog first.
+#
+# This is a backstop, not the primary defense: POST_DEADLINE_S
+# (http_client.py) is what's SUPPOSED to bound a stuck POST to ~10s in
+# software. This watchdog exists for the case that bound itself fails --
+# e.g. if a low-level TLS handshake call doesn't actually honour
+# sock.settimeout() the way plain socket send/recv do, a real risk this
+# hasn't been run against real hardware to rule out (see the Trial 4
+# report). If settimeout is silently not honoured during the handshake,
+# THIS WATCHDOG IS THE ONLY BOUND on that stall -- there is no software
+# fallback for it. http_client.timeout_post()'s feed_fn is wired below to
+# wdt.feed, called at every stage transition and before every individual
+# read -- not just once per full POST -- so this watchdog only needs to
+# survive the GAP BETWEEN two feeds, not the whole POST_DEADLINE_S.
+#
+# 8000 (first try): 2x SOCKET_OP_TIMEOUT_S=4s margin over that gap for
+# scheduler/GC jitter, chosen to stay under the RP2040 datasheet's
+# ~8.388s single-period hardware watchdog cap (24-bit counter at a fixed
+# tick rate) -- NEEDS VERIFICATION ON HARDWARE: whether the Pico 2's
+# RP2350 (a different chip revision) shares that cap, and whether
+# MicroPython's rp2 WDT driver enforces or extends it, is unconfirmed.
+# 4000 (fallback, only used if 8000 is rejected): matches
+# SOCKET_OP_TIMEOUT_S exactly, meaning if THIS is what actually gets
+# used, the watchdog's margin over one legitimate (if slow) socket
+# operation shrinks from 2x to 1x -- a genuinely slow-but-working
+# operation right at its own 4s timeout could then race the watchdog.
+# That degradation is deliberately visible (see WDT_ARMED below), not
+# silent -- if the fallback is what's actually needed, SOCKET_OP_TIMEOUT_S
+# itself should be revisited once real hardware says why 8000 didn't work,
+# rather than leaving the margin thin indefinitely.
+WDT_TIMEOUT_MS_CANDIDATES = (8000, 4000)
+
+wdt = None
+WDT_TIMEOUT_MS_ACTUAL = None
+if WDT_TIMEOUT_MS_CANDIDATES:
+    for _candidate_ms in WDT_TIMEOUT_MS_CANDIDATES:
+        try:
+            wdt = WDT(timeout=_candidate_ms)
+            WDT_TIMEOUT_MS_ACTUAL = _candidate_ms
+            break
+        except (ValueError, OSError) as exc:
+            print("# WDT_CANDIDATE_REJECTED timeout_ms={} type={} msg={}".format(
+                _candidate_ms, type(exc).__name__, exc))
+    if wdt is None:
+        # Fail loudly, before any hardware below (ADC included) starts --
+        # a watchdog was explicitly requested (WDT_TIMEOUT_MS_CANDIDATES
+        # is non-empty) and NONE of the candidates worked. Proceeding
+        # without one here would silently drop the freeze-fix's backstop
+        # with no record of why.
+        raise RuntimeError(
+            "machine.WDT rejected every candidate timeout in {} -- refusing to start "
+            "without the requested watchdog. Check machine.WDT's accepted range on "
+            "this build (see the RP2040 ~8.388s hardware-watchdog-cap note above) "
+            "and adjust WDT_TIMEOUT_MS_CANDIDATES.".format(WDT_TIMEOUT_MS_CANDIDATES))
+    # machine.WDT does not document a public getter for the configured
+    # timeout on rp2 -- print whatever's available via getattr rather
+    # than assume either way; NEEDS VERIFICATION ON HARDWARE whether this
+    # build exposes one at all (e.g. an undocumented `.timeout`).
+    _wdt_effective = getattr(wdt, "timeout", None)
+    print("# WDT_ARMED requested_ms={} effective_reported_ms={} reset_cause={}".format(
+        WDT_TIMEOUT_MS_ACTUAL,
+        _wdt_effective if _wdt_effective is not None else "not_exposed_by_driver",
+        BOOT_RESET_CAUSE_NAME))
+
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
 sync = PPSTimeSync(pps_pin=15)
@@ -210,42 +314,6 @@ def _wifi_service():
             pass  # e.g. "already connecting" -- next retry will catch a real failure
 
 
-# machine.WDT, once started, CANNOT be stopped/disabled from software on
-# the rp2 port -- there is no wdt.deinit(), only wdt.feed() or letting it
-# expire and reset the board. So this is a build-time choice, not a
-# runtime one: set WDT_TIMEOUT_MS to None and reflash before doing any
-# mpremote maintenance (a paused REPL session, a long fs cp/ls -- anything
-# that legitimately stops this loop from running for a while) -- otherwise
-# the watchdog resets the board mid-session with no way to pause it first.
-#
-# This is a backstop, not the primary defense: POST_DEADLINE_S
-# (http_client.py) is what's SUPPOSED to bound a stuck POST to ~10s in
-# software. This watchdog exists for the case that bound itself fails --
-# e.g. if a low-level TLS handshake call doesn't actually honour
-# sock.settimeout() the way plain socket send/recv do, a real risk this
-# hasn't been run against real hardware to rule out (see the Trial 4
-# report). http_client.timeout_post()'s feed_fn is wired below to
-# wdt.feed, called at every stage transition and before every individual
-# read -- not just once per full POST -- so this watchdog only needs to
-# survive the GAP BETWEEN two feeds, not the whole POST_DEADLINE_S. That
-# gap is bounded by SOCKET_OP_TIMEOUT_S=4s if settimeout is actually
-# working; 8000ms gives 2x margin over that for scheduler/GC jitter.
-#
-# NEEDS VERIFICATION ON HARDWARE: the RP2040 datasheet documents an
-# ~8.388s maximum single-period hardware watchdog timeout (24-bit
-# counter at a fixed tick rate). Whether the Pico 2's RP2350 (a different
-# chip revision) shares that cap, and whether MicroPython's rp2 WDT
-# driver enforces or extends it, is unconfirmed -- 8000ms was chosen to
-# stay under the assumed cap either way; there's no need to raise it even
-# if real hardware allows more, since it's sized around the per-feed gap
-# (SOCKET_OP_TIMEOUT_S), not the full POST_DEADLINE_S.
-WDT_TIMEOUT_MS = 8000  # None disables the watchdog entirely (see above)
-
-wdt = None
-if WDT_TIMEOUT_MS is not None:
-    wdt = WDT(timeout=WDT_TIMEOUT_MS)
-
-
 def _feed_wdt():
     if wdt is not None:
         wdt.feed()
@@ -304,6 +372,8 @@ def _post_batch(payload):
     print("# PRE_POST heap_free_before_collect={} heap_free_after_collect={}".format(
         heap_free_before_collect, heap_free_after_collect))
 
+    global longest_post_duration_s, stage_failure_counts
+
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected stage=n/a heap_free={}".format(gc.mem_free()))
         return False
@@ -320,9 +390,20 @@ def _post_batch(payload):
         # branch can get without doing that.
         heap_free_at_try_start = gc.mem_free()
         body_bytes = json.dumps(payload).encode("utf-8")
-        status_code, _headers, _body = timeout_post(
-            INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
-            feed_fn=_feed_wdt)
+        # Timed around timeout_post() specifically (not this whole
+        # function, which also does GC/mem_info bookkeeping with its own
+        # separate instrumentation above) -- on BOTH success and failure,
+        # so a stalled attempt that eventually raises still updates this;
+        # that's often the more interesting case for spotting stalls.
+        _post_start_ticks = time.ticks_us()
+        try:
+            status_code, _headers, _body = timeout_post(
+                INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
+                feed_fn=_feed_wdt)
+        finally:
+            duration_s = time.ticks_diff(time.ticks_us(), _post_start_ticks) / 1e6
+            if duration_s > longest_post_duration_s:
+                longest_post_duration_s = duration_s
         ok = 200 <= status_code < 300
         if not ok:
             print("# POST_FAIL reason=http_status stage=n/a status={} heap_free_at_try_start={} "
@@ -330,6 +411,7 @@ def _post_batch(payload):
                 status_code, heap_free_at_try_start, gc.mem_free()))
         return ok
     except PostStageError as exc:
+        stage_failure_counts[exc.stage] = stage_failure_counts.get(exc.stage, 0) + 1
         print("# POST_FAIL reason={} stage={} heap_free_at_try_start={} "
               "heap_free_now={}".format(
             exc.reason, exc.stage, heap_free_at_try_start, gc.mem_free()))
@@ -384,6 +466,19 @@ peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in com
 post_attempts = 0  # a flush() where the buffer was actually non-empty -- excludes no-op flushes
 post_successes = 0
 dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_summary.py
+longest_post_duration_s = 0.0  # wall-clock duration of the slowest _post_batch call so far,
+                                # success or failure -- see _post_batch for how it's measured
+# One counter per http_client.PostStageError.stage seen so far -- shows
+# WHERE POST attempts are failing/stalling, not just how many. Includes
+# both timeout_post()'s own POST_DEADLINE_S trips and any other
+# exception at that stage (e.g. a genuine ECONNRESET, not only a
+# settimeout-triggered timeout) -- NEEDS VERIFICATION ON HARDWARE:
+# distinguishing a real socket timeout from another OSError by errno
+# would need this build's actual errno for a timed-out socket op
+# confirmed first, which wasn't done here; until then this counts every
+# stage failure, not only confirmed timeouts, which is still the
+# actionable signal (where do POSTs actually get stuck).
+stage_failure_counts = {"dns": 0, "connect": 0, "tls_handshake": 0, "send": 0, "read_response": 0}
 
 _wifi_service()
 
@@ -516,9 +611,16 @@ while True:
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
               "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
-              "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={}".format(
+              "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={} "
+              "reset_cause={} longest_post_duration_s={:.3f} stage_fail_dns={} "
+              "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
+              "stage_fail_read_response={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
             dup_timestamp_count, chunk_capacity_overflow_count,
+            BOOT_RESET_CAUSE_NAME, longest_post_duration_s,
+            stage_failure_counts["dns"], stage_failure_counts["connect"],
+            stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
+            stage_failure_counts["read_response"],
         ))
