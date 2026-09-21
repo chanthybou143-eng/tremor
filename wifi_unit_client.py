@@ -155,16 +155,37 @@ ADC_VOLTAGE_SCALE = 3.3 / 65535  # raw u16 -> volts, same conversion
                                   # overnight_log.py's _parse_sample_line() applies
 
 # Captured before anything else below runs, so it reflects why THIS boot
-# happened, not some later state. Printed on every STATUS line (not just
-# once) so a WDT-triggered reset is unmistakable in the log even if you
-# only look at STATUS lines: every one printed by the process that starts
-# after a watchdog reset will show reset_cause=WDT_RESET, distinguishing
-# it from a normal power-on or a soft reset from mpremote. Looked up via
-# getattr with a sentinel default rather than `from machine import
-# WDT_RESET, ...` directly -- NEEDS VERIFICATION ON HARDWARE: not
-# confirmed that the rp2 port defines every one of these five constants
-# machine.reset_cause() docs generally list; a missing one would crash
-# this whole file at import time if imported by name instead.
+# happened, not some later state. Printed ONCE, in the # BOOT line below
+# -- NOT repeated on every STATUS line -- because reset_cause=WDT_RESET
+# at the very moment of a fresh launch is EXPECTED, not a signal of
+# anything wrong: confirmed by reading mpremote's own source
+# (transport_serial.py's enter_raw_repl(), used by `mpremote run` with
+# its default soft_reset=True) that every `mpremote run <file>` sends
+# Ctrl-D (MicroPython's soft-reset sequence) before executing the file,
+# unconditionally. On the rp2 port specifically, that Ctrl-D soft reset
+# is documented (not independently verified against this exact firmware
+# build's C source, so held with high but not absolute confidence) to go
+# through the SDK's watchdog_reboot() mechanism -- meaning reset_cause()
+# legitimately reports WDT_RESET after an ORDINARY `mpremote run`, with
+# or without this file's own machine.WDT ever existing. Trial 4's first
+# attempt confirmed this empirically: WDT_RESET appeared on the very
+# first boot line, which is impossible for THIS run's own watchdog to
+# have caused (it didn't exist yet at the moment of that reset).
+#
+# So: WDT_RESET in THIS boot's # BOOT line is normal and not itself a
+# stop condition. What WOULD be meaningful is WDT_RESET appearing in a
+# LATER # BOOT line that follows an "EVENT reconnected" mid-log (i.e.
+# overnight_wifi_log.py detected the device dropped out and relaunched
+# it) -- that shape means something reset the board WHILE it was already
+# running, which an ordinary `mpremote run` boot-time reset can't
+# explain.
+#
+# Looked up via getattr with a sentinel default rather than `from
+# machine import WDT_RESET, ...` directly -- NEEDS VERIFICATION ON
+# HARDWARE: not confirmed that the rp2 port defines every one of these
+# five constants machine.reset_cause() docs generally list; a missing
+# one would crash this whole file at import time if imported by name
+# instead.
 _RESET_CAUSE_NAMES = {
     getattr(machine, "PWRON_RESET", -1): "PWRON_RESET",
     getattr(machine, "HARD_RESET", -2): "HARD_RESET",
@@ -174,6 +195,7 @@ _RESET_CAUSE_NAMES = {
 }
 BOOT_RESET_CAUSE = machine.reset_cause()
 BOOT_RESET_CAUSE_NAME = _RESET_CAUSE_NAMES.get(BOOT_RESET_CAUSE, "UNKNOWN({})".format(BOOT_RESET_CAUSE))
+print("# BOOT reset_cause={}".format(BOOT_RESET_CAUSE_NAME))
 
 # Tried in order at boot; the first machine.WDT() accepts without raising
 # is used. () or None disables the watchdog entirely -- this is a
@@ -241,10 +263,9 @@ if WDT_TIMEOUT_MS_CANDIDATES:
     # than assume either way; NEEDS VERIFICATION ON HARDWARE whether this
     # build exposes one at all (e.g. an undocumented `.timeout`).
     _wdt_effective = getattr(wdt, "timeout", None)
-    print("# WDT_ARMED requested_ms={} effective_reported_ms={} reset_cause={}".format(
+    print("# WDT_ARMED requested_ms={} effective_reported_ms={}".format(
         WDT_TIMEOUT_MS_ACTUAL,
-        _wdt_effective if _wdt_effective is not None else "not_exposed_by_driver",
-        BOOT_RESET_CAUSE_NAME))
+        _wdt_effective if _wdt_effective is not None else "not_exposed_by_driver"))
 
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
@@ -612,14 +633,14 @@ while True:
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
               "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
               "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={} "
-              "reset_cause={} longest_post_duration_s={:.3f} stage_fail_dns={} "
+              "longest_post_duration_s={:.3f} stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
               "stage_fail_read_response={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
             dup_timestamp_count, chunk_capacity_overflow_count,
-            BOOT_RESET_CAUSE_NAME, longest_post_duration_s,
+            longest_post_duration_s,
             stage_failure_counts["dns"], stage_failure_counts["connect"],
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
             stage_failure_counts["read_response"],
