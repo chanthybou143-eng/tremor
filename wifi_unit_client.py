@@ -73,7 +73,7 @@ from machine import ADC, UART, Pin, Timer, WDT
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
-from http_client import PostStageError, classify_post_exception, parse_https_url, timeout_post
+from http_client import PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
 INGEST_HOST, INGEST_PORT, INGEST_PATH = parse_https_url(INGEST_URL)
@@ -773,7 +773,7 @@ while True:
               "stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
               "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
-              "max_consecutive_failures={} heap_free_at_try_start={}".format(
+              "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -783,4 +783,5 @@ while True:
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
             stage_failure_counts["read_response"], stage_failure_counts["body"],
             readings_sent_ok, max_consecutive_failures, last_heap_free_at_try_start,
+            read_rssi(wlan),
         ))

@@ -424,3 +424,28 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
                 sock.close()
             except OSError:
                 pass
+
+
+def read_rssi(wlan_obj):
+    """Best-effort WiFi RSSI in dBm for diagnostics/STATUS logging only.
+
+    Lives here rather than in wifi_unit_client.py so it's host-testable
+    with a fake wlan_obj -- wifi_unit_client.py itself can't be imported
+    on the host at all (it constructs hardware objects and runs an
+    infinite loop at module scope), the same reason timeout_post()'s
+    pieces live here instead of there.
+
+    wlan_obj.status('rssi') is the documented call on MicroPython's rp2
+    port with the cyw43 driver (Pico 2 W), returning a negative dBm
+    integer -- NOT independently verified against this project's actual
+    firmware/driver build, since that requires the real device. Guarded
+    against every possible failure mode (the key not being implemented by
+    this particular driver build, any other exception, or a None return)
+    because this is a nice-to-have diagnostic value that must never be
+    allowed to crash the main loop's STATUS line.
+    """
+    try:
+        rssi = wlan_obj.status("rssi")
+    except Exception:
+        return "na"
+    return rssi if rssi is not None else "na"

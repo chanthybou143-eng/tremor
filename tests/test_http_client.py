@@ -22,6 +22,7 @@ from http_client import (  # noqa: E402
     POST_DEADLINE_S,
     classify_post_exception,
     parse_https_url,
+    read_rssi,
     timeout_post,
 )
 
@@ -406,3 +407,36 @@ def test_classify_post_exception_tags_anything_else_unknown():
     stage, reason = classify_post_exception(OSError("connection reset"))
     assert stage == "unknown"
     assert reason == "connection reset"
+
+
+def test_read_rssi_returns_the_driver_value():
+    class FakeWlan:
+        def status(self, key):
+            assert key == "rssi"
+            return -58
+
+    assert read_rssi(FakeWlan()) == -58
+
+
+def test_read_rssi_returns_na_when_status_raises():
+    class FakeWlan:
+        def status(self, key):
+            raise OSError("rssi not supported by this driver")
+
+    assert read_rssi(FakeWlan()) == "na"
+
+
+def test_read_rssi_returns_na_on_any_other_exception():
+    class FakeWlan:
+        def status(self, key):
+            raise ValueError("unsupported status param")
+
+    assert read_rssi(FakeWlan()) == "na"
+
+
+def test_read_rssi_returns_na_when_status_returns_none():
+    class FakeWlan:
+        def status(self, key):
+            return None
+
+    assert read_rssi(FakeWlan()) == "na"
