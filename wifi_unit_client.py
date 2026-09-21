@@ -450,6 +450,7 @@ def _post_batch(payload):
         heap_free_before_collect, heap_free_after_collect))
 
     global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count
+    global last_heap_free_at_try_start
     global _consecutive_failures, _current_post_interval_s, readings_sent_ok, max_consecutive_failures
 
     if not wlan.isconnected():
@@ -471,6 +472,7 @@ def _post_batch(payload):
         # itself could get that granularity), but it's the closest this
         # branch can get without doing that.
         heap_free_at_try_start = gc.mem_free()
+        last_heap_free_at_try_start = heap_free_at_try_start
         body_bytes = json.dumps(payload).encode("utf-8")
         # Timed around timeout_post() specifically (not this whole
         # function, which also does GC/mem_info bookkeeping with its own
@@ -599,6 +601,14 @@ SLOW_POST_THRESHOLD_S = 5.0  # about half of POST_DEADLINE_S -- a POST legitimat
 slow_post_count = 0  # cumulative count of attempts (success or failure) exceeding
                      # SLOW_POST_THRESHOLD_S -- distinct from stage_failure_counts, which only
                      # counts outright failures; this also catches a slow-but-successful POST
+last_heap_free_at_try_start = 0  # heap_free_at_try_start from the MOST RECENT attempt --
+                                  # previously only ever printed on a POST_FAIL line (and not at
+                                  # all on success), so tracking a failure run's heap trend meant
+                                  # manually collecting POST_FAIL lines by hand. Trial 5's
+                                  # prediction (fixed-capacity storage + the 60-reading cap means
+                                  # this should stay flat across a failure run, not decline ~4KB
+                                  # per attempt the way Trial 4's did) needs this on every STATUS
+                                  # line to check directly, success or failure.
 # One counter per http_client.PostStageError.stage seen so far -- shows
 # WHERE POST attempts are failing/stalling, not just how many. Includes
 # both timeout_post()'s own POST_DEADLINE_S trips and any other
@@ -751,7 +761,7 @@ while True:
               "stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
               "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
-              "max_consecutive_failures={}".format(
+              "max_consecutive_failures={} heap_free_at_try_start={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -760,5 +770,5 @@ while True:
             stage_failure_counts["dns"], stage_failure_counts["connect"],
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
             stage_failure_counts["read_response"], stage_failure_counts["body"],
-            readings_sent_ok, max_consecutive_failures,
+            readings_sent_ok, max_consecutive_failures, last_heap_free_at_try_start,
         ))
