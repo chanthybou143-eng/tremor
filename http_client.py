@@ -95,6 +95,38 @@ class PostStageError(Exception):
                 stage, reason, elapsed_s, stage_duration_s, deadline_s))
 
 
+def classify_post_exception(exc):
+    """Maps any exception a POST attempt might raise to a (stage, reason)
+    pair, for POST_FAIL logging and stage_failure_counts. The single
+    source of truth for that mapping, kept here specifically so it's
+    host-testable: wifi_unit_client.py (the actual caller, in
+    _post_batch) can't be imported on the host at all -- it constructs
+    hardware objects and enters an unconditional infinite main loop at
+    module scope, not just because of its machine/network imports -- so
+    without this, the mapping logic could only be verified by manual
+    reading, the same gap that let Trial 4's MemoryError failures sit
+    unclassified (reason=exception stage=unknown) instead of tagged
+    "body" until this was added.
+
+    PostStageError already carries its own .stage/.reason -- returned
+    as-is. MemoryError is tagged "body": Trial 4 hit this repeatedly as
+    json.dumps(payload).encode("utf-8") -- built in _post_batch, BEFORE
+    timeout_post() is ever called, so its allocation size scales with
+    however many readings are buffered -- failed outright once the
+    backlog grew large enough during a run of failures. Also covers a
+    MemoryError escaping from inside timeout_post() itself rather than
+    being wrapped as PostStageError (currently only theoretical, not
+    seen in Trial 4 -- e.g. _read_response_with_deadline's `body +=
+    chunk` accumulation only catches OSError around each read, not
+    MemoryError). Anything else is tagged "unknown".
+    """
+    if isinstance(exc, PostStageError):
+        return exc.stage, exc.reason
+    if isinstance(exc, MemoryError):
+        return "body", str(exc)
+    return "unknown", str(exc)
+
+
 # Applied via sock.settimeout() once, immediately after the socket is
 # created and before connect() -- MicroPython's usocket, like CPython's
 # socket, applies one timeout value to every blocking call made on that

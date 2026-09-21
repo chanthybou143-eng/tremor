@@ -73,7 +73,7 @@ from machine import ADC, UART, Pin, Timer, WDT
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
-from http_client import PostStageError, parse_https_url, timeout_post
+from http_client import PostStageError, classify_post_exception, parse_https_url, timeout_post
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
 INGEST_HOST, INGEST_PORT, INGEST_PATH = parse_https_url(INGEST_URL)
@@ -503,9 +503,19 @@ def _post_batch(payload):
             heap_free_at_try_start, gc.mem_free()))
         ok = False
     except Exception as exc:
-        print("# POST_FAIL reason=exception stage=unknown type={} msg={} heap_free_at_try_start={} "
+        # classify_post_exception is the single source of truth for the
+        # stage/reason mapping (host-tested in test_http_client.py, since
+        # this file itself can't be imported on the host at all -- see
+        # that function's docstring). Trial 4 hit this path repeatedly:
+        # json.dumps(payload).encode("utf-8"), built here BEFORE
+        # timeout_post() is ever called, failed outright with a genuine
+        # MemoryError (tagged "body" by the classifier) as the buffered
+        # backlog grew unboundedly during a run of failures.
+        stage, reason = classify_post_exception(exc)
+        stage_failure_counts[stage] = stage_failure_counts.get(stage, 0) + 1
+        print("# POST_FAIL reason=exception stage={} type={} msg={} heap_free_at_try_start={} "
               "heap_free_now={}".format(
-            type(exc).__name__, exc, heap_free_at_try_start, gc.mem_free()))
+            stage, type(exc).__name__, reason, heap_free_at_try_start, gc.mem_free()))
         ok = False
 
     if ok:
@@ -599,7 +609,8 @@ slow_post_count = 0  # cumulative count of attempts (success or failure) exceedi
 # confirmed first, which wasn't done here; until then this counts every
 # stage failure, not only confirmed timeouts, which is still the
 # actionable signal (where do POSTs actually get stuck).
-stage_failure_counts = {"dns": 0, "connect": 0, "tls_handshake": 0, "send": 0, "read_response": 0}
+stage_failure_counts = {"dns": 0, "connect": 0, "tls_handshake": 0, "send": 0, "read_response": 0,
+                         "body": 0}
 
 _wifi_service()
 
@@ -739,7 +750,8 @@ while True:
               "longest_post_duration_s={:.3f} last_post_duration_ms={} slow_post_count={} "
               "stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
-              "stage_fail_read_response={} readings_sent_ok={} max_consecutive_failures={}".format(
+              "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
+              "max_consecutive_failures={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -747,6 +759,6 @@ while True:
             longest_post_duration_s, last_post_duration_ms, slow_post_count,
             stage_failure_counts["dns"], stage_failure_counts["connect"],
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
-            stage_failure_counts["read_response"],
+            stage_failure_counts["read_response"], stage_failure_counts["body"],
             readings_sent_ok, max_consecutive_failures,
         ))

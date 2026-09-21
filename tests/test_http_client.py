@@ -20,6 +20,7 @@ import pytest
 from http_client import (  # noqa: E402
     PostStageError,
     POST_DEADLINE_S,
+    classify_post_exception,
     parse_https_url,
     timeout_post,
 )
@@ -379,3 +380,29 @@ def test_socket_is_always_closed_on_failure():
             getaddrinfo_fn=_fake_getaddrinfo,
         )
     assert sock.closed is True
+
+
+def test_classify_post_exception_maps_memory_error_to_stage_body():
+    """Trial 4's actual failure mode: json.dumps(payload).encode("utf-8")
+    -- built in wifi_unit_client.py's _post_batch, before timeout_post()
+    is ever called -- raised a genuine MemoryError as the buffered
+    backlog grew unboundedly during a run of failures. Before this, it
+    was caught by the generic `except Exception` and logged as
+    stage=unknown, indistinguishable from any other unexpected failure."""
+    stage, reason = classify_post_exception(MemoryError("memory allocation failed, allocating 10344 bytes"))
+    assert stage == "body"
+    assert "10344" in reason
+
+
+def test_classify_post_exception_passes_through_post_stage_error():
+    exc = PostStageError("tls_handshake", "[Errno 12] ENOMEM", elapsed_s=0.4,
+                          stage_duration_s=0.02, deadline_s=10.0)
+    stage, reason = classify_post_exception(exc)
+    assert stage == "tls_handshake"
+    assert reason == "[Errno 12] ENOMEM"
+
+
+def test_classify_post_exception_tags_anything_else_unknown():
+    stage, reason = classify_post_exception(OSError("connection reset"))
+    assert stage == "unknown"
+    assert reason == "connection reset"
