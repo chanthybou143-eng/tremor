@@ -34,6 +34,27 @@ import socket
 import ssl
 import time
 
+try:
+    _DEFAULT_NOW_FN = time.ticks_ms
+    _DEFAULT_TICKS_DIFF_FN = time.ticks_diff
+except AttributeError:
+    # Desktop Python's time module has no ticks_ms/ticks_diff at all (they're
+    # MicroPython-only) -- this fallback exists ONLY so this module imports
+    # and runs on the host (see module docstring: host-testable by design),
+    # for whichever tests don't specifically care about injecting their own
+    # fake clock. Never used on-device. Not wrap-safe like the real
+    # ticks_ms/ticks_diff -- fine here since durations on the host are
+    # always tiny (fake sockets, no real delay), not a portable
+    # reimplementation of MicroPython's ticks semantics.
+    def _host_now_fn():
+        return int(time.monotonic() * 1000)
+
+    def _host_ticks_diff_fn(a, b):
+        return a - b
+
+    _DEFAULT_NOW_FN = _host_now_fn
+    _DEFAULT_TICKS_DIFF_FN = _host_ticks_diff_fn
+
 
 class PostStageError(Exception):
     """Raised by timeout_post() for any failure, identifying which stage
@@ -143,24 +164,31 @@ def parse_https_url(url):
     return host, port, path
 
 
-def _stage_error(stage, reason, now_fn, start_at, stage_start_at):
+def _stage_error(stage, reason, now_fn, ticks_diff_fn, start_at, stage_start_at):
     """Builds a PostStageError with elapsed_s/stage_duration_s/deadline_s
-    filled in from the SAME now_fn timeout_post() itself uses -- one
-    helper so every raise site (deadline checks and wrapped OSErrors
-    alike) reports this consistently, rather than only the deadline
-    checks carrying timing information."""
+    filled in from the SAME ticks clock timeout_post() itself uses for
+    its deadline -- one helper so every raise site (deadline checks and
+    wrapped OSErrors alike) reports this consistently. Elapsed times are
+    computed via ticks_diff_fn (wrap-safe subtraction), not plain `-`,
+    for the same reason timeout_post() itself uses it -- see
+    timeout_post()'s docstring on why now_fn/ticks_diff_fn replaced
+    time.time() here. Internally everything is milliseconds (matching
+    time.ticks_ms()); PostStageError's fields are seconds (human-facing),
+    converted only at this one boundary."""
     now = now_fn()
     return PostStageError(
         stage, reason,
-        elapsed_s=now - start_at,
-        stage_duration_s=now - stage_start_at,
+        elapsed_s=ticks_diff_fn(now, start_at) / 1000.0,
+        stage_duration_s=ticks_diff_fn(now, stage_start_at) / 1000.0,
         deadline_s=POST_DEADLINE_S,
     )
 
 
-def _check_deadline(deadline_at, stage, now_fn, start_at, stage_start_at):
-    if now_fn() >= deadline_at:
-        raise _stage_error(stage, "overall_deadline_exceeded", now_fn, start_at, stage_start_at)
+def _check_deadline(stage, now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms):
+    now = now_fn()
+    if ticks_diff_fn(now, start_at) >= deadline_ms:
+        raise _stage_error(stage, "overall_deadline_exceeded", now_fn, ticks_diff_fn,
+                            start_at, stage_start_at)
 
 
 def _build_request(method, host, path, body_bytes, extra_headers=None):
@@ -176,8 +204,8 @@ def _build_request(method, host, path, body_bytes, extra_headers=None):
     return "{} {} HTTP/1.1\r\n{}\r\n".format(method, path, header_lines).encode("utf-8") + body_bytes
 
 
-def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, start_at,
-                                  max_header_bytes=4096):
+def _read_response_with_deadline(sock_like, now_fn, ticks_diff_fn, feed_fn, start_at,
+                                  deadline_ms, max_header_bytes=4096):
     """Reads one full HTTP/1.1 response from sock_like (anything with a
     .read(n) method returning bytes, or b""/None at EOF -- adapted from
     the keepalive-single-core branch's http_keepalive.py, which was
@@ -204,26 +232,26 @@ def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, start_
                                # read_response itself began, not since the last individual read
     buf = b""
     while b"\r\n\r\n" not in buf:
-        _check_deadline(deadline_at, "read_response", now_fn, start_at, stage_start_at)
+        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
         try:
             chunk = sock_like.read(256)
         except OSError as exc:
-            raise _stage_error("read_response", str(exc), now_fn, start_at, stage_start_at)
+            raise _stage_error("read_response", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
         if not chunk:
             raise _stage_error("read_response", "connection closed while reading response headers",
-                                now_fn, start_at, stage_start_at)
+                                now_fn, ticks_diff_fn, start_at, stage_start_at)
         buf += chunk
         if len(buf) > max_header_bytes:
             raise _stage_error("read_response", "response headers too large or malformed",
-                                now_fn, start_at, stage_start_at)
+                                now_fn, ticks_diff_fn, start_at, stage_start_at)
 
     header_bytes, _, body_start = buf.partition(b"\r\n\r\n")
     lines = header_bytes.split(b"\r\n")
     status_parts = lines[0].decode("utf-8", "replace").split(" ", 2)
     if len(status_parts) < 2:
         raise _stage_error("read_response", "malformed status line: {!r}".format(lines[0]),
-                            now_fn, start_at, stage_start_at)
+                            now_fn, ticks_diff_fn, start_at, stage_start_at)
     status_code = int(status_parts[1])
 
     headers = {}
@@ -234,20 +262,20 @@ def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, start_
 
     if headers.get("transfer-encoding", "").lower() == "chunked":
         raise _stage_error("read_response", "chunked response body not supported",
-                            now_fn, start_at, stage_start_at)
+                            now_fn, ticks_diff_fn, start_at, stage_start_at)
 
     content_length = int(headers.get("content-length", "0"))
     body = body_start
     while len(body) < content_length:
-        _check_deadline(deadline_at, "read_response", now_fn, start_at, stage_start_at)
+        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
         try:
             chunk = sock_like.read(content_length - len(body))
         except OSError as exc:
-            raise _stage_error("read_response", str(exc), now_fn, start_at, stage_start_at)
+            raise _stage_error("read_response", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
         if not chunk:
             raise _stage_error("read_response", "connection closed while reading response body",
-                                now_fn, start_at, stage_start_at)
+                                now_fn, ticks_diff_fn, start_at, stage_start_at)
         body += chunk
 
     return status_code, headers, body
@@ -255,12 +283,31 @@ def _read_response_with_deadline(sock_like, deadline_at, now_fn, feed_fn, start_
 
 def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
                   socket_factory=None, ssl_wrap_fn=None, getaddrinfo_fn=None,
-                  now_fn=None, feed_fn=None):
+                  now_fn=None, ticks_diff_fn=None, feed_fn=None):
     """One-shot HTTPS POST with SOCKET_OP_TIMEOUT_S applied to every
     individual blocking call and POST_DEADLINE_S enforced across the
     whole attempt (see both constants' comments above for why both are
     needed). Always closes whatever socket it opened, success or
     failure -- callers must not assume otherwise.
+
+    now_fn/ticks_diff_fn default to time.ticks_ms/time.ticks_diff, NOT
+    time.time -- Trial 4 found that time.time() (this module's original
+    choice) can jump forward by >=10s with under 150ms of real elapsed
+    time on this hardware/firmware combo (confirmed by cross-referencing
+    against wifi_unit_client.py's independently-measured, ticks-based
+    longest_post_duration_s; root cause not pinned down further -- a
+    repo-wide search turned up no application code anywhere in this
+    client that sets an RTC or otherwise steps the wall clock, so this
+    looks like a platform-level time.time() unreliability, not a step
+    from GPS/NTP sync code). time.ticks_ms()/ticks_diff() is what every
+    OTHER timing/interval computation in this codebase already
+    exclusively uses for exactly this class of reason -- this module was
+    the one exception, now fixed to match. ticks_diff_fn matters, not
+    just now_fn: raw subtraction of two ticks values is only valid
+    within ticks_ms()'s ~12.4 day wraparound window, and ticks_diff()
+    handles that correctly by construction. Both are injectable so tests
+    can supply a fake, deterministic, non-wrapping counter instead of a
+    real clock.
 
     Raises PostStageError(stage, reason) on any failure. Returns
     (status_code, headers_dict, body_bytes) on success -- callers decide
@@ -277,56 +324,63 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
     socket_factory/ssl_wrap_fn/getaddrinfo_fn default to the real
     socket.socket/ssl.wrap_socket/socket.getaddrinfo -- tests inject
     fakes instead of touching a real network (see
-    tests/test_http_client.py).
+    tests/test_http_client.py). getaddrinfo_fn is called as
+    getaddrinfo(host, port, 0, socket.SOCK_STREAM), and the resolved
+    (family, type, proto) are passed to socket_factory(family, type,
+    proto) -- matching the standard urequests.py call shape (which this
+    module's bare socket.socket()/2-arg getaddrinfo() previously did
+    NOT match), rather than relying on this platform's bare
+    socket.socket() default family/type/proto.
     """
     socket_factory = socket_factory or socket.socket
     ssl_wrap_fn = ssl_wrap_fn or ssl.wrap_socket
     getaddrinfo_fn = getaddrinfo_fn or socket.getaddrinfo
-    now_fn = now_fn or time.time
+    now_fn = now_fn or _DEFAULT_NOW_FN
+    ticks_diff_fn = ticks_diff_fn or _DEFAULT_TICKS_DIFF_FN
     feed_fn = feed_fn or (lambda: None)
 
+    deadline_ms = int(POST_DEADLINE_S * 1000)
     start_at = now_fn()
-    deadline_at = start_at + POST_DEADLINE_S
     sock = None
     ssl_sock = None
     try:
         stage_start_at = now_fn()
         try:
-            addr_info = getaddrinfo_fn(host, port)
+            addr_info = getaddrinfo_fn(host, port, 0, socket.SOCK_STREAM)
         except OSError as exc:
-            raise _stage_error("dns", str(exc), now_fn, start_at, stage_start_at)
-        addr = addr_info[0][-1]
+            raise _stage_error("dns", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
+        addr_family, addr_type, addr_proto, _canonname, addr = addr_info[0]
 
         stage_start_at = now_fn()
-        _check_deadline(deadline_at, "connect", now_fn, start_at, stage_start_at)
+        _check_deadline("connect", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
         try:
-            sock = socket_factory()
+            sock = socket_factory(addr_family, addr_type, addr_proto)
             sock.settimeout(SOCKET_OP_TIMEOUT_S)
             sock.connect(addr)
         except OSError as exc:
-            raise _stage_error("connect", str(exc), now_fn, start_at, stage_start_at)
+            raise _stage_error("connect", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
 
         stage_start_at = now_fn()
-        _check_deadline(deadline_at, "tls_handshake", now_fn, start_at, stage_start_at)
+        _check_deadline("tls_handshake", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
         try:
             ssl_sock = ssl_wrap_fn(sock, server_hostname=host)
         except OSError as exc:
-            raise _stage_error("tls_handshake", str(exc), now_fn, start_at, stage_start_at)
+            raise _stage_error("tls_handshake", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
 
         stage_start_at = now_fn()
-        _check_deadline(deadline_at, "send", now_fn, start_at, stage_start_at)
+        _check_deadline("send", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
         request = _build_request("POST", host, path, payload_bytes, extra_headers)
         try:
             ssl_sock.write(request)
         except OSError as exc:
-            raise _stage_error("send", str(exc), now_fn, start_at, stage_start_at)
+            raise _stage_error("send", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
 
         stage_start_at = now_fn()
-        _check_deadline(deadline_at, "read_response", now_fn, start_at, stage_start_at)
-        return _read_response_with_deadline(ssl_sock, deadline_at, now_fn, feed_fn, start_at)
+        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        return _read_response_with_deadline(ssl_sock, now_fn, ticks_diff_fn, feed_fn, start_at, deadline_ms)
     finally:
         if ssl_sock is not None:
             try:
