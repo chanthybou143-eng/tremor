@@ -147,11 +147,23 @@ POST_INTERVAL_S = 30.0
 # regardless -- an overnight soak's failure runs were consistently 12-17
 # consecutive attempts 30s apart before crashing, so backing off gives a
 # struggling connection room rather than hammering it at a fixed rate.
-# BACKOFF_CAP_S=240 (8x) is a reasoned starting point matching that
-# observed run length, not a measured optimum -- NEEDS VERIFICATION ON
-# HARDWARE whether it actually shortens or prevents a failure run.
+# BACKOFF_CAP_S was 240 (8x) at first -- a reasoned starting point, not a
+# measured optimum. A Trial 5 overnight run then measured the real cost of
+# that: at a ~0.94 readings/s arrival rate (Trial 5 run 2, clean hours) and
+# MAX_BUFFERED_READINGS=600, the buffer fills from empty in ~600-640s, and a
+# single run of 4 consecutive failures under the old 240s cap already spans
+# ~665s (60+120+240+240s of backoff waits alone) -- enough on its own to
+# overflow the buffer and drop readings, which is exactly what happened
+# (dropped=518 over several such episodes). Lowering the cap to 120 keeps a
+# 4-failure run's span to ~420-450s (comfortably under the fill time) and a
+# 5-failure run to ~540-575s (still under, though with less margin); a
+# 6-failure run's ~660-700s span still exceeds the fill time and can still
+# overflow the buffer. See tests/test_backoff_buffer_simulation.py for the
+# host-side simulation this is based on. Still not independently verified
+# on hardware whether it changes the failure-run length itself, only how
+# much buffer damage a given run length can do.
 BACKOFF_MULTIPLIER = 2.0
-BACKOFF_CAP_S = 240.0
+BACKOFF_CAP_S = 120.0
 # After this many consecutive failures, force an extra gc.collect() (and
 # explicitly drop this frame's socket/response reference first) rather
 # than waiting for the routine ones -- see _post_batch's docstring.
