@@ -93,7 +93,85 @@ def test_moving_average_is_noop_for_window_one():
     assert moving_average(samples, 1) == samples
 
 
+def test_moving_average_reused_buffer_matches_default_allocation_path():
+    # Numeric equivalence: the default (n=None, out=None) path and the
+    # reused-buffer path must produce identical output for the same valid
+    # data, for both the window<=1 no-op branch and the real filter.
+    samples = [1.0, 2.0, 1.0, 3.0, 2.0, 4.0, 3.0]
+    expected_w1 = moving_average(samples, 1)
+    expected_w3 = moving_average(samples, 3)
+
+    out = [0.0] * len(samples)
+    result_w1 = moving_average(samples, 1, n=len(samples), out=out)
+    assert result_w1 == expected_w1
+
+    out = [0.0] * len(samples)
+    result_w3 = moving_average(samples, 3, n=len(samples), out=out)
+    assert result_w3 == expected_w3
+
+
+def test_moving_average_ignores_stale_data_past_n():
+    # The whole point of the reused-buffer path: samples/out may be
+    # oversized, fixed-capacity buffers with garbage past index n-1 (as
+    # wifi_unit_client.py's CHUNK_CAPACITY buffers are, reused chunk to
+    # chunk) -- moving_average must never read or write past n.
+    n = 5
+    capacity = 10
+    samples = [1.0, 2.0, 1.0, 3.0, 2.0] + [9999.0] * (capacity - n)  # tail is stale garbage
+    sentinel = -1.0
+    out = [sentinel] * capacity
+
+    result = moving_average(samples, 3, n=n, out=out)
+
+    expected = moving_average(samples[:n], 3)
+    assert result[:n] == expected
+    # Nothing past n-1 was written -- the stale tail was never touched,
+    # which also proves it was never read into an accumulating sum either
+    # (a window=3 filter reading ahead into the 9999.0 tail would have
+    # visibly corrupted the last couple of in-range outputs).
+    assert out[n:] == [sentinel] * (capacity - n)
+
+
+def test_moving_average_window_one_ignores_stale_data_past_n():
+    n = 3
+    capacity = 6
+    samples = [5.0, 6.0, 7.0] + [9999.0] * (capacity - n)
+    sentinel = -1.0
+    out = [sentinel] * capacity
+
+    result = moving_average(samples, 1, n=n, out=out)
+
+    assert result[:n] == [5.0, 6.0, 7.0]
+    assert out[n:] == [sentinel] * (capacity - n)
+
+
 def test_frequency_from_crossings_matches_known_period():
     crossings = [0.0, 0.02, 0.04, 0.06]  # 20ms period -> 50Hz
     estimates = frequency_from_crossings(crossings)
     assert all(f == pytest.approx(50.0) for _, f in estimates)
+
+
+def test_find_zero_crossings_ignores_stale_data_past_n():
+    ts, ys = generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=0.1, seed=9)
+    n = len(ts)
+    capacity = n + 500
+    ts_oversized = list(ts) + [ts[-1] + 1000.0] * (capacity - n)  # garbage, way out of order
+    ys_oversized = list(ys) + [9999.0] * (capacity - n)           # garbage amplitude
+
+    expected = find_zero_crossings(ts, ys)
+    actual = find_zero_crossings(ts_oversized, ys_oversized, n=n)
+    assert actual == expected
+
+
+def test_estimate_frequency_ignores_stale_data_past_n():
+    ts, ys = generate_synthetic_signal(freq_hz=50.0, fs_hz=4000.0, duration_s=0.5, seed=10)
+    n = len(ts)
+    capacity = n + 500
+    ts_oversized = list(ts) + [ts[-1] + 1000.0] * (capacity - n)
+    ys_oversized = list(ys) + [9999.0] * (capacity - n)
+
+    expected_freq, expected_per_cycle = estimate_frequency(ts, ys)
+    actual_freq, actual_per_cycle = estimate_frequency(ts_oversized, ys_oversized, n=n)
+
+    assert actual_freq == expected_freq
+    assert actual_per_cycle == expected_per_cycle

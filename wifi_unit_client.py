@@ -1,90 +1,47 @@
 """Standalone Pico-side WiFi client: samples the ADC, syncs GPS/PPS time,
 reduces each ~1s chunk to a (frequency_hz, amplitude_v, gps_utc_s) reading
 on-device, and ships batches of those readings to TREMOR's /api/ingest
-endpoint over WiFi -- the eventual standalone replacement for the current
-laptop-tethered mpremote + overnight_log.py setup.
+endpoint over WiFi -- the deployed replacement for the laptop-tethered
+mpremote + overnight_log.py setup. This is the known-good single-core
+client (originally 9dfdf08); a dual-core (_thread) redesign was tried and
+reverted after a MemoryError crash loop from heap fragmentation, and
+stays single-core-only going forward (see wifi_ingest.py/git history).
 
-NOT CURRENTLY DEPLOYED (2026-09-19). A ~10.5h soak of this exact script
-surfaced a recurring MemoryError crash -- "memory allocation failed,
-allocating 8192 bytes" at chunk_summary.py:82 (the per-chunk
-`[(v - dc_offset) ** 2 for v in filtered]` list comprehension, ~1000
-elements, allocated fresh every second) -- 23 times over ~4h45m, with the
-interval between crashes shrinking as the run went on (~107s, then ~74s
-between the last three), consistent with heap fragmentation building up
-under the shared dual-core allocator rather than a one-off glitch. Likely
-mechanism: this per-second large-list churn on core 0, concurrent with
-core 1's TLS/urequests allocations on the *same* heap (see the "new
-GC-pause risk" design note below), fragments the heap enough that an
-8KB allocation occasionally fails outright even with adequate total free
-memory. Each crash restarts the script from scratch, silently discarding
-whatever was sitting unflushed in IngestBuffer at that moment (in RAM,
-wiped on restart) -- real, uncounted data loss with no drop counter to
-show it, unlike the ring-buffer overflow this redesign was built to fix.
+Written against adc_stream_gps.py's proven ADC-ring-buffer/GPS-UART-polling
+design (same wraparound-safe ticks accumulator, same GPS_READ_CHUNK_BYTES
+reasoning), with chunk_summary.py and wifi_ingest.py tested under desktop
+Python. Known MicroPython WiFi gotchas this was written to survive -- see
+the inline comments at each relevant point: no WiFi auto-reconnect
+(_wifi_service), and a blocking POST can stall the main loop for longer
+than the ring buffer's headroom (RING_CAPACITY).
 
-It also produced a second-order symptom: 23 of 29 disconnect/reconnect
-events logged that night were actually these crashes, not the USB drops
-they were first assumed to be (mischaracterized as such in status updates
-during the run, since disconnect/reconnect counts were checked without
-grepping for the traceback itself). A crash-triggered restart, followed
-quickly by a small post-restart batch, could land close enough in real
-time to the tail of the pre-crash batch still in /api/ingest's 60s
-server-side window to make rocof_from_window's fit see an artificially
-tiny apparent time gap between two batches whose timestamps are each
-independently reconstructed from "now" -- observed live as a
--22.953 Hz/s spike (physically impossible; the underlying frequency
-reading itself was plausible). This is a distinct edge case from the
-earlier same-night within-batch timestamp-compression bug (fixed in
-d348cf1) -- that one was systematic and every batch; this one is an
-occasional cross-batch boundary artifact that only appears around a
-crash/restart.
+That last one used to be theoretical. Trial 3 hit it for real: a ~2min
+WiFi outage produced a ~7min main-loop freeze via urequests.post(),
+which has no socket timeout in most MicroPython forks -- confirmed by
+elapsed_s staying flat while wall-clock time advanced and the ADC ring
+buffer's overflow counter jumping by ~400,000 during the stall. _post_batch
+now calls http_client.timeout_post() instead, which bounds every
+individual socket operation (SOCKET_OP_TIMEOUT_S) and the whole POST
+attempt (POST_DEADLINE_S) -- see that module for why both are needed. A
+machine.WDT backstops the case that software bound itself fails (see
+WDT_TIMEOUT_MS_CANDIDATES below) -- if settimeout() is silently not
+honoured during the TLS handshake specifically, this watchdog is the
+ONLY bound on that stall. reset_cause() is captured at boot and printed
+on every STATUS line, so a WDT-triggered reset is unmistakable in the
+log.
 
-Reverted to the pre-dual-core single-core version (git show
-9dfdf08:wifi_unit_client.py) for actual deployment -- known-stable,
-overflow behavior under load is bounded and already measured
-(diagnostics/wifi_probe_concurrent.py), rather than an unbounded silent
-loss with no counter. This file is kept, not deleted -- the dual-core
-approach is still the right direction once the heap-fragmentation issue
-is understood and fixed; that fix is unresolved follow-up work, not
-attempted here. A fix will need to either reduce per-second allocation
-churn on core 0 (e.g. reuse a preallocated buffer instead of a fresh
-list comprehension every chunk) or move real allocation-heavy work off
-the shared heap's contention path entirely -- to be scoped separately,
-with its own measurement, not guessed at now.
+POST_INTERVAL_S raised from 8s to 30s to reduce how often the ~2.1-2.6s
+DNS+TCP+TLS handshake gets paid per hour -- a persistent/keep-alive
+connection was investigated and found not viable against this specific
+PythonAnywhere deployment (reproducible ~15s response delay on any
+connection not explicitly closed; see the keepalive-single-core branch's
+diagnostics), so batching more readings per POST is the remaining lever.
 
-Dual-core split (see conversation design notes -- justified by
-diagnostics/wifi_probe_concurrent.py's measurement: real urequests.post()
-latency under concurrent ADC/GPS load spiked to ~5.4-5.7s in ~18% of
-cycles, overflowing RING_CAPACITY=4096 and dropping ~1400-1600 samples
-per spike):
-
-    Core 0 (this module's top level and main loop): ADC Timer IRQ,
-    ring-buffer drain, chunk_summary, IngestBuffer.append(), GPS UART
-    servicing, PPSTimeSync. Never touches `wlan` -- see _core1_main.
-
-    Core 1 (_core1_main, launched via _thread): WiFi connect/reconnect
-    and periodic IngestBuffer.flush(). Owns `wlan` exclusively; core 0
-    only ever reads the plain _wifi_connected flag below for its status
-    line, specifically to avoid any cross-core access to the cyw43
-    driver itself (not just the Python-level WLAN object), which hasn't
-    been verified safe to call from two cores concurrently.
-
-IngestBuffer (wifi_ingest.py) is the only object touched from both cores,
-and is now internally locked for exactly that reason -- see its docstring
-for the minimal-hold-time design (the lock never spans the network call).
-
-NOT YET RUN ON REAL HARDWARE past the diagnostics/ probes. Known
-MicroPython WiFi/urequests gotchas this was written to survive -- see the
-inline comments at each relevant point: no WiFi auto-reconnect
-(_wifi_service), urequests responses must be .close()'d or sockets leak
-(_post_batch), no default socket timeout in most urequests forks
-(_post_batch).
-
-TEST_DURATION_S follows adc_stream_gps.py's own bring-up convention: None
-runs forever (production); a number bounds the run and prints a FINAL
-summary in the same shape as diagnostics/dualcore_control_a.py's, so a
-bounded run of *this* script is Test C in the Control A/B/C comparison --
-not a separate stand-in script -- and is directly diffable against
-Control A's numbers.
+gc.mem_free()/gc.mem_alloc() are logged alongside the existing periodic
+status line (with an explicit gc.collect() first, so the numbers reflect
+reclaimed state, not a mid-accumulation snapshot) specifically so a long
+soak's heap trend is visible -- the dual-core incident's fragmentation
+was only caught after the fact, from a crash, not from watching a trend.
 
 Additive, not a modification: imports pps_time_sync.PPSTimeSync exactly as
 adc_stream_gps.py does, and freq_estimator.py (via chunk_summary.py)
@@ -93,36 +50,144 @@ adc_stream_gps.py itself, is touched by this script.
 """
 
 import array
+import gc
 import time
 
-import _thread
+try:
+    import json
+except ImportError:
+    # No precedent for either name anywhere else in this repo, and no
+    # vendored urequests.py locally to check what IT imported internally
+    # (urequests.post(json=payload) did this same dumps() call, so this
+    # isn't a new dependency, just now an explicit, visible one) -- the
+    # live device's own /lib couldn't safely be checked either (would
+    # mean touching the serial port of a running soak). Genuinely
+    # unconfirmed which name this build uses, so don't guess: try both.
+    import ujson as json
+
+import micropython
 import network
-import urequests
-from machine import ADC, UART, Pin, Timer
+import machine
+from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
-from chunk_summary import summarize_chunk
+from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer
+from http_client import PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
-TEST_DURATION_S = None  # None = run forever (production); a number = bounded
-                        # verification run -- see module docstring
+INGEST_HOST, INGEST_PORT, INGEST_PATH = parse_https_url(INGEST_URL)
 
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
-# See diagnostics/wifi_probe_concurrent.py's measurement in the module
-# docstring for why this is 4096 (~4s headroom, ~24KB RAM), not
-# adc_stream_gps.py's 512 -- and why that headroom alone wasn't enough,
-# which is what motivated the dual-core split below.
+# adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
+# short USB/GPS-poll stalls. Unlike WiFi reconnect (made non-blocking
+# above), urequests.post() itself IS a blocking call with no async
+# alternative in stock urequests -- DNS+TCP+TLS+transfer for a small JSON
+# batch is plausibly ~0.5-2s, occasionally more, and the main loop can't
+# drain the ring buffer while blocked inside it. 4096 samples (~4s
+# headroom, ~24KB RAM) is a cheap stopgap so a typical POST doesn't
+# overflow it -- NOT a guarantee against a pathological multi-second
+# stall. OPEN DESIGN QUESTION for real hardware: if measured POST
+# latency threatens this headroom, the more robust fix is running the
+# POST on the Pico 2's second core via _thread (ADC/ring-buffer draining
+# stays on core 0, uninterrupted) rather than keep enlarging this buffer --
+# worth deciding once real latency numbers exist, not guessed now.
 RING_CAPACITY = 4096
 MAX_DRAIN_PER_PASS = 128  # see adc_stream_gps.py: bounds one drain so GPS
-                          # UART servicing always gets a turn
+                          # UART servicing and WiFi/POST bookkeeping always get a turn
 
 CHUNK_S = 1.0            # one summarized reading per second, same cadence as overnight_log.py
-POST_INTERVAL_S = 8.0    # batch several readings per POST rather than one per
-                         # second -- each POST pays a DNS+TCP+TLS handshake cost
-                         # that dominates a single small payload's transfer time
-MAX_BUFFERED_READINGS = 600  # ~10 minutes at 1 reading/s -- see wifi_ingest.py's
-                              # docstring; needs retuning against real gc.mem_free()
+# Fixed capacity for one chunk's worth of samples (~ADC_SAMPLE_HZ * CHUNK_S
+# ~= 1030 nominal), preallocated once below and reused every chunk instead
+# of building fresh lists each time. This is the fix for the MemoryError
+# crash loop seen in production: every chunk, three ~1030-element lists
+# were each built via .append()/listcomp (_chunk_ts_s etc. filling up,
+# voltages = [...], and moving_average's own output list), and MicroPython
+# grows a list's backing array by doubling on overflow -- at ~1030 items
+# that's a transition from 1024 to 2048 slots, i.e. one fresh *contiguous*
+# 8192-byte block (2048 slots * 4 bytes/slot on this 32-bit target) needed
+# every single time, which can fail under heap fragmentation even with
+# hundreds of KB nominally free (confirmed: every crash logged heap_free
+# well over 350KB while failing to allocate exactly 8192 bytes). A margin
+# over the nominal ~1030 covers normal timer jitter without ever growing.
+# Lowering it further isn't well justified: with array.array buffers
+# below, each extra slot of margin costs only its flat itemsize (a few
+# bytes), not the boxed-float overhead a plain list paid per slot -- the
+# margin is now cheap, and real chunks have been observed needing up to
+# ~1148 samples (inferred from a crash requiring a slice sized past 1030
+# during unrelated heap pressure), so 1200 stays a reasonable ceiling.
+CHUNK_CAPACITY = 1200
+
+# NEEDS VERIFICATION ON HARDWARE: this assumes single-precision floats
+# (MICROPY_FLOAT_IMPL_FLOAT), the common default for the rp2 port since
+# RP2040/RP2350 have no double-precision FPU -- but this has not been
+# confirmed on this specific build. Run check_float_precision.py (repo
+# root) on-device before flashing this file: if it prints "double", change
+# this to 'd' first. Getting it wrong doesn't crash anything (array.array
+# silently truncates values to fit 'f'), but it would store frequency/
+# amplitude/timestamp readings at less precision than this build's floats
+# actually support, and 'd' costs only 4 more bytes/slot.
+FLOAT_TYPECODE = "f"
+# Single source of truth for how often buffer.flush() POSTs a batch.
+# Raised from 8s to 30s: a persistent/keep-alive connection was
+# investigated and found not viable against this specific PythonAnywhere
+# deployment (reproducible ~15s response delay on any connection not
+# explicitly told "Connection: close" -- see the keepalive-single-core
+# branch's diagnostics; not revisited here, keep-alive is dead). With
+# reuse off the table, the remaining lever to cut total time spent on
+# the ~2.1-2.6s DNS+TCP+TLS handshake each POST pays is fewer POSTs per
+# hour, not cheaper ones -- 30s batches 3-4x more readings per handshake
+# than 8s did, at the cost of a longer worst-case delay before a reading
+# reaches the dashboard.
+POST_INTERVAL_S = 30.0
+# After a POST actually attempted and failed (not wifi_disconnected --
+# that's already handled by _wifi_service()'s own independent 5s retry
+# timer, a different failure mode), the effective interval between
+# attempts doubles, capped, instead of retrying every POST_INTERVAL_S
+# regardless -- an overnight soak's failure runs were consistently 12-17
+# consecutive attempts 30s apart before crashing, so backing off gives a
+# struggling connection room rather than hammering it at a fixed rate.
+# BACKOFF_CAP_S was 240 (8x) at first -- a reasoned starting point, not a
+# measured optimum. A Trial 5 overnight run then measured the real cost of
+# that: at a ~0.94 readings/s arrival rate (Trial 5 run 2, clean hours) and
+# MAX_BUFFERED_READINGS=600, the buffer fills from empty in ~600-640s, and a
+# single run of 4 consecutive failures under the old 240s cap already spans
+# ~665s (60+120+240+240s of backoff waits alone) -- enough on its own to
+# overflow the buffer and drop readings, which is exactly what happened
+# (dropped=518 over several such episodes). Lowering the cap to 120 keeps a
+# 4-failure run's span to ~420-450s (comfortably under the fill time) and a
+# 5-failure run to ~540-575s (still under, though with less margin); a
+# 6-failure run's ~660-700s span still exceeds the fill time and can still
+# overflow the buffer. See tests/test_backoff_buffer_simulation.py for the
+# host-side simulation this is based on. Still not independently verified
+# on hardware whether it changes the failure-run length itself, only how
+# much buffer damage a given run length can do.
+BACKOFF_MULTIPLIER = 2.0
+BACKOFF_CAP_S = 120.0
+# After this many consecutive failures, force an extra gc.collect() (and
+# explicitly drop this frame's socket/response reference first) rather
+# than waiting for the routine ones -- see _post_batch's docstring.
+CONSECUTIVE_FAILURE_GC_THRESHOLD = 3
+# ~30 readings/batch at POST_INTERVAL_S=30s and one reading/s (CHUNK_S)
+# -- 600 is a ~20x margin over one normal batch, and the outage-tolerance
+# semantics (drop-oldest once buffered readings span ~10 minutes) are
+# unchanged by the interval bump, since this bound is independent of how
+# often flush() is called. See the bench-run report (commit history) for
+# the actually-observed peak.
+MAX_BUFFERED_READINGS = 600
+# Caps a single flush()'s POST body -- uncapped, a fully-buffered flush
+# (600 readings) is a ~48.6KB JSON body (measured directly), a single
+# allocation-heavy contiguous write nobody had reason to bound before the
+# buffer itself could actually reach that size. 60 is ~2x the normal
+# ~28-30 readings/cycle at POST_INTERVAL_S=30s/CHUNK_S=1s -- comfortable
+# headroom for ordinary timing jitter, so normal operation is never
+# capped, while a real backlog drains over several ordinary-cadence
+# cycles instead of one large POST. The remainder is left buffered for
+# the next scheduled flush(), not sent immediately -- an extra POST right
+# away would be one more multi-second blocking call competing with ADC
+# ring-buffer draining, the same kind of stall that causes ring-buffer
+# overflow_count in the first place.
+MAX_READINGS_PER_POST = 60
 
 WIFI_RETRY_INTERVAL_S = 5    # how often to kick off a fresh connect attempt while down
 STATUS_INTERVAL_S = 10
@@ -130,14 +195,133 @@ STATUS_INTERVAL_S = 10
 ADC_VOLTAGE_SCALE = 3.3 / 65535  # raw u16 -> volts, same conversion
                                   # overnight_log.py's _parse_sample_line() applies
 
+# Captured before anything else below runs, so it reflects why THIS boot
+# happened, not some later state. Printed ONCE, in the # BOOT line below
+# -- NOT repeated on every STATUS line -- because reset_cause=WDT_RESET
+# at the very moment of a fresh launch is EXPECTED, not a signal of
+# anything wrong: confirmed by reading mpremote's own source
+# (transport_serial.py's enter_raw_repl(), used by `mpremote run` with
+# its default soft_reset=True) that every `mpremote run <file>` sends
+# Ctrl-D (MicroPython's soft-reset sequence) before executing the file,
+# unconditionally. On the rp2 port specifically, that Ctrl-D soft reset
+# is documented (not independently verified against this exact firmware
+# build's C source, so held with high but not absolute confidence) to go
+# through the SDK's watchdog_reboot() mechanism -- meaning reset_cause()
+# legitimately reports WDT_RESET after an ORDINARY `mpremote run`, with
+# or without this file's own machine.WDT ever existing. Trial 4's first
+# attempt confirmed this empirically: WDT_RESET appeared on the very
+# first boot line, which is impossible for THIS run's own watchdog to
+# have caused (it didn't exist yet at the moment of that reset).
+#
+# So: WDT_RESET in THIS boot's # BOOT line is normal and not itself a
+# stop condition. What WOULD be meaningful is WDT_RESET appearing in a
+# LATER # BOOT line that follows an "EVENT reconnected" mid-log (i.e.
+# overnight_wifi_log.py detected the device dropped out and relaunched
+# it) -- that shape means something reset the board WHILE it was already
+# running, which an ordinary `mpremote run` boot-time reset can't
+# explain.
+#
+# Looked up via getattr with a sentinel default rather than `from
+# machine import WDT_RESET, ...` directly -- NEEDS VERIFICATION ON
+# HARDWARE: not confirmed that the rp2 port defines every one of these
+# five constants machine.reset_cause() docs generally list; a missing
+# one would crash this whole file at import time if imported by name
+# instead.
+_RESET_CAUSE_NAMES = {
+    getattr(machine, "PWRON_RESET", -1): "PWRON_RESET",
+    getattr(machine, "HARD_RESET", -2): "HARD_RESET",
+    getattr(machine, "WDT_RESET", -3): "WDT_RESET",
+    getattr(machine, "DEEPSLEEP_RESET", -4): "DEEPSLEEP_RESET",
+    getattr(machine, "SOFT_RESET", -5): "SOFT_RESET",
+}
+BOOT_RESET_CAUSE = machine.reset_cause()
+BOOT_RESET_CAUSE_NAME = _RESET_CAUSE_NAMES.get(BOOT_RESET_CAUSE, "UNKNOWN({})".format(BOOT_RESET_CAUSE))
+print("# BOOT reset_cause={}".format(BOOT_RESET_CAUSE_NAME))
+
+# Tried in order at boot; the first machine.WDT() accepts without raising
+# is used. () or None disables the watchdog entirely -- this is a
+# build-time choice, not a runtime one, since rp2's WDT has no
+# deinit()/disable once started (only .feed(), or letting it expire) --
+# set this to () and reflash before any mpremote maintenance session (a
+# paused REPL, a long fs cp/ls -- anything that legitimately stops this
+# loop from running for a while), since there's no way to pause an armed
+# watchdog first.
+#
+# This is a backstop, not the primary defense: POST_DEADLINE_S
+# (http_client.py) is what's SUPPOSED to bound a stuck POST to ~10s in
+# software. This watchdog exists for the case that bound itself fails --
+# e.g. if a low-level TLS handshake call doesn't actually honour
+# sock.settimeout() the way plain socket send/recv do, a real risk this
+# hasn't been run against real hardware to rule out (see the Trial 4
+# report). If settimeout is silently not honoured during the handshake,
+# THIS WATCHDOG IS THE ONLY BOUND on that stall -- there is no software
+# fallback for it. http_client.timeout_post()'s feed_fn is wired below to
+# wdt.feed, called at every stage transition and before every individual
+# read -- not just once per full POST -- so this watchdog only needs to
+# survive the GAP BETWEEN two feeds, not the whole POST_DEADLINE_S.
+#
+# 8000 (first try): 2x SOCKET_OP_TIMEOUT_S=4s margin over that gap for
+# scheduler/GC jitter, chosen to stay under the RP2040 datasheet's
+# ~8.388s single-period hardware watchdog cap (24-bit counter at a fixed
+# tick rate) -- NEEDS VERIFICATION ON HARDWARE: whether the Pico 2's
+# RP2350 (a different chip revision) shares that cap, and whether
+# MicroPython's rp2 WDT driver enforces or extends it, is unconfirmed.
+# 4000 (fallback, only used if 8000 is rejected): matches
+# SOCKET_OP_TIMEOUT_S exactly, meaning if THIS is what actually gets
+# used, the watchdog's margin over one legitimate (if slow) socket
+# operation shrinks from 2x to 1x -- a genuinely slow-but-working
+# operation right at its own 4s timeout could then race the watchdog.
+# That degradation is deliberately visible (see WDT_ARMED below), not
+# silent -- if the fallback is what's actually needed, SOCKET_OP_TIMEOUT_S
+# itself should be revisited once real hardware says why 8000 didn't work,
+# rather than leaving the margin thin indefinitely.
+WDT_TIMEOUT_MS_CANDIDATES = (8000, 4000)
+
+wdt = None
+WDT_TIMEOUT_MS_ACTUAL = None
+if WDT_TIMEOUT_MS_CANDIDATES:
+    for _candidate_ms in WDT_TIMEOUT_MS_CANDIDATES:
+        try:
+            wdt = WDT(timeout=_candidate_ms)
+            WDT_TIMEOUT_MS_ACTUAL = _candidate_ms
+            break
+        except (ValueError, OSError) as exc:
+            print("# WDT_CANDIDATE_REJECTED timeout_ms={} type={} msg={}".format(
+                _candidate_ms, type(exc).__name__, exc))
+    if wdt is None:
+        # Fail loudly, before any hardware below (ADC included) starts --
+        # a watchdog was explicitly requested (WDT_TIMEOUT_MS_CANDIDATES
+        # is non-empty) and NONE of the candidates worked. Proceeding
+        # without one here would silently drop the freeze-fix's backstop
+        # with no record of why.
+        raise RuntimeError(
+            "machine.WDT rejected every candidate timeout in {} -- refusing to start "
+            "without the requested watchdog. Check machine.WDT's accepted range on "
+            "this build (see the RP2040 ~8.388s hardware-watchdog-cap note above) "
+            "and adjust WDT_TIMEOUT_MS_CANDIDATES.".format(WDT_TIMEOUT_MS_CANDIDATES))
+    # machine.WDT does not document a public getter for the configured
+    # timeout on rp2 -- print whatever's available via getattr rather
+    # than assume either way; NEEDS VERIFICATION ON HARDWARE whether this
+    # build exposes one at all (e.g. an undocumented `.timeout`).
+    _wdt_effective = getattr(wdt, "timeout", None)
+    print("# WDT_ARMED requested_ms={} effective_reported_ms={}".format(
+        WDT_TIMEOUT_MS_ACTUAL,
+        _wdt_effective if _wdt_effective is not None else "not_exposed_by_driver"))
+
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
 sync = PPSTimeSync(pps_pin=15)
+wlan = network.WLAN(network.STA_IF)
 
 t0 = time.ticks_us()
 
-# Ring buffer -- identical structure to adc_stream_gps.py's (ISR does the
-# minimum possible work; the main loop converts/drains).
+# Ring buffer -- identical structure to adc_stream_gps.py's, see that
+# file's docstring for why (ISR does the minimum possible work; the main
+# loop converts/drains). RING_CAPACITY=512 at ADC_SAMPLE_HZ=1030 is only
+# ~497ms of headroom (same as adc_stream_gps.py) -- this is why WiFi
+# connect/reconnect below MUST be non-blocking: a single blocking connect
+# attempt of even a couple of seconds would overflow this buffer and drop
+# most samples acquired during the stall.
 ring_ticks = array.array("L", [0] * RING_CAPACITY)
 ring_raw = array.array("H", [0] * RING_CAPACITY)
 write_idx = 0
@@ -164,92 +348,298 @@ GPS_READ_CHUNK_BYTES = 128  # see adc_stream_gps.py for the throughput/latency
                             # tradeoff this bounds
 gps_buf = b""
 
-buffer = IngestBuffer(UNIT_ID, post_fn=None, max_readings=MAX_BUFFERED_READINGS)  # post_fn set below
 
-# Cross-core status only -- never used for control flow on either side, so
-# plain-variable reads/writes are fine without a lock (see module
-# docstring: core 0 never touches `wlan` itself, only this flag).
-_wifi_connected = False
-_stop_flag = False  # core 0 sets this at TEST_DURATION_S; core 1 polls it to exit its loop
+wlan.active(True)
+_last_wifi_attempt_ticks = time.ticks_us()
 
 
-def _core1_main():
-    """Runs entirely on core 1: WiFi connect/reconnect + periodic
-    IngestBuffer.flush(). Everything that touches `wlan` or issues the
-    network POST lives here and only here.
+def _wifi_service():
+    """Call every loop pass -- never blocks. wlan.connect() itself is
+    asynchronous (the cyw43 driver negotiates in the background; MicroPython's
+    call returns immediately), so this only ever *starts* an attempt at most
+    once per WIFI_RETRY_INTERVAL_S and otherwise just checks isconnected() --
+    it never busy-waits, which matters given the ring buffer's ~497ms
+    headroom (see its comment above). NEEDS VERIFICATION ON HARDWARE: that
+    wlan.connect() on the Pico 2 W's cyw43 driver really is non-blocking in
+    the way ESP32 MicroPython ports document -- if it isn't, this call needs
+    to move off the main loop (e.g. a second thread via _thread) instead.
     """
-    global _wifi_connected
-
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
-    last_wifi_attempt_ticks = time.ticks_us()
-    last_post_ticks = time.ticks_us()
-
-    def _wifi_service():
-        """Call every loop pass -- never blocks. wlan.connect() itself is
-        asynchronous (the cyw43 driver negotiates in the background;
-        MicroPython's call returns immediately -- confirmed on this
-        firmware by diagnostics/wifi_probe.py: 6-26ms call-return time),
-        so this only ever *starts* an attempt at most once per
-        WIFI_RETRY_INTERVAL_S and otherwise just checks isconnected().
-        """
-        nonlocal last_wifi_attempt_ticks
-        global _wifi_connected
-        _wifi_connected = wlan.isconnected()
-        if _wifi_connected:
-            return
-        now = time.ticks_us()
-        if time.ticks_diff(now, last_wifi_attempt_ticks) >= WIFI_RETRY_INTERVAL_S * 1_000_000:
-            last_wifi_attempt_ticks = now
-            try:
-                wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-            except OSError:
-                pass  # e.g. "already connecting" -- next retry will catch a real failure
-
-    def _post_batch(payload):
-        """IngestBuffer's injected post_fn. Returns True only on a 2xx
-        response. Every response is explicitly closed -- a missed
-        .close() on urequests leaks the underlying socket, and repeated
-        leaks exhaust the Pico's socket table over an unattended
-        multi-hour run. NEEDS VERIFICATION ON HARDWARE: whether this
-        urequests build supports a timeout kwarg at all -- without one, a
-        dead/half-open connection can block this call indefinitely (this
-        blocks only core 1 now, not the ADC/GPS path on core 0, but it
-        would still stall this unit's own reporting).
-        """
-        if not wlan.isconnected():
-            return False
-        response = None
+    global _last_wifi_attempt_ticks
+    if wlan.isconnected():
+        return
+    now = time.ticks_us()
+    if time.ticks_diff(now, _last_wifi_attempt_ticks) >= WIFI_RETRY_INTERVAL_S * 1_000_000:
+        _last_wifi_attempt_ticks = now
         try:
-            response = urequests.post(INGEST_URL, json=payload)
-            return 200 <= response.status_code < 300
-        except Exception:
-            return False
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        except OSError:
+            pass  # e.g. "already connecting" -- next retry will catch a real failure
+
+
+def _feed_wdt():
+    if wdt is not None:
+        wdt.feed()
+
+
+PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to check
+                            # whether the collect below is actually reducing/preventing
+                            # ENOMEM failures, or whether they happen regardless
+
+_consecutive_failures = 0
+_current_post_interval_s = POST_INTERVAL_S  # read by the main loop instead of the
+                                              # POST_INTERVAL_S constant directly --
+                                              # see BACKOFF_MULTIPLIER's comment
+readings_sent_ok = 0  # cumulative individual readings actually accepted by the
+                       # server (not POST attempts -- a single POST's batch size
+                       # varies, especially once MAX_READINGS_PER_POST capping is
+                       # draining a backlog), so this can be reconciled directly
+                       # against the server's own received count
+max_consecutive_failures = 0  # highest _consecutive_failures streak seen so far,
+                                # this run -- distinct from the current streak,
+                                # which resets to 0 on the next success
+
+
+def _post_batch(payload):
+    """IngestBuffer's injected post_fn. Returns True only on a 2xx
+    response. Every socket opened by timeout_post() is closed inside
+    that function itself (success or failure) -- see http_client.py.
+
+    Uses http_client.timeout_post() rather than urequests.post(): the
+    latter has no socket timeout in most MicroPython forks, so a dead/
+    half-open connection could block this call indefinitely -- exactly
+    what happened in Trial 3 (see module docstring). timeout_post()
+    bounds every individual socket operation (SOCKET_OP_TIMEOUT_S) and
+    the whole attempt (POST_DEADLINE_S), and raises PostStageError
+    (tagging which stage failed) instead of leaving that ambiguous.
+
+    Trial 1 showed heap_free swinging through deep troughs between
+    readings taken 30s apart (as low as ~28KB total, ~12KB max contiguous
+    free block), every one of which fully recovered by the next STATUS
+    line's own gc.collect() (10s later) -- meaning most of each trough
+    was reclaimable garbage sitting uncollected, not live data. gc.collect()
+    is now called here too (gated by PRE_POST_GC_COLLECT above, so this
+    can be A/B tested rather than assumed to help), immediately before
+    mem_info()/the POST, so a POST never has to compete with garbage
+    that simply hasn't been swept yet.
+
+    Both mem_info() and gc.mem_free() are read/printed before AND after
+    the collect, so the before/after is visible. gc.mem_free() returns a
+    value, so both numbers land on the single PRE_POST line directly.
+    micropython.mem_info() does not return anything -- it only prints,
+    and there is no portable MicroPython API to read "max free sz" as a
+    number (confirmed: this is an open feature request, not an oversight
+    on this file's part -- see micropython/micropython#910) -- so its
+    before/after can only be two separate printed blocks
+    (MEM_INFO_PRE_COLLECT / MEM_INFO_POST_COLLECT), not merged into one
+    line, but they're adjacent in the log and directly comparable by eye.
+    A third snapshot (MEM_INFO_TRY_START) repeats this right at the top
+    of the try block, as close to the actual timeout_post() call as code
+    can get without modifying that function itself -- unavoidably almost
+    identical to MEM_INFO_POST_COLLECT a few lines above (nothing but the
+    wlan.isconnected() check runs in between), but captured separately
+    since it's the tightest bound available on "state immediately before
+    the risky call" without instrumenting timeout_post()/http_client.py
+    itself.
+
+    Backoff and extra cleanup on a failure run: see BACKOFF_MULTIPLIER/
+    CONSECUTIVE_FAILURE_GC_THRESHOLD's own comments. Only a POST actually
+    attempted and failed (http_status or exception) counts -- not
+    wifi_disconnected, which returns before any of this and is already
+    retried on its own independent timer by _wifi_service().
+    """
+    heap_free_before_collect = gc.mem_free()
+    print("# MEM_INFO_PRE_COLLECT")
+    micropython.mem_info()
+
+    if PRE_POST_GC_COLLECT:
+        gc.collect()
+
+    heap_free_after_collect = gc.mem_free()
+    print("# MEM_INFO_POST_COLLECT")
+    micropython.mem_info()
+
+    print("# PRE_POST heap_free_before_collect={} heap_free_after_collect={}".format(
+        heap_free_before_collect, heap_free_after_collect))
+
+    global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count
+    global last_heap_free_at_try_start
+    global _consecutive_failures, _current_post_interval_s, readings_sent_ok, max_consecutive_failures
+
+    if not wlan.isconnected():
+        print("# POST_FAIL reason=wifi_disconnected stage=n/a heap_free={}".format(gc.mem_free()))
+        return False
+
+    ok = False
+    try:
+        print("# MEM_INFO_TRY_START")
+        micropython.mem_info()
+        # Captured at the moment this function actually starts the
+        # request, so a failure line shows the state right before the
+        # attempt instead of only the aftermath -- Trial 1's POST_FAIL
+        # lines showed heap_free well above 350KB, read after the POST
+        # call had already unwound and likely freed whatever it failed
+        # to allocate, which told us almost nothing about the actual
+        # moment of failure. This still isn't the literal instant of an
+        # internal allocation failure (only instrumenting timeout_post()
+        # itself could get that granularity), but it's the closest this
+        # branch can get without doing that.
+        heap_free_at_try_start = gc.mem_free()
+        last_heap_free_at_try_start = heap_free_at_try_start
+        body_bytes = json.dumps(payload).encode("utf-8")
+        # Timed around timeout_post() specifically (not this whole
+        # function, which also does GC/mem_info bookkeeping with its own
+        # separate instrumentation above) -- on BOTH success and failure,
+        # so a stalled attempt that eventually raises still updates this;
+        # that's often the more interesting case for spotting stalls.
+        _post_start_ticks = time.ticks_us()
+        try:
+            status_code, _headers, _body = timeout_post(
+                INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
+                feed_fn=_feed_wdt)
         finally:
-            if response is not None:
-                response.close()
+            duration_us = time.ticks_diff(time.ticks_us(), _post_start_ticks)
+            duration_s = duration_us / 1e6
+            last_post_duration_ms = duration_us // 1000
+            if duration_s > longest_post_duration_s:
+                longest_post_duration_s = duration_s
+            if duration_s > SLOW_POST_THRESHOLD_S:
+                slow_post_count += 1
+        ok = 200 <= status_code < 300
+        if not ok:
+            print("# POST_FAIL reason=http_status stage=n/a status={} heap_free_at_try_start={} "
+                  "heap_free_now={}".format(
+                status_code, heap_free_at_try_start, gc.mem_free()))
+    except PostStageError as exc:
+        stage_failure_counts[exc.stage] = stage_failure_counts.get(exc.stage, 0) + 1
+        print("# POST_FAIL reason={} stage={} elapsed_s={} stage_duration_s={} deadline_s={} "
+              "heap_free_at_try_start={} heap_free_now={}".format(
+            exc.reason, exc.stage, exc.elapsed_s, exc.stage_duration_s, exc.deadline_s,
+            heap_free_at_try_start, gc.mem_free()))
+        ok = False
+    except Exception as exc:
+        # classify_post_exception is the single source of truth for the
+        # stage/reason mapping (host-tested in test_http_client.py, since
+        # this file itself can't be imported on the host at all -- see
+        # that function's docstring). Trial 4 hit this path repeatedly:
+        # json.dumps(payload).encode("utf-8"), built here BEFORE
+        # timeout_post() is ever called, failed outright with a genuine
+        # MemoryError (tagged "body" by the classifier) as the buffered
+        # backlog grew unboundedly during a run of failures.
+        stage, reason = classify_post_exception(exc)
+        stage_failure_counts[stage] = stage_failure_counts.get(stage, 0) + 1
+        print("# POST_FAIL reason=exception stage={} type={} msg={} heap_free_at_try_start={} "
+              "heap_free_now={}".format(
+            stage, type(exc).__name__, reason, heap_free_at_try_start, gc.mem_free()))
+        ok = False
 
-    buffer._post_fn = _post_batch  # set here so _post_batch can close over this core's wlan
+    if ok:
+        readings_sent_ok += len(payload["readings"])
+        _consecutive_failures = 0
+        _current_post_interval_s = POST_INTERVAL_S
+    else:
+        _consecutive_failures += 1
+        if _consecutive_failures > max_consecutive_failures:
+            max_consecutive_failures = _consecutive_failures
+        _current_post_interval_s = min(
+            _current_post_interval_s * BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
+        if _consecutive_failures >= CONSECUTIVE_FAILURE_GC_THRESHOLD:
+            # No local response/socket reference to explicitly drop here
+            # (unlike the urequests-based version this was ported from) --
+            # timeout_post() already closes its own socket internally in
+            # its own finally block, success or failure, before this
+            # function ever sees the result.
+            print("# MEM_INFO_BEFORE_EXTRA_COLLECT consecutive_failures={}".format(
+                _consecutive_failures))
+            micropython.mem_info()
+            gc.collect()
+            print("# MEM_INFO_AFTER_EXTRA_COLLECT")
+            micropython.mem_info()
+    return ok
 
-    while not _stop_flag:
-        _wifi_service()
-        now = time.ticks_us()
-        if time.ticks_diff(now, last_post_ticks) >= POST_INTERVAL_S * 1_000_000:
-            last_post_ticks = now
-            buffer.flush()  # _post_batch checks wlan.isconnected() itself
-        time.sleep_ms(50)  # core 1 has no hard-real-time work; a short sleep avoids busy-spinning
 
-
-_thread.start_new_thread(_core1_main, ())
+buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS,
+                       max_readings_per_post=MAX_READINGS_PER_POST)
 
 _last_consumed_ticks = t0
 _elapsed_us_total = 0
-_chunk_ticks = []      # raw time.ticks_us() per sample -- for gps_utc_s lookup
-_chunk_ts_s = []       # elapsed seconds per sample -- summarize_chunk's timestamps
-_chunk_counts = []     # raw u16 ADC counts per sample -- converted to volts below
+# Fixed-capacity buffers, allocated once here and reused every chunk by
+# writing to index _chunk_len (never .append()'d/reallocated) -- see
+# CHUNK_CAPACITY above for why. Only indices [0, _chunk_len) hold valid
+# data for the *current* chunk; everything from _chunk_len onward is
+# stale leftover from a previous chunk and must never be read -- every
+# consumer below is bounded to _chunk_len, not len(...), specifically to
+# guard against that.
+#
+# array.array, not plain lists: a plain list of floats still boxes each
+# individual value (a separate heap object per element) even though the
+# list itself is pre-sized -- only the backing pointer array was fixed,
+# not the ~1030 float objects it points to, which were freshly allocated
+# and freed every chunk regardless of the list-growth fix. array.array
+# stores packed, unboxed values instead, so filling these buffers by
+# index allocates nothing at all: indexing/reading/rewriting existing
+# slots is unchanged (array.array supports the exact same arr[i]/
+# arr[i]=x/len(arr) interface as a list), and the stale-data guards
+# above are unaffected. counts uses 'H' (raw ADC u16, matches ring_raw's
+# own typecode) and ticks uses 'I', both narrower than a list's 4-byte
+# pointer slot for at least one of them; the float buffers use
+# FLOAT_TYPECODE (see its own comment above -- unverified pending
+# check_float_precision.py).
+_chunk_ticks = array.array("I", [0] * CHUNK_CAPACITY)     # raw time.ticks_us() per sample -- for gps_utc_s lookup
+_chunk_ts_s = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)    # chunk-relative elapsed seconds per sample -- summarize_chunk's timestamps
+_chunk_counts = array.array("H", [0] * CHUNK_CAPACITY)    # raw u16 ADC counts per sample -- converted to volts below
+_voltages = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)      # scratch buffer for the volts-converted chunk
+_filtered_buf = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)  # scratch buffer for summarize_chunk's filtered signal
+_chunk_len = 0
+_chunk_start_us = 0  # _elapsed_us_total at the current chunk's first sample --
+                      # see _chunk_ts_s's own comment in the main loop below
+chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY samples --
+                                    # extra samples past capacity are dropped and counted here,
+                                    # same "count, don't silently lose" contract as overflow_count
+_last_post_ticks = t0
 _last_status_ticks = t0
+peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
+post_attempts = 0  # a flush() where the buffer was actually non-empty -- excludes no-op flushes
+post_successes = 0
+dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_summary.py
+longest_post_duration_s = 0.0  # wall-clock duration of the slowest _post_batch call so far,
+                                # success or failure -- see _post_batch for how it's measured
+last_post_duration_ms = 0  # duration of the MOST RECENT attempt specifically (not the max) --
+                            # Trial 4's 0.147s-vs-10s discrepancy would have been visible on the
+                            # very next STATUS line if this had existed then, without waiting for
+                            # a fresh new maximum or cross-referencing a POST_FAIL line by hand
+SLOW_POST_THRESHOLD_S = 5.0  # about half of POST_DEADLINE_S -- a POST legitimately taking
+                             # longer than this, even if it still succeeds, is well outside the
+                             # ~0.5-2.6s historical baseline and worth counting as its own signal
+slow_post_count = 0  # cumulative count of attempts (success or failure) exceeding
+                     # SLOW_POST_THRESHOLD_S -- distinct from stage_failure_counts, which only
+                     # counts outright failures; this also catches a slow-but-successful POST
+last_heap_free_at_try_start = 0  # heap_free_at_try_start from the MOST RECENT attempt --
+                                  # previously only ever printed on a POST_FAIL line (and not at
+                                  # all on success), so tracking a failure run's heap trend meant
+                                  # manually collecting POST_FAIL lines by hand. Trial 5's
+                                  # prediction (fixed-capacity storage + the 60-reading cap means
+                                  # this should stay flat across a failure run, not decline ~4KB
+                                  # per attempt the way Trial 4's did) needs this on every STATUS
+                                  # line to check directly, success or failure.
+# One counter per http_client.PostStageError.stage seen so far -- shows
+# WHERE POST attempts are failing/stalling, not just how many. Includes
+# both timeout_post()'s own POST_DEADLINE_S trips and any other
+# exception at that stage (e.g. a genuine ECONNRESET, not only a
+# settimeout-triggered timeout) -- NEEDS VERIFICATION ON HARDWARE:
+# distinguishing a real socket timeout from another OSError by errno
+# would need this build's actual errno for a timed-out socket op
+# confirmed first, which wasn't done here; until then this counts every
+# stage failure, not only confirmed timeouts, which is still the
+# actionable signal (where do POSTs actually get stuck).
+stage_failure_counts = {"dns": 0, "connect": 0, "tls_handshake": 0, "send": 0, "read_response": 0,
+                         "body": 0}
 
-while TEST_DURATION_S is None or _elapsed_us_total < TEST_DURATION_S * 1_000_000:
+_wifi_service()
+
+while True:
+    _feed_wdt()  # covers everything in this iteration OTHER than a POST attempt --
+                 # timeout_post() feeds it separately, at a finer grain, during one
+
     drained = 0
     while read_idx != write_idx and drained < MAX_DRAIN_PER_PASS:
         raw_ticks = ring_ticks[read_idx]
@@ -260,23 +650,79 @@ while TEST_DURATION_S is None or _elapsed_us_total < TEST_DURATION_S * 1_000_000
         _elapsed_us_total += time.ticks_diff(raw_ticks, _last_consumed_ticks)
         _last_consumed_ticks = raw_ticks
 
-        _chunk_ticks.append(raw_ticks)
-        _chunk_ts_s.append(_elapsed_us_total / 1e6)
-        _chunk_counts.append(raw_count)
+        if _chunk_len < CHUNK_CAPACITY:
+            if _chunk_len == 0:
+                # First sample of a new chunk -- this becomes the
+                # reference point _chunk_ts_s is measured from. See its
+                # own comment below for why.
+                _chunk_start_us = _elapsed_us_total
+            _chunk_ticks[_chunk_len] = raw_ticks
+            # Chunk-relative, not _elapsed_us_total/1e6 (session-cumulative)
+            # directly: chunk_summary.py/freq_estimator.py only ever use
+            # differences between _chunk_ts_s values (span, zero-crossing
+            # interpolation), never an absolute value, so a chunk-relative
+            # timestamp is numerically equivalent for every downstream
+            # calculation -- but it keeps the magnitude bounded to
+            # roughly [0, CHUNK_S] regardless of how long the process has
+            # been running, instead of growing for hours. That bound
+            # matters because FLOAT_TYPECODE='f' (single precision, this
+            # is a rp2 board): float32's step size at ~1030s of session
+            # time is already ~0.24ms, close to the ~0.97ms raw sample
+            # interval at ADC_SAMPLE_HZ=1030, and by ~10h it's ~3.9ms --
+            # *wider* than the sample interval, meaning consecutive
+            # samples' cumulative timestamps could round to the same
+            # float32 value. A chunk-relative value never exceeds
+            # ~1.2s, where float32's step size is a few microseconds --
+            # utterly negligible next to the ~970us sample interval, for
+            # as long as this process runs.
+            _chunk_ts_s[_chunk_len] = (_elapsed_us_total - _chunk_start_us) / 1e6
+            _chunk_counts[_chunk_len] = raw_count
+            _chunk_len += 1
+        else:
+            # CHUNK_CAPACITY's margin over the nominal ~1030 samples/chunk
+            # wasn't enough this time -- drop the extra samples (same
+            # "count, don't silently lose" contract as the ADC ring
+            # buffer's own overflow_count) rather than grow the buffer,
+            # which would defeat the whole point of preallocating it.
+            chunk_capacity_overflow_count += 1
 
     # Once ~CHUNK_S worth of samples has accumulated, reduce it to one
-    # (frequency_hz, amplitude_v, gps_utc_s) reading and buffer it.
-    if _chunk_ts_s and (_chunk_ts_s[-1] - _chunk_ts_s[0]) >= CHUNK_S:
-        voltages = [count * ADC_VOLTAGE_SCALE for count in _chunk_counts]
+    # (frequency_hz, amplitude_v, gps_utc_s) reading and buffer it. Every
+    # index used below is bounded to _chunk_len, not len(...) -- these are
+    # fixed-capacity buffers reused every chunk (see CHUNK_CAPACITY), so
+    # indices past _chunk_len hold stale data from a previous chunk.
+    if _chunk_len > 0 and (_chunk_ts_s[_chunk_len - 1] - _chunk_ts_s[0]) >= CHUNK_S:
+        for _i in range(_chunk_len):
+            _voltages[_i] = _chunk_counts[_i] * ADC_VOLTAGE_SCALE
         try:
-            frequency_hz, amplitude_v = summarize_chunk(_chunk_ts_s, voltages)
-            gps_utc_s = sync.ticks_to_utc(_chunk_ticks[-1])
+            frequency_hz, amplitude_v = summarize_chunk(
+                _chunk_ts_s, _voltages, n=_chunk_len, filtered_buf=_filtered_buf)
+            gps_utc_s = sync.ticks_to_utc(_chunk_ticks[_chunk_len - 1])
             buffer.append(frequency_hz, amplitude_v, gps_utc_s)
+        except DegenerateTimestampsError as exc:
+            # Distinguished from the routine ValueError skip below
+            # specifically so this rarer failure is counted and its
+            # context logged -- see chunk_summary.py's docstring: this is
+            # what used to crash the process with a bare ZeroDivisionError.
+            # since_last_post_us tells us whether this coincided with a
+            # POST attempt (a blocking urequests.post() call stalls the
+            # main loop, so a collision caused by a burst of catch-up
+            # drains right after a long stall would show a small value
+            # here); ring buffer overflow_count is logged alongside since
+            # the same blocking-stall mechanism is the known cause of that
+            # too, so a correlation between the two would be visible.
+            dup_timestamp_count += 1
+            since_last_post_us = time.ticks_diff(time.ticks_us(), _last_post_ticks)
+            print("# DUP_TIMESTAMP elapsed_s={:.1f} n={} first={} last={} "
+                  "since_last_post_us={} overflow_count={} error={}".format(
+                _elapsed_us_total / 1e6, _chunk_len,
+                _chunk_ts_s[0] if _chunk_len else None,
+                _chunk_ts_s[_chunk_len - 1] if _chunk_len else None,
+                since_last_post_us, overflow_count, exc,
+            ))
         except ValueError:
             pass  # too few crossings this chunk -- skip it, same as overnight_log.py
-        _chunk_ticks = []
-        _chunk_ts_s = []
-        _chunk_counts = []
+        _chunk_len = 0
 
     if uart.any():
         chunk = uart.read(GPS_READ_CHUNK_BYTES)
@@ -295,27 +741,47 @@ while TEST_DURATION_S is None or _elapsed_us_total < TEST_DURATION_S * 1_000_000
             if len(gps_buf) > MAX_GPS_BUF_BYTES:
                 gps_buf = gps_buf[-MAX_GPS_BUF_BYTES:]
 
+    _wifi_service()
+
+    current_buffered = len(buffer)
+    if current_buffered > peak_buffered:
+        peak_buffered = current_buffered
+
     now = time.ticks_us()
+    # _current_post_interval_s, not the POST_INTERVAL_S constant directly --
+    # it backs off past 30s after consecutive failures and resets to 30s on
+    # the next success (see _post_batch's docstring / BACKOFF_MULTIPLIER).
+    if time.ticks_diff(now, _last_post_ticks) >= _current_post_interval_s * 1_000_000:
+        _last_post_ticks = now
+        if current_buffered > 0:
+            post_attempts += 1
+            if buffer.flush():  # _post_batch checks wlan.isconnected() itself; a
+                                 # no-op (returns False, buffer untouched) while down
+                post_successes += 1
+        else:
+            buffer.flush()  # genuinely nothing to send -- not counted as an attempt
+
     if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
         _last_status_ticks = now
         s = sync.status
-        print("# STATUS elapsed_s={:.1f} wifi={} synced={} pps={} sync={} rejected={} "
-              "no_edge={} period_us={} buffered={} dropped={} overflow={}".format(
-            _elapsed_us_total / 1e6, _wifi_connected, s["synced"], s["pps_count"],
-            s["sync_count"], s["rejected_count"], s["no_edge_count"], s["pps_period_us"],
-            len(buffer), buffer.dropped_count, overflow_count,
+        gc.collect()  # so mem_free()/mem_alloc() reflect reclaimable garbage,
+                       # not a snapshot mid-accumulation -- see module docstring
+        print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
+              "dropped={} overflow={} heap_free={} heap_alloc={} post_attempts={} "
+              "post_successes={} dup_timestamp_count={} chunk_capacity_overflow={} "
+              "longest_post_duration_s={:.3f} last_post_duration_ms={} slow_post_count={} "
+              "stage_fail_dns={} "
+              "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
+              "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
+              "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={}".format(
+            _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
+            current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
+            gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
+            dup_timestamp_count, chunk_capacity_overflow_count,
+            longest_post_duration_s, last_post_duration_ms, slow_post_count,
+            stage_failure_counts["dns"], stage_failure_counts["connect"],
+            stage_failure_counts["tls_handshake"], stage_failure_counts["send"],
+            stage_failure_counts["read_response"], stage_failure_counts["body"],
+            readings_sent_ok, max_consecutive_failures, last_heap_free_at_try_start,
+            read_rssi(wlan),
         ))
-
-if TEST_DURATION_S is not None:
-    _stop_flag = True
-    adc_timer.deinit()
-    time.sleep_ms(200)  # let core 1 notice _stop_flag and exit its loop
-    s = sync.status
-    print("=== Test C end ===")
-    print("FINAL pps_count={} sync_count={} sync_ratio={:.4f} rejected={} no_edge={} "
-          "pps_period_us={} overflow_count={} buffered={} dropped={}".format(
-        s["pps_count"], s["sync_count"],
-        (s["sync_count"] / s["pps_count"]) if s["pps_count"] else float("nan"),
-        s["rejected_count"], s["no_edge_count"], s["pps_period_us"],
-        overflow_count, len(buffer), buffer.dropped_count,
-    ))
