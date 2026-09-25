@@ -55,8 +55,45 @@ def test_v2_payload_carries_boot_id_seq_and_the_integer_gps_triple():
     p = sent[0]
     assert p["boot_id"] == BOOT and p["unit_id"] == "unit-1"
     a, b = p["readings"]
-    assert a["seq"] == 0 and a["gps"] == [20721, 41023, 500_123] and a["gps_utc_s"] == 41023.5   # float kept for an older server
-    assert b["seq"] == 1 and "gps" not in b and b["gps_utc_s"] is None
+    assert a["seq"] == 0 and a["gps"] == [20721, 41023, 500_123]
+    assert b["seq"] == 1 and "gps" not in b                       # not yet synced: no time at all -> unlocked
+    # the legacy float32 time is NOT sent in v2 by default (SEND_LEGACY_FLOAT = False)
+    assert all("gps_utc_s" not in r for r in p["readings"])
+    assert set(a) == {"frequency_hz", "amplitude_v", "seq", "gps"}
+
+
+def test_the_legacy_float_can_be_switched_back_on_for_rollback_compatibility():
+    sent, post = _sink()
+    buf = IngestBuffer("unit-1", post, boot_id=BOOT, send_legacy_float=True)
+    buf.append(50.0, 0.75, 41023.5, gps=(20721, 41023, 500_123))
+    buf.append(50.01, 0.75, None, gps=None)
+    buf.flush()
+    a, b = sent[0]["readings"]
+    assert a["gps_utc_s"] == 41023.5 and a["gps"] == [20721, 41023, 500_123]
+    assert b["gps_utc_s"] is None and "gps" not in b
+
+
+def test_legacy_v1_always_sends_the_float_regardless_of_the_flag():
+    sent, post = _sink()
+    buf = IngestBuffer("unit-1", post, send_legacy_float=False)            # no boot_id => v1
+    buf.append(50.0, 0.75, 41023.5)
+    buf.flush()
+    assert sent[0]["readings"][0]["gps_utc_s"] == 41023.5
+
+
+def test_v2_payload_size_with_and_without_the_legacy_float():
+    def size(**kw):
+        sent = []
+        buf = IngestBuffer("unit-1", lambda p: sent.append(p) or True, boot_id=BOOT if kw.pop("v2", True) else None, **kw)
+        for i in range(60):
+            us = int(T0 * US) + i * 1_000_000 + 123_457
+            buf.append(50.0 + 0.0123 * (i % 5), 0.744, float(str(__import__("numpy").float32((us / US) % 86400))),
+                       gps=tuple(v2_gps(us)))
+        buf.flush()
+        return len(json.dumps(sent[0]).encode())
+    v1, v2_lean, v2_compat = size(v2=False), size(), size(send_legacy_float=True)
+    assert v2_lean < v2_compat and v2_compat - v2_lean >= 60 * 15                 # the float costs >= ~15 B/reading
+    assert v2_lean / v1 < 1.30                                                    # lean v2 stays within +30% of v1
 
 
 def test_seq_is_contiguous_across_failed_posts_merge_back_and_capped_sends():
@@ -177,8 +214,17 @@ def test_client_passes_boot_id_to_the_buffer_and_the_integer_gps_to_append():
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     ctor = [c for c in calls if getattr(c.func, "id", "") == "IngestBuffer"]
     assert len(ctor) == 1 and any(k.arg == "boot_id" for k in ctor[0].keywords)
+    assert any(k.arg == "send_legacy_float" for k in ctor[0].keywords)
     appends = [c for c in calls if isinstance(c.func, ast.Attribute) and c.func.attr == "append"
                and getattr(c.func.value, "id", "") == "buffer"]
     assert len(appends) == 1 and len(appends[0].args) == 4                # freq, amp, float32 utc, integer gps
     src = (ROOT / "wifi_unit_client.py").read_text()
     assert "sync.ticks_to_gps(" in src and "if BOOT_ID is not None else None" in src
+
+
+def test_send_legacy_float_is_a_module_constant_defaulting_to_false_and_gates_the_float_work():
+    tree = _client_tree()
+    consts = [n for n in tree.body if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "SEND_LEGACY_FLOAT" for t in n.targets)]
+    assert len(consts) == 1 and isinstance(consts[0].value, ast.Constant) and consts[0].value.value is False
+    src = (ROOT / "wifi_unit_client.py").read_text()
+    assert "if (BOOT_ID is None or SEND_LEGACY_FLOAT) else None" in src            # float32 time only computed when it will be sent

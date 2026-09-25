@@ -34,6 +34,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 from .ingest import PayloadError, parse_payload
 from .retention import RetentionConfig, RetentionEngine, day_to_date
 from .rocof import rocof_from_window
+from .security import (TOKEN_HEADER, ExportAuth, IngestAuth, RateLimiter, client_ip, parse_rate)
 from .store import DAY_US, US, ReadingStore, Row, StoreError, UnitState, open_store
 from .timeline import rocof_series
 from .units import SyntheticUnitFeed, UnitFeed, UnitReading
@@ -440,6 +441,11 @@ HISTORY_DEFAULT_LIMIT = 1000
 HISTORY_MAX_LIMIT = 10_000
 HISTORY_DEFAULT_SPAN_S = 3600.0
 QUOTA_WARNING_FRACTION = 0.8
+# A 60-reading v2 batch is ~7 KB and the parser accepts at most 1,000 readings (~140 KB); anything
+# bigger is refused before it is parsed, so an anonymous caller cannot tie up the single worker.
+MAX_BODY_BYTES = 512 * 1024
+DEFAULT_HISTORY_RATE = (30, 60.0)     # requests per seconds, per client
+DEFAULT_EXPORT_RATE = (10, 60.0)
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
@@ -557,6 +563,11 @@ def create_app(
     retention_config: Optional[RetentionConfig] = None,
     quota_bytes: Optional[int] = None,
     quota_root: Optional[str] = None,
+    ingest_auth: Optional[IngestAuth] = None,
+    export_token: Optional[str] = None,
+    history_rate: Optional[tuple] = None,
+    export_rate: Optional[tuple] = None,
+    client_ip_header: Optional[str] = None,
 ) -> Flask:
     """``db_path`` (else $TREMOR_DB_PATH, else an ephemeral temp file) is where
     every ingested reading is stored permanently. ``clock`` supplies receipt time
@@ -577,6 +588,25 @@ def create_app(
     quota_root = quota_root or os.environ.get("TREMOR_QUOTA_ROOT") or None
     size_cache = _TtlCache()
 
+    # --- access control (see security.py). Misconfiguration raises at startup, on purpose.
+    auth = ingest_auth if ingest_auth is not None else IngestAuth.from_env(os.environ, clock=clock, log=log)
+    export_auth = ExportAuth(export_token if export_token is not None else (os.environ.get("TREMOR_EXPORT_TOKEN") or None))
+    h_lim, h_per = history_rate or parse_rate(os.environ.get("TREMOR_HISTORY_RATE"), DEFAULT_HISTORY_RATE)
+    e_lim, e_per = export_rate or parse_rate(os.environ.get("TREMOR_EXPORT_RATE"), DEFAULT_EXPORT_RATE)
+    history_limiter = RateLimiter(h_lim, h_per, clock)
+    export_limiter = RateLimiter(e_lim, e_per, clock)
+    ip_header = client_ip_header if client_ip_header is not None else (os.environ.get("TREMOR_CLIENT_IP_HEADER") or None)
+
+    def _rate_limited(limiter):
+        ok, retry = limiter.allow(client_ip(request, ip_header))
+        if ok:
+            return None
+        import math
+        resp = jsonify(error="rate limit exceeded", retry_after_s=round(retry, 1))
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(max(1, math.ceil(retry)))
+        return resp
+
     state = _UnitsState()
     stop_event = threading.Event()
     feeds_and_threads = []
@@ -593,6 +623,7 @@ def create_app(
         feeds_and_threads.append((feed, consumer))
 
     app = Flask(__name__)
+    app.config["MAX_CONTENT_LENGTH"] = MAX_BODY_BYTES
 
     @app.get("/")
     def index():
@@ -629,6 +660,12 @@ def create_app(
             batch = parse_payload(request.get_json(silent=True))
         except PayloadError as exc:
             return jsonify(error=str(exc)), 400
+        decision = auth.check(batch.unit_id, request.headers.get(TOKEN_HEADER))
+        if not decision.allowed:
+            # identical for "missing" and "wrong": no oracle, and never any token in the body/log
+            resp = jsonify(error="unauthorized")
+            resp.status_code = 401
+            return resp
         try:
             res = store.ingest(batch, clock())
         except StoreError as exc:
@@ -645,6 +682,9 @@ def create_app(
 
     @app.get("/api/history")
     def api_history():
+        limited = _rate_limited(history_limiter)
+        if limited is not None:
+            return limited
         unit = request.args.get("unit", "")
         if not unit:
             return jsonify(error="unit is required"), 400
@@ -727,6 +767,10 @@ def create_app(
                          used_bytes=used, quota_bytes=quota_bytes, used_fraction=round(frac, 4),
                          warning=warning, warning_threshold=QUOTA_WARNING_FRACTION, measured=measured),
             store=h,
+            ingest_auth=auth.summary(),
+            export=dict(enabled=export_auth.enabled),
+            history_rate_limit=dict(requests=h_lim, per_seconds=h_per, client_ip_header=ip_header,
+                                    your_address_as_seen=client_ip(request, ip_header)),
             retention=dict(raw_days=cfg.raw_days, rocof_event_hz_s=cfg.rocof_event_hz_s,
                            freq_band=[cfg.freq_lo, cfg.freq_hi], event_margin_s=cfg.event_margin_s,
                            export_dir=cfg.export_dir),
@@ -739,7 +783,17 @@ def create_app(
 
     @app.get("/api/export/<unit>/<day>")
     def api_export(unit, day):
-        """Download one day's gzip CSV export (so it can be pulled off the server)."""
+        """Download one day's gzip CSV export (so it can be pulled off the server).
+        Needs TREMOR_EXPORT_TOKEN, sent as the X-Tremor-Token header (never in the URL, which
+        ends up in access logs); disabled entirely if no token is configured. Rate limited so
+        an anonymous caller cannot tie up the single web worker."""
+        if not export_auth.enabled:
+            return jsonify(error="export is disabled on this server"), 403
+        limited = _rate_limited(export_limiter)
+        if limited is not None:
+            return limited
+        if not export_auth.check(request.headers.get(TOKEN_HEADER)):
+            return jsonify(error="unauthorized"), 401
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", unit) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
             return jsonify(error="not found"), 404
         try:
@@ -761,6 +815,7 @@ def create_app(
     app.config["TREMOR_STATE"] = state
     app.config["TREMOR_STORE"] = store
     app.config["TREMOR_RETENTION"] = engine
+    app.config["TREMOR_INGEST_AUTH"] = auth
     app.config["TREMOR_SHUTDOWN"] = shutdown
     return app
 

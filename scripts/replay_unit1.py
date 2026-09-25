@@ -47,6 +47,7 @@ from werkzeug.serving import make_server  # noqa: E402
 
 from wifi_ingest import IngestBuffer, make_boot_id  # noqa: E402
 from tremor.retention import RetentionConfig  # noqa: E402
+from tremor.security import IngestAuth  # noqa: E402
 from tremor.store import StoreError  # noqa: E402
 from tremor.timeline import rocof_series  # noqa: E402
 from tremor.webapp import create_app  # noqa: E402
@@ -72,8 +73,9 @@ def f32_text(x):
 
 
 class Device:
-    def __init__(self, url, clock, start_unix, rng, mode, reboots, fail_bursts, fault_windows, log):
+    def __init__(self, url, clock, start_unix, rng, mode, reboots, fail_bursts, fault_windows, log, token=None):
         self.url, self.clock, self.rng, self.mode, self.log = url, clock, rng, mode, log
+        self.token = token
         self.t0 = start_unix
         self.reboots = sorted(reboots)
         self.fail_bursts = fail_bursts            # [(start_s, n_attempts)]
@@ -154,8 +156,10 @@ class Device:
         result = "n/a"
         stored_by_server = False
         if mode in ("ok", "read_response_stored"):
-            req = urllib.request.Request(self.url + "/api/ingest", data=json.dumps(payload).encode(),
-                                         headers={"Content-Type": "application/json"})
+            hdrs = {"Content-Type": "application/json"}
+            if self.token:
+                hdrs["X-Tremor-Token"] = self.token
+            req = urllib.request.Request(self.url + "/api/ingest", data=json.dumps(payload).encode(), headers=hdrs)
             try:
                 with urllib.request.urlopen(req, timeout=10) as r:
                     body = json.loads(r.read())
@@ -208,13 +212,32 @@ class Device:
             next_flush = self.now + self.interval
 
 
-def start_server(db_path, clock, export_dir):
-    app = create_app(simulated_units=[], db_path=db_path, clock=clock,
+TOKEN = "replay-token-unit1-0123456789abcdef"
+EXPORT_TOKEN = "replay-export-token-0123456789abcdef"
+
+
+def start_server(db_path, clock, export_dir, auth_mode="off"):
+    auth = IngestAuth({"unit-1": TOKEN}, auth_mode, clock=clock) if auth_mode != "off" else IngestAuth({}, "off")
+    app = create_app(simulated_units=[], db_path=db_path, clock=clock, ingest_auth=auth, export_token=EXPORT_TOKEN,
                      retention_config=RetentionConfig(export_dir=export_dir, raw_days=14))
     srv = make_server("127.0.0.1", 0, app, threaded=True)
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     return app, srv, f"http://127.0.0.1:{srv.server_port}"
+
+
+def post_probe(url, token):
+    """POST a tiny valid v2 batch with the given token (or none) and return the HTTP status."""
+    body = json.dumps({"unit_id": "unit-1", "boot_id": "probe0000probe00", "readings": [
+        {"seq": 0, "frequency_hz": 50.0, "amplitude_v": 0.7}]}).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if token:
+        hdrs["X-Tremor-Token"] = token
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url + "/api/ingest", data=body, headers=hdrs)) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
 
 
 def get(url):
@@ -229,6 +252,9 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--start", default="2026-09-24T23:00:00Z",
                     help="virtual UTC start (default crosses UTC midnight = 09:30 ACST)")
+    ap.add_argument("--auth", choices=("off", "optional", "required"), default="off",
+                    help="server ingest-auth mode; the simulated device sends its token unless --no-token")
+    ap.add_argument("--no-token", action="store_true", help="simulate a legacy unit that cannot send a token")
     ap.add_argument("--keep-db", metavar="PATH")
     a = ap.parse_args()
 
@@ -241,7 +267,7 @@ def main():
     if os.path.exists(db_path):
         os.remove(db_path)
     clock = Clock(start)
-    app, srv, url = start_server(db_path, clock, os.path.join(tmp, "exports"))
+    app, srv, url = start_server(db_path, clock, os.path.join(tmp, "exports"), a.auth)
     store = app.config["TREMOR_STORE"]
 
     # the server answers 503 for a window (storage unavailable), via the real StoreError path
@@ -259,7 +285,8 @@ def main():
     events = []
     dev = Device(url, clock, start, rng, a.mode, reboots=[duration * 0.35, duration * 0.8],
                  fail_bursts=[(duration * 0.2, 4), (duration * 0.7, 2)], fault_windows=fault_windows,
-                 log=lambda s: (events.append(s), print("  " + s)))
+                 log=lambda s: (events.append(s), print("  " + s)),
+                 token=None if (a.auth == "off" or a.no_token) else TOKEN)
     dev.run(duration)
     # drain: keep flushing until the buffer is empty (as the real device would)
     for _ in range(60):
@@ -276,6 +303,17 @@ def main():
         print(("  PASS  " if ok else "  FAIL  ") + msg)
         if not ok:
             failures.append(msg)
+
+    if a.auth == "required" and a.no_token:
+        h = get(f"{url}/api/health")
+        print("Access control (mode: required; the simulated device sent no token)")
+        check(dev.processed_total == 0 and h["store"]["raw_rows"] == 0,
+              f"a legacy device with no token stored nothing: {h['store']['raw_rows']} rows, {len(dev.produced)} readings still on the device")
+        check(h["ingest_auth"]["rejected_missing"] > 0 and h["ingest_auth"]["authenticated"] == 0,
+              f"every POST was refused with 401 and counted ({h['ingest_auth']['rejected_missing']} rejected)")
+        print("\n" + ("ALL CHECKS PASSED" if not failures else f"{len(failures)} CHECK(S) FAILED"))
+        srv.shutdown()
+        return 1 if failures else 0
 
     lo_s = min(v[0] for v in dev.produced.values()) / US - 10           # ground truth's own time range
     hi_s = max(v[0] for v in dev.produced.values()) / US + 10
@@ -358,23 +396,61 @@ def main():
 
     # restart: a new app on the same DB, and a stale retry of readings it already has
     srv.shutdown()
-    app2, srv2, url2 = start_server(db_path, clock, os.path.join(tmp, "exports"))
+    app2, srv2, url2 = start_server(db_path, clock, os.path.join(tmp, "exports"), a.auth)
     try:
         c2 = get(f"{url2}/api/history?unit=unit-1&from={lo_s}&to={hi_s}&limit=10000")
         check(c2["count"] == min(len(rows), 10000), f"after a server restart the same DB serves the same history ({c2['count']} rows)")
         last = rows[-5:]
         if a.mode == "v2":
+            hdr2 = {"Content-Type": "application/json"}
+            if a.auth != "off" and not a.no_token:
+                hdr2["X-Tremor-Token"] = TOKEN
             req = urllib.request.Request(url2 + "/api/ingest", data=json.dumps({
                 "unit_id": "unit-1", "boot_id": last[0]["boot_id"], "readings": [
                     {"seq": r["seq"], "frequency_hz": r["freq_hz"], "amplitude_v": r["amplitude_v"],
                      "gps": [r["gps_utc_us"] // (86400 * US), (r["gps_utc_us"] % (86400 * US)) // US, r["gps_utc_us"] % US]}
-                    for r in last]}).encode(), headers={"Content-Type": "application/json"})
+                    for r in last]}).encode(), headers=hdr2)
             clock.t = start + duration + 5
             with urllib.request.urlopen(req) as r:
                 body = json.loads(r.read())
             check(body["inserted"] == 0 and body["duplicates"] == 5, "a stale retry after the restart is recognised as duplicates")
     finally:
         srv2.shutdown()
+
+    if a.auth != "off":
+        print(f"\nAccess control (mode: {a.auth}; the simulated device {'sent no token' if a.no_token else 'sent its token'})")
+        srv_p = make_server("127.0.0.1", 0, app, threaded=True)
+        threading.Thread(target=srv_p.serve_forever, daemon=True).start()
+        url_probe = f"http://127.0.0.1:{srv_p.server_port}"
+        try:
+            clock.t = start + duration + 100
+            codes = {name: post_probe(url_probe, tok) for name, tok in
+                     (("no token", None), ("wrong token", "w" * 30), ("right token", TOKEN))}
+            expect = {"optional": {"no token": 202, "wrong token": 401, "right token": 202},
+                      "required": {"no token": 401, "wrong token": 401, "right token": 202}}[a.auth]
+            check(codes == expect, f"POST with no / wrong / right token -> {codes['no token']} / {codes['wrong token']} / {codes['right token']} (expected {expect['no token']} / {expect['wrong token']} / {expect['right token']})")
+            if codes["right token"] == 202:
+                stored += 1                                   # the probe itself stored one (unlocked) reading
+            summary = get(f"{url_probe}/api/health")["ingest_auth"]
+            print(f"        /api/health ingest_auth: {json.dumps(summary)}")
+            if a.no_token and a.auth == "required":
+                check(dev.processed_total == 0, "a legacy device without a token delivered nothing in 'required' mode (all its POSTs got 401)")
+            elif a.no_token:
+                check(summary["missing_accepted"] > 0, f"in 'optional' mode the token-less legacy device was accepted and counted ({summary['missing_accepted']} requests)")
+            else:
+                probe_rejects = 1 if a.auth == "required" else 0          # the deliberate no-token probe above
+                check(summary["authenticated"] > 0 and summary["rejected_missing"] == probe_rejects,
+                      f"the token-bearing device authenticated ({summary['authenticated']} requests); the only missing-token rejection is my probe")
+            exp_day = datetime.fromtimestamp(start, timezone.utc).date().isoformat()
+            for label, hdr, want in (("no token", {}, 401), ("ingest token", {"X-Tremor-Token": TOKEN}, 401)):
+                try:
+                    urllib.request.urlopen(urllib.request.Request(f"{url_probe}/api/export/unit-1/{exp_day}", headers=hdr))
+                    got = 200
+                except urllib.error.HTTPError as e:
+                    got = e.code
+                check(got == want, f"/api/export with {label} -> {got}")
+        finally:
+            srv_p.shutdown()
 
     # retention: age the clock 20 days, let the guarded pruner run, and prove nothing was lost
     print("\nRetention (clock advanced 20 days, raw_days=14)")
@@ -415,7 +491,8 @@ def main():
               "aggregates keep mean/min/max/std of frequency, max |RoCoF| and the unlocked count")
         d0 = sorted(days)[0]
         day_iso = datetime.fromtimestamp(d0 * 86400, timezone.utc).date().isoformat()
-        with urllib.request.urlopen(f"{url3}/api/export/unit-1/{day_iso}") as r:
+        with urllib.request.urlopen(urllib.request.Request(f"{url3}/api/export/unit-1/{day_iso}",
+                                                            headers={"X-Tremor-Token": EXPORT_TOKEN})) as r:
             n_dl = len(gzip.decompress(r.read()).decode().splitlines()) - 1
         check(n_dl == days[d0].export_rows, f"the export downloads over HTTP intact: {n_dl} rows for {day_iso}")
     finally:

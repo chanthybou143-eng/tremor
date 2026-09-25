@@ -12,3 +12,10 @@ WIFI_PASSWORD = "your-network-password"
 UNIT_ID = "unit-1"
 
 INGEST_URL = "https://tremorgrid.pythonanywhere.com/api/ingest"
+
+# Optional per-unit ingest token, sent as the X-Tremor-Token header. It must match this unit's entry in
+# the server's TREMOR_INGEST_TOKENS setting. Generate one (>= 16 characters) with:
+#     python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Keep the real value ONLY in wifi_config.py on the Pico -- never commit it. Leave it out entirely
+# while the server's auth mode is "optional" and this unit has not been given a token yet.
+# INGEST_TOKEN = "paste-the-token-here"

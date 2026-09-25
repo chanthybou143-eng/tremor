@@ -194,9 +194,11 @@ seconds-of-day value belongs to. A reading with no usable GPS time is stored wit
 - **`ingest.py`** parses two payload generations. **v1 (Unit 1 today):** `gps_utc_s` = UTC seconds-of-day as a
   float32 (~4-8 ms, no date). **v2 (client prepared, not yet flashed):** batch-level `boot_id`, per-reading `seq`,
   and integer `gps: [days_since_1970, second_of_day, microsecond]` built on the device with integer-only
-  arithmetic (`pps_time_sync.PPSTimeSync.ticks_to_gps`), so it is exact and carries the device's own date. v2
-  still includes the float `gps_utc_s` so an older server keeps working. A time more than 1 h old or 5 s in the
-  future relative to receipt is flagged implausible, never trusted.
+  arithmetic (`pps_time_sync.PPSTimeSync.ticks_to_gps`), so it is exact and carries the device's own date. The
+  old float `gps_utc_s` is **not** sent in v2 by default (`SEND_LEGACY_FLOAT = False` in `wifi_unit_client.py`;
+  flip it to `True` at flash time only if a rolled-back pre-v2 server must keep reading times). Measured for a
+  60-reading POST body: v1 5,855 B, v2 6,776 B (+16%), v2 with the float 8,396 B (+43%). A time more than 1 h old
+  or 5 s in the future relative to receipt is flagged implausible, never trusted.
 - **`store.py`** is a small `ReadingStore` interface with one implementation, `SqliteReadingStore` (stdlib
   sqlite3, default rollback journal -- *not* WAL, PythonAnywhere's disk is NFS; one short-lived connection per
   call). Dedupe is `INSERT OR IGNORE` against partial unique indexes: v2 on `(unit_id, boot_id, seq)`, legacy on
@@ -216,10 +218,56 @@ seconds-of-day value belongs to. A reading with no usable GPS time is stored wit
   `/api/history?unit=&from=&to=&limit=` (hard limit 10,000; `resolution=raw|1min|auto`), `/api/health` (DB size,
   quota use with a warning at 80%, days needing attention), `/api/export/<unit>/<YYYY-MM-DD>`.
 - **Config (env):** `TREMOR_DB_PATH`, `TREMOR_QUOTA_MB` (512), `TREMOR_QUOTA_ROOT`, `TREMOR_RAW_DAYS`,
-  `TREMOR_EXPORT_DIR`, `TREMOR_EVENT_ROCOF_HZ_S`, `TREMOR_EVENT_FREQ_LO/HI`, `TREMOR_SQLITE_SYNCHRONOUS` (FULL).
+  `TREMOR_EXPORT_DIR`, `TREMOR_EVENT_ROCOF_HZ_S`, `TREMOR_EVENT_FREQ_LO/HI`, `TREMOR_SQLITE_SYNCHRONOUS` (FULL), plus the
+  access-control settings below.
 - **Running the tests:** the shared `.venv`'s editable install can point at another checkout; use
   `PYTHONPATH=src pytest` so the code under test is this tree. Tests that need "now" use `tests/helpers.py`'s
   `FakeClock` -- never the real clock (an earlier ingest test only passed near 11:23 UTC).
+
+### Access control (`security.py`)
+
+`/api/ingest` used to accept unauthenticated POSTs. It now supports a per-unit token in the `X-Tremor-Token`
+header; tokens live only in the environment (the PythonAnywhere WSGI file) and, on the Pico, in the gitignored
+`wifi_config.py` -- never in the repo (`tests/test_security.py` checks this).
+
+- **`TREMOR_INGEST_AUTH`:** `off` (default when no tokens are set) / `optional` (a missing token is accepted, logged
+  once per 10 min per unit and counted; a *wrong* token is rejected with 401) / `required`. Legacy Unit 1 cannot
+  send a token, so the rollout is `optional` now and `required` after the reflash; `/api/health` →
+  `ingest_auth` (`missing_accepted`, `units_seen_without_token`) shows when it is safe to flip.
+- **`TREMOR_INGEST_TOKENS`:** `unit-1=<token>,unit-2=<token>` (each >= 16 chars). A 401 never says whether the
+  token was missing or wrong; comparison is constant-time; misconfiguration raises at startup.
+- **`/api/export`:** disabled unless `TREMOR_EXPORT_TOKEN` is set; header-only (never in the URL); rate limited
+  (`TREMOR_EXPORT_RATE`, default 10/60 s per client). `/api/history` and `/api/health` stay public;
+  `/api/history` is rate limited per client (`TREMOR_HISTORY_RATE`, default 30/60 s). Behind a proxy set
+  `TREMOR_CLIENT_IP_HEADER` (e.g. `X-Real-IP`); `/api/health` shows `your_address_as_seen` so you can check.
+- Request bodies over 512 KB are refused before parsing.
+- **Client:** `INGEST_TOKEN` in `wifi_config.py` (optional) is sent by `wifi_unit_client.py` via
+  `timeout_post(extra_headers=...)` and never printed.
+
+### Flash-session checklist (NOT yet done -- the v2 client is committed but never flashed)
+
+Server first (see `deploy/DEPLOY_SERVER_PERSISTENCE.md`), client second. Before/while flashing the v2 client
+(`wifi_ingest.py`, `pps_time_sync.py`, `nmea_parser.py`, `wifi_unit_client.py`) run these ON THE DEVICE -- none
+of them could be checked on the host:
+
+1. **Floor division and modulo on negative ints.** `ticks_to_gps` relies on `//` and `%` flooring (Python
+   semantics) for a reading slightly *before* the anchor and for midnight rollover. On the Pico REPL:
+   `print(-1 // 1000000, -1 % 1000000, -250001 // 1000000, -250001 % 1000000)` must print
+   `-1 999999 -1 749999`.
+2. **`os.urandom` exists** (`import os; print(os.urandom(8))`). If not, the client falls back to the legacy
+   payload (no `boot_id`) by design -- but then dedupe is by GPS time only, so find out.
+3. **Heap headroom with the +17.6 KB** of new per-reading arrays (`seq`, `gday`, `gsec`, `gus` and a flag
+   byte, x600 x2 buffers). The soak's minimum free heap was 358,192 B; watch `heap_free` and
+   `heap_free_at_try_start` on the first STATUS lines and through a failure run (buffer full = worst case).
+4. **`json.dumps` of the v2 batch**: transient allocation for 60 readings (`seq`, `gps` list) is larger than
+   v1; confirm no `MemoryError` and that POST durations stay near the ~2.4 s median.
+5. **Integer time sanity**: with GPS locked, compare a `ticks_to_gps` triple against the RMC time/date at the
+   same PPS edge, and check it across a UTC midnight (09:30 ACST) if you can wait for one.
+6. **Token**: put `INGEST_TOKEN = "..."` in the Pico's `wifi_config.py` (never the repo), confirm the boot line
+   `# AUTH ingest token configured`, then watch `/api/health` `ingest_auth.authenticated` rise and
+   `missing_accepted` stop rising -- only then switch the server to `TREMOR_INGEST_AUTH=required`.
+7. **`SEND_LEGACY_FLOAT`**: leave `False` unless a pre-v2 server has to keep working.
+8. The PPS interval filter for `pps_time_sync.py` is a separate open item to go into the same flash session.
 
 ### Test tolerances are tied to real hardware constraints
 

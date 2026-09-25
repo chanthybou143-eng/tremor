@@ -12,12 +12,14 @@ from tremor.store import StoreError
 from tremor.webapp import HISTORY_MAX_LIMIT, create_app
 
 BOOT = "9f3a51c07d2e4b18"
+EXPORT_TOKEN = "export-token-0123456789abcdef"
+AUTH = {"X-Tremor-Token": EXPORT_TOKEN}
 
 
 @pytest.fixture
 def ctx(tmp_path):
     clock = FakeClock(T0)
-    app = create_app(simulated_units=[], db_path=str(tmp_path / "readings.db"), clock=clock,
+    app = create_app(simulated_units=[], db_path=str(tmp_path / "readings.db"), clock=clock, export_token=EXPORT_TOKEN,
                      retention_config=RetentionConfig(export_dir=str(tmp_path / "exports"), raw_days=14,
                                                       export_chunk_rows=500, prune_chunk_rows=500))
     yield app.test_client(), clock, app, tmp_path
@@ -308,13 +310,13 @@ def test_old_data_flows_through_retention_and_is_still_reachable_as_aggregates_a
     assert ancient["resolution"] == "1min" and sum(a["n"] for a in ancient["aggregates"]) == 600
     assert {"freq_mean", "freq_min", "freq_max", "freq_std", "rocof_max_abs", "n_unlocked"} <= set(ancient["aggregates"][0])
     # the gzip export can be pulled off the server, and matches
-    dl = client.get("/api/export/unit-1/2026-09-01")
+    dl = client.get("/api/export/unit-1/2026-09-01", headers=AUTH)
     assert dl.status_code == 200 and dl.mimetype == "application/gzip"
     lines = gzip.decompress(dl.data).decode().splitlines()
     assert len(lines) == 601 and lines[0].startswith("unit_id,")
-    assert client.get("/api/export/unit-1/2026-09-02").status_code == 404
-    assert client.get("/api/export/..%2Fetc/2026-09-01").status_code == 404
-    assert client.get("/api/export/unit-1/not-a-date").status_code == 404
+    assert client.get("/api/export/unit-1/2026-09-02", headers=AUTH).status_code == 404
+    assert client.get("/api/export/..%2Fetc/2026-09-01", headers=AUTH).status_code == 404
+    assert client.get("/api/export/unit-1/not-a-date", headers=AUTH).status_code == 404
 
 
 def test_health_flags_a_day_that_needs_attention(ctx):

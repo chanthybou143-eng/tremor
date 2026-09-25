@@ -74,9 +74,16 @@ from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer, make_boot_id
 from http_client import PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
+import wifi_config
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
 INGEST_HOST, INGEST_PORT, INGEST_PATH = parse_https_url(INGEST_URL)
+
+# Per-unit ingest token, sent as the X-Tremor-Token header. It lives ONLY in wifi_config.py on
+# the Pico (gitignored, like the WiFi password) -- never in this repo. Optional: a unit without
+# one still works while the server's auth mode is "optional". Never printed or logged.
+INGEST_TOKEN = getattr(wifi_config, "INGEST_TOKEN", None)
+_AUTH_HEADERS = {"X-Tremor-Token": INGEST_TOKEN} if INGEST_TOKEN else None
 
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
 # adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
@@ -495,7 +502,7 @@ def _post_batch(payload):
         try:
             status_code, _headers, _body = timeout_post(
                 INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
-                feed_fn=_feed_wdt)
+                extra_headers=_AUTH_HEADERS, feed_fn=_feed_wdt)
         finally:
             duration_us = time.ticks_diff(time.ticks_us(), _post_start_ticks)
             duration_s = duration_us / 1e6
@@ -563,15 +570,22 @@ def _post_batch(payload):
 # this build has no random source, run the legacy (v1) format instead -- a
 # repeated boot_id would restart seq at 0 and make the server silently discard
 # the new boot's readings as duplicates, which is worse than v1's GPS-time dedupe.
+# Also send the old float32 "gps_utc_s" in v2 payloads? Default False: the integer "gps"
+# triple carries the same time exactly and the float costs ~24 bytes per reading. Flip to
+# True at flash time ONLY if you need a rolled-back (pre-v2) server to keep reading times.
+SEND_LEGACY_FLOAT = False
+
 try:
     BOOT_ID = make_boot_id()
 except Exception as _exc:
     BOOT_ID = None
     print("# BOOT_ID_UNAVAILABLE {} -- using legacy payload".format(_exc))
 print("# BOOT_ID boot_id={}".format(BOOT_ID))
+print("# AUTH ingest token {}".format("configured" if _AUTH_HEADERS is not None else "absent"))
 
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS,
-                       max_readings_per_post=MAX_READINGS_PER_POST, boot_id=BOOT_ID)
+                       max_readings_per_post=MAX_READINGS_PER_POST, boot_id=BOOT_ID,
+                       send_legacy_float=SEND_LEGACY_FLOAT)
 
 _last_consumed_ticks = t0
 _elapsed_us_total = 0
@@ -711,10 +725,10 @@ while True:
             frequency_hz, amplitude_v = summarize_chunk(
                 _chunk_ts_s, _voltages, n=_chunk_len, filtered_buf=_filtered_buf)
             _last_tick = _chunk_ticks[_chunk_len - 1]
-            gps_utc_s = sync.ticks_to_utc(_last_tick)
-            # Full-precision integer UTC (days, second-of-day, microsecond) for the
-            # v2 payload; the float above is single precision (~4-8 ms) and is
-            # only kept for the legacy format / an older server.
+            # Full-precision integer UTC (days, second-of-day, microsecond) for the v2
+            # payload. The float32 time (~4-8 ms) is only needed for the legacy format, or
+            # in v2 when SEND_LEGACY_FLOAT is on -- otherwise skip computing it.
+            gps_utc_s = sync.ticks_to_utc(_last_tick) if (BOOT_ID is None or SEND_LEGACY_FLOAT) else None
             gps = sync.ticks_to_gps(_last_tick) if BOOT_ID is not None else None
             buffer.append(frequency_hz, amplitude_v, gps_utc_s, gps)
         except DegenerateTimestampsError as exc:

@@ -171,7 +171,8 @@ class IngestBuffer:
     more multi-second blocking stall.
     """
 
-    def __init__(self, unit_id, post_fn, max_readings=600, max_readings_per_post=None, boot_id=None):
+    def __init__(self, unit_id, post_fn, max_readings=600, max_readings_per_post=None, boot_id=None,
+                 send_legacy_float=False):
         self.unit_id = unit_id
         # boot_id=None -> the legacy (v1) wire format, exactly as before. A
         # boot_id (see make_boot_id) switches to v2: every reading carries a
@@ -179,6 +180,11 @@ class IngestBuffer:
         # carries the boot_id, so the server can drop retried duplicates exactly
         # and never confuses readings from two different power-ups.
         self.boot_id = boot_id
+        # v2 only: also send the old float32 "gps_utc_s" next to the integer time. Off by
+        # default -- it is ~24 bytes per reading and a v2 server does not need it. Turn it on
+        # (wifi_unit_client.SEND_LEGACY_FLOAT) only if a rollback to a pre-v2 server has to
+        # keep working: that server reads nothing but gps_utc_s for the reading's time.
+        self.send_legacy_float = send_legacy_float
         self._next_seq = 0
         self._post_fn = post_fn
         self._max_readings = max_readings
@@ -246,10 +252,9 @@ class IngestBuffer:
             r = {
                 "frequency_hz": buf.freq[idx],
                 "amplitude_v": buf.amp[idx] if buf.has_amp[idx] else None,
-                # kept in v2 too: an older server (rollback) still gets a usable
-                # (float32) time; a v2 server prefers "gps" below
-                "gps_utc_s": buf.gps[idx] if buf.has_gps[idx] else None,
             }
+            if not v2 or self.send_legacy_float:
+                r["gps_utc_s"] = buf.gps[idx] if buf.has_gps[idx] else None
             if v2:
                 r["seq"] = buf.seq[idx]
                 if buf.has_gpsi[idx]:

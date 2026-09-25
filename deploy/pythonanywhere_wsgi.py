@@ -24,6 +24,17 @@ os.environ.setdefault("TREMOR_QUOTA_MB", "512")
 # os.environ.setdefault("TREMOR_RAW_DAYS", "14")
 # os.environ.setdefault("TREMOR_SQLITE_SYNCHRONOUS", "FULL")   # NORMAL only if latency demands it
 
+# --- access control (see tremor/security.py). REAL VALUES GO ONLY IN THE FILE ON PYTHONANYWHERE,
+# never in this repo copy. Generate each token with:
+#     python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Phase 1 (legacy Unit 1 cannot send a token yet): "optional" accepts requests without a token
+# (logged + counted on /api/health) but rejects a wrong one. Phase 2 (after the reflash): "required".
+# os.environ["TREMOR_INGEST_TOKENS"] = "unit-1=<token-for-unit-1>"     # comma-separate more units
+# os.environ["TREMOR_INGEST_AUTH"] = "optional"                        # optional | required
+# os.environ["TREMOR_EXPORT_TOKEN"] = "<token-for-/api/export>"         # export is disabled without it
+# os.environ["TREMOR_CLIENT_IP_HEADER"] = "X-Real-IP"                  # only if remote_addr is the proxy (see the runbook)
+# os.environ["TREMOR_HISTORY_RATE"] = "30/60"                          # /api/history requests per seconds, per client
+
 # The venv created in the PythonAnywhere Bash console (see the "web" extra
 # / requirements.txt install steps) is selected via the Web tab's
 # "Virtualenv" field, not here -- this path only needs to make the tremor
