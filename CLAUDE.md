@@ -22,6 +22,8 @@ chain: 9 V AC plugpack → 39k/2.2k divider (measured scale factor 18.80) → 1
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # first-time setup
 .venv/bin/pytest -q                                          # run all tests
+PYTHONPATH=src python scripts/replay_unit1.py --hours 2       # end-to-end: real Flask server + simulated Unit 1 traffic
+python scripts/measure_db_latency.py --dir ~/tremor_data      # run ON PythonAnywhere: SQLite commit latency vs the device's 4 s deadline
 .venv/bin/pytest tests/test_frequency.py -v                  # one file
 .venv/bin/pytest tests/test_frequency.py::test_estimate_frequency_hand_built  # one test
 .venv/bin/pytest -k "noise"                                  # by keyword
@@ -140,6 +142,11 @@ isn't a `SyntheticFrequencySource`).
 
 ### Multi-unit web dashboard (`units.py`, `webapp.py`)
 
+> **Superseded in part by "Server persistence" below:** real (ingested) units are no longer kept in
+> `_UnitsState`'s receipt-time-stamped, 60 s in-memory buffers. They are stored permanently in SQLite under
+> the device's own GPS UTC time, and `/api/units` reads its window from the database. `_UnitsState` and
+> the paragraphs about receipt-time stamping / batch ids below still describe the *synthetic* feeds.
+
 A second, separate live view from the single-unit matplotlib dashboard
 above: a local Flask web app showing frequency + RoCoF for each of the 5
 planned units (only 2-3 simulated today; the rest render as "no data yet"
@@ -176,6 +183,43 @@ canvas sparklines, no build step, no charting library — that polls
 `GET /api/units` every second; `create_app()` takes `simulated_units`/
 `unit_slots` so tests can spin up an app with zero or one feed instead of
 all three.
+
+### Server persistence (`ingest.py`, `store.py`, `timeline.py`, `retention.py`)
+
+Every ingested reading is stored permanently under its **own GPS UTC time**, never receipt time. Receipt time
+is metadata (`received_at`); the only place the server uses it is to pick which UTC day a legacy
+seconds-of-day value belongs to. A reading with no usable GPS time is stored with `gps_utc_us` NULL and a flag
+(`flags & 1` unlocked, `& 2` implausible time) and is never plotted or given a time.
+
+- **`ingest.py`** parses two payload generations. **v1 (Unit 1 today):** `gps_utc_s` = UTC seconds-of-day as a
+  float32 (~4-8 ms, no date). **v2 (client prepared, not yet flashed):** batch-level `boot_id`, per-reading `seq`,
+  and integer `gps: [days_since_1970, second_of_day, microsecond]` built on the device with integer-only
+  arithmetic (`pps_time_sync.PPSTimeSync.ticks_to_gps`), so it is exact and carries the device's own date. v2
+  still includes the float `gps_utc_s` so an older server keeps working. A time more than 1 h old or 5 s in the
+  future relative to receipt is flagged implausible, never trusted.
+- **`store.py`** is a small `ReadingStore` interface with one implementation, `SqliteReadingStore` (stdlib
+  sqlite3, default rollback journal -- *not* WAL, PythonAnywhere's disk is NFS; one short-lived connection per
+  call). Dedupe is `INSERT OR IGNORE` against partial unique indexes: v2 on `(unit_id, boot_id, seq)`, legacy on
+  `(unit_id, gps_utc_us)`. Legacy *unlocked* readings cannot be deduplicated (no key) -- stored and flagged on
+  purpose, not matched by content. A storage failure is a `StoreError` -> HTTP 503, which is safe because the
+  device keeps its readings and ingest is idempotent.
+- **`timeline.py`** computes RoCoF over GPS-ordered points (one implementation shared by the live view, the
+  aggregates and event detection); it never bridges a `boot_id` change or a gap over 1.5 s.
+- **`retention.py`** keeps the disk bounded (free tier: 512 MB, ~12 MB/day/unit): raw rows older than
+  `TREMOR_RAW_DAYS` (14) are pruned **only after** the day is exported to gzip CSV, aggregated to 1-minute rows
+  (mean/min/max/std of freq, max |RoCoF|, locked/unlocked counts), and verified (export == database ==
+  aggregates, checksum intact). Raw rows within +/-5 min of |RoCoF| > 0.1 Hz/s or freq outside 49.85-50.15 Hz
+  are kept permanently (`events`). A day that fails verification is marked `attention` and is never pruned. It
+  runs opportunistically from the ingest path in small resumable chunks (no scheduler needed) and via
+  `python -m tremor.retention`.
+- **API:** `/api/units` (window from the DB; adds `gps_utc`, `unlocked_count`, `duplicates_ignored`),
+  `/api/history?unit=&from=&to=&limit=` (hard limit 10,000; `resolution=raw|1min|auto`), `/api/health` (DB size,
+  quota use with a warning at 80%, days needing attention), `/api/export/<unit>/<YYYY-MM-DD>`.
+- **Config (env):** `TREMOR_DB_PATH`, `TREMOR_QUOTA_MB` (512), `TREMOR_QUOTA_ROOT`, `TREMOR_RAW_DAYS`,
+  `TREMOR_EXPORT_DIR`, `TREMOR_EVENT_ROCOF_HZ_S`, `TREMOR_EVENT_FREQ_LO/HI`, `TREMOR_SQLITE_SYNCHRONOUS` (FULL).
+- **Running the tests:** the shared `.venv`'s editable install can point at another checkout; use
+  `PYTHONPATH=src pytest` so the code under test is this tree. Tests that need "now" use `tests/helpers.py`'s
+  `FakeClock` -- never the real clock (an earlier ingest test only passed near 11:23 UTC).
 
 ### Test tolerances are tied to real hardware constraints
 
