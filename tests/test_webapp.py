@@ -20,6 +20,13 @@ from tremor.webapp import (
 )
 from tremor.units import UnitReading
 
+from helpers import T0, FakeClock, v1_batch, v1_reading, v2_batch, v2_series
+
+
+def _app(tmp_path, clock=None):
+    """An app with an isolated database and a frozen clock (never the real one)."""
+    return create_app(simulated_units=[], db_path=str(tmp_path / "readings.db"), clock=clock or FakeClock(T0))
+
 
 def test_smoothed_history_suppresses_single_cycle_spike():
     # A stable series with one isolated outlier -- the kind of single bad
@@ -123,74 +130,69 @@ def test_api_units_route_goes_live_with_a_simulated_unit():
         app.config["TREMOR_SHUTDOWN"]()
 
 
-def test_api_ingest_accepts_a_batch_and_updates_the_unit():
-    app = create_app(simulated_units=[])
+def test_api_ingest_accepts_a_batch_and_updates_the_unit(tmp_path):
+    # Frozen clock + GPS times relative to it: the old version hard-coded gps_utc_s=41023.5
+    # (11:23 UTC) and only passed when the suite happened to run near that time of day.
+    app = _app(tmp_path)
     client = app.test_client()
     try:
-        resp = client.post("/api/ingest", json={
-            "unit_id": "unit-1",
-            "readings": [
-                {"frequency_hz": 49.98, "amplitude_v": 0.72, "gps_utc_s": 41023.5},
-                {"frequency_hz": 50.01, "amplitude_v": 0.73, "gps_utc_s": 41023.52},
-            ],
-        })
+        resp = client.post("/api/ingest", json=v1_batch("unit-1", [
+            v1_reading(49.98, T0 - 1.0, amp=0.72),
+            v1_reading(50.01, T0 - 0.98, amp=0.73),
+        ]))
         assert resp.status_code == 202
-        assert resp.get_json()["accepted"] == 2
+        body = resp.get_json()
+        assert (body["accepted"], body["inserted"], body["duplicates"]) == (2, 2, 0)
 
         data = client.get("/api/units").get_json()
         unit1 = next(u for u in data if u["id"] == "unit-1")
         assert unit1["status"] == "live"
         assert unit1["freq_hz"] == pytest.approx(49.995, abs=0.01)
         assert unit1["amplitude_v"] == pytest.approx(0.725, abs=0.01)
-        assert unit1["gps_utc_s"] == pytest.approx(41023.52)
+        # gps_utc_s keeps its old meaning (UTC seconds-of-day of the newest reading)...
+        assert unit1["gps_utc_s"] == pytest.approx((T0 - 0.98) % 86400, abs=0.01)
+        # ...and gps_utc is the same instant as absolute Unix seconds
+        assert unit1["gps_utc"] == pytest.approx(T0 - 0.98, abs=0.01)
+        assert unit1["gps_locked"] is True and unit1["unlocked_count"] == 0
     finally:
         app.config["TREMOR_SHUTDOWN"]()
 
 
-def test_api_ingest_spaces_batch_readings_by_reading_interval_not_compressed():
-    # Regression test: an earlier version stamped a batch's readings
-    # ~0.02s apart (modeled on per-mains-cycle spacing that never matched
-    # any real client) instead of the real ~1s-per-reading cadence
-    # wifi_unit_client.py actually uses. That compression divided a real
-    # ~1s frequency delta by an apparent ~0.02s gap, inflating RoCoF by
-    # ~50x -- invisible with only a frequency sparkline, but produced
-    # physically-impossible spikes once the dashboard started plotting
-    # RoCoF as its own line (a few tenths of a Hz/s is a large *real*
-    # swing; several Hz/s is not physically plausible).
-    app = create_app(simulated_units=[])
+def test_api_ingest_keeps_the_devices_own_one_second_spacing_however_late_the_batch_arrives(tmp_path):
+    # Regression (original intent): an earlier version stamped a batch's readings ~0.02s apart
+    # instead of the real ~1s cadence, inflating RoCoF ~50x -- physically impossible spikes.
+    # The server no longer stamps readings at all: each keeps its own GPS time, so spacing is
+    # the device's real 1 s no matter when the batch arrives. Delivering the batch 10 minutes
+    # late (a retry) must not move or compress anything.
+    clock = FakeClock(T0 + 600.0)
+    app = _app(tmp_path, clock)
     client = app.test_client()
     try:
-        # A gentle, realistic ramp: 0.01 Hz/s -- a full second apart, that's
-        # a tiny per-reading step, easy to blow up if timestamps are wrong.
-        readings = [{"frequency_hz": 50.0 + 0.01 * i} for i in range(8)]
-        resp = client.post("/api/ingest", json={"unit_id": "unit-1", "readings": readings})
-        assert resp.status_code == 202
+        # A gentle, realistic ramp: 0.01 Hz/s -- a tiny per-reading step, easy to blow up if
+        # timestamps are wrong. Measured 10 minutes before the batch is received.
+        readings = [v1_reading(50.0 + 0.01 * i, T0 + i) for i in range(8)]
+        assert client.post("/api/ingest", json=v1_batch("unit-1", readings)).status_code == 202
 
-        data = client.get("/api/units").get_json()
-        unit1 = next(u for u in data if u["id"] == "unit-1")
-
+        unit1 = next(u for u in client.get("/api/units").get_json() if u["id"] == "unit-1")
         history_ts = [t for t, _ in unit1["history"]]
         gaps = [b - a for a, b in zip(history_ts, history_ts[1:])]
-        assert all(gap == pytest.approx(1.0, abs=0.05) for gap in gaps)
+        assert all(gap == pytest.approx(1.0, abs=0.02) for gap in gaps)
+        assert history_ts[0] == pytest.approx(T0, abs=0.01)             # device time, NOT receipt time
+        assert abs(history_ts[0] - clock()) > 500
 
-        # True slope here is 0.01 Hz/s -- correct spacing should recover
-        # something in that ballpark, not an order-of-magnitude-inflated value.
-        assert abs(unit1["rocof_hz_s"]) < 0.5
+        assert unit1["rocof_hz_s"] == pytest.approx(0.01, abs=0.005)    # true slope, not inflated
     finally:
         app.config["TREMOR_SHUTDOWN"]()
 
 
-def test_api_ingest_accepts_a_new_unit_id_and_it_appears_automatically():
-    # The whole point of the dynamic roster: a unit_id nothing has seen
-    # before is accepted outright and shows up on the dashboard on its
-    # first batch -- no code change, no pre-registration.
-    app = create_app(simulated_units=[])
+def test_api_ingest_accepts_a_new_unit_id_and_it_appears_automatically(tmp_path):
+    # The whole point of the dynamic roster: a unit_id nothing has seen before is accepted
+    # outright and shows up on the dashboard on its first batch -- no code change, no
+    # pre-registration.
+    app = _app(tmp_path)
     client = app.test_client()
     try:
-        resp = client.post("/api/ingest", json={
-            "unit_id": "unit-7",
-            "readings": [{"frequency_hz": 50.0}],
-        })
+        resp = client.post("/api/ingest", json=v1_batch("unit-7", [v1_reading(50.0, T0 - 1.0)]))
         assert resp.status_code == 202
 
         data = client.get("/api/units").get_json()
@@ -202,8 +204,24 @@ def test_api_ingest_accepts_a_new_unit_id_and_it_appears_automatically():
         app.config["TREMOR_SHUTDOWN"]()
 
 
-def test_api_ingest_rejects_empty_unit_id():
-    app = create_app(simulated_units=[])
+def test_a_unit_that_has_only_unlocked_readings_appears_with_an_explicit_count_and_no_trace(tmp_path):
+    # No GPS time -> stored and flagged, never plotted, never stamped with receipt time.
+    app = _app(tmp_path)
+    client = app.test_client()
+    try:
+        for i in range(3):
+            assert client.post("/api/ingest", json=v1_batch("unit-7", [v1_reading(50.0 + i * 0.01, None)])).status_code == 202
+        unit = client.get("/api/units").get_json()[0]
+        assert unit["id"] == "unit-7" and unit["status"] == "live" and unit["gps_locked"] is False
+        assert unit["unlocked_count"] == 3
+        assert unit["freq_hz"] is None and unit["history"] == [] and unit["rocof_history"] == []
+        assert unit["completeness_pct"] is None
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_api_ingest_rejects_empty_unit_id(tmp_path):
+    app = _app(tmp_path)
     client = app.test_client()
     try:
         resp = client.post("/api/ingest", json={
@@ -216,8 +234,8 @@ def test_api_ingest_rejects_empty_unit_id():
         app.config["TREMOR_SHUTDOWN"]()
 
 
-def test_api_ingest_rejects_missing_frequency():
-    app = create_app(simulated_units=[])
+def test_api_ingest_rejects_missing_frequency(tmp_path):
+    app = _app(tmp_path)
     client = app.test_client()
     try:
         resp = client.post("/api/ingest", json={
@@ -293,41 +311,46 @@ def test_reproduces_the_impossible_rocof_if_batches_were_naively_bridged():
     )
 
 
-def test_server_does_not_bridge_close_batches_without_gps_confirmation(monkeypatch):
-    """The actual fix, exercised through the real /api/ingest HTTP path
-    with the exact batch shape from the reproduction above (no gps_utc_s
-    on either batch, matching a device that hasn't acquired PPS lock --
-    also the incident's real condition, since GPS-synced-and-still-wrong
-    was never the failure mode)."""
-    app = create_app(simulated_units=[])
+def test_server_does_not_bridge_across_a_boot_id_change(tmp_path):
+    """The incident this guards (7714d2a): a crash-triggered restart's first small batch landed
+    close to the tail of the pre-crash batch, and the OLD receipt-time reconstruction fooled
+    RoCoF into a physically impossible -22.953 Hz/s. Timestamps are now the device's own GPS
+    time, and a fit is never allowed to span a boot_id change -- even when the GPS times say the
+    two readings are only half a second apart (the exact shape of the reproduction above)."""
+    clock = FakeClock(T0)
+    app = _app(tmp_path, clock)
     client = app.test_client()
     try:
-        # chain + repeat: the two POSTs need exactly these two values, but
-        # snapshot()'s own `now = time.time()` call afterward needs one
-        # more -- hold at the last value rather than run out.
-        times = itertools.chain([1000.0, 1000.02], itertools.repeat(1000.02))
-        monkeypatch.setattr("tremor.webapp.time.time", lambda: next(times))
+        clock.t = T0 - 2.0
+        pre = v2_series("unit-1", "aaaaaaaaaaaaaaaa", T0 - 10.0, 8, freq=lambda i: 50.00)     # T0-10 .. T0-3
+        assert client.post("/api/ingest", json=pre).status_code == 202
+        clock.t = T0 - 1.0
+        post = v2_series("unit-1", "bbbbbbbbbbbbbbbb", T0 - 2.5, 1, freq=lambda i: 49.50)     # 0.5 s after, new boot
+        assert client.post("/api/ingest", json=post).status_code == 202
 
-        client.post("/api/ingest", json={
-            "unit_id": "unit-1",
-            "readings": [{"frequency_hz": 50.00} for _ in range(8)],
-        })
-        resp = client.post("/api/ingest", json={
-            "unit_id": "unit-1",
-            "readings": [{"frequency_hz": 49.50}],
-        })
-        assert resp.status_code == 202
-
-        data = client.get("/api/units").get_json()
-        unit1 = next(u for u in data if u["id"] == "unit-1")
-
-        # No eligible cross-batch pair exists (different batch_ids, no GPS
-        # on either side) -- batch 2's reading contributes no new RoCoF
-        # point, so the last stored value stays whatever batch 1's own
-        # (8 identical readings, same batch) least-squares fit produced --
-        # ~0, modulo floating-point noise, never the naive-bridge value.
+        unit1 = next(u for u in client.get("/api/units").get_json() if u["id"] == "unit-1")
+        # the 49.50 Hz reading is on the chart (it is real, GPS-timed) ...
+        assert unit1["history"][-1][1] == pytest.approx(49.50, abs=0.01)
+        # ... but contributes no RoCoF point, so nothing impossible exists anywhere
         assert unit1["rocof_hz_s"] == pytest.approx(0.0, abs=1e-6)
         assert all(abs(r) <= ROCOF_PLAUSIBILITY_LIMIT_HZ_S for _t, r in unit1["rocof_history"])
+        assert unit1["rocof_history"][-1][0] < T0 - 2.5
+        assert unit1["rocof_suppressed_count"] >= 1
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_legacy_batches_with_gps_still_bridge_normally_through_the_api(tmp_path):
+    # Overcorrection guard, at the HTTP level: two v1 batches (no boot_id) whose GPS times are
+    # 0.5 s apart compute an ordinary RoCoF (0.02 Hz / 0.5 s = 0.04 Hz/s).
+    clock = FakeClock(T0)
+    app = _app(tmp_path, clock)
+    client = app.test_client()
+    try:
+        client.post("/api/ingest", json=v1_batch("unit-1", [v1_reading(50.00, T0 - 2.0)]))
+        client.post("/api/ingest", json=v1_batch("unit-1", [v1_reading(50.02, T0 - 1.5)]))
+        unit1 = next(u for u in client.get("/api/units").get_json() if u["id"] == "unit-1")
+        assert unit1["rocof_hz_s"] == pytest.approx(0.04, abs=0.01)
     finally:
         app.config["TREMOR_SHUTDOWN"]()
 

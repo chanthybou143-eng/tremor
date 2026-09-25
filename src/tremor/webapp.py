@@ -17,17 +17,28 @@ synthetic-specific.
 
 from __future__ import annotations
 
+import logging
+import os
+import re
 import statistics
+import tempfile
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Deque, Dict, List, Optional, Tuple
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
+from .ingest import PayloadError, parse_payload
+from .retention import RetentionConfig, RetentionEngine, day_to_date
 from .rocof import rocof_from_window
+from .store import DAY_US, US, ReadingStore, Row, StoreError, UnitState, open_store
+from .timeline import rocof_series
 from .units import SyntheticUnitFeed, UnitFeed, UnitReading
+
+log = logging.getLogger("tremor.webapp")
 
 WINDOW_S = 60.0
 # Longer than the single-unit matplotlib dashboard's 500ms: per-unit
@@ -419,18 +430,160 @@ def _consume(
         state.add_reading(unit_id, reading)
 
 
+# --- DB-backed units ---------------------------------------------------------
+# Real (ingested) units are read from the ReadingStore, ordered by each
+# reading's own GPS UTC time -- so a late or retried batch lands where it was
+# actually measured, and nothing is stamped with receipt time. Synthetic feeds
+# keep using _UnitsState above (they have no GPS time and no persistence).
+
+HISTORY_DEFAULT_LIMIT = 1000
+HISTORY_MAX_LIMIT = 10_000
+HISTORY_DEFAULT_SPAN_S = 3600.0
+QUOTA_WARNING_FRACTION = 0.8
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _db_unit_snapshot(u: UnitState, rows: List[Row], now: float) -> dict:
+    seconds_since = now - u.last_received_at
+    out = dict(
+        id=u.unit_id,
+        label=_default_label(u.unit_id),
+        status="stale" if seconds_since > STALE_THRESHOLD_S else "live",
+        # gps_utc_s keeps its old meaning (UTC seconds-of-day of the newest reading);
+        # gps_utc is the same instant as absolute Unix seconds.
+        gps_utc_s=(u.last_gps_us % DAY_US) / US if u.last_gps_us is not None else None,
+        gps_utc=u.last_gps_us / US if u.last_gps_us is not None else None,
+        gps_locked=u.last_gps_locked,
+        seconds_since_last_reading=seconds_since,
+        # Readings held without a usable GPS time: stored and flagged, never plotted.
+        unlocked_count=u.unlocked_total,
+        implausible_time_count=u.implausible_total,
+        duplicates_ignored=u.duplicates_total,
+    )
+    if not rows:
+        out.update(
+            freq_hz=None, rocof_hz_s=None, history=[], rocof_history=[], amplitude_v=None,
+            samples_per_minute=0, completeness_pct=None, gaps=[], rocof_gaps=[],
+            rocof_suppressed_count=0,
+        )
+        return out
+    pts = [(r.gps_utc_us / US, r.freq_hz, r.boot_id) for r in rows]
+    latest_t = pts[-1][0]
+    series = rocof_series(pts, MAX_ROCOF_GAP_S, ROCOF_PLAUSIBILITY_LIMIT_HZ_S)
+    recent = [f for t, f, _b in pts if latest_t - t <= READOUT_WINDOW_S]
+    recent_amp = [
+        r.amplitude_v for r in rows
+        if r.amplitude_v is not None and latest_t - r.gps_utc_us / US <= READOUT_WINDOW_S
+    ]
+    history_points = [(t, f) for t, f, _b in pts]
+    seconds_with_data = {int(t // 1.0) for t, _f, _b in pts if latest_t - t <= COMPLETENESS_WINDOW_S}
+    out.update(
+        freq_hz=statistics.median(recent),
+        rocof_hz_s=series.points[-1][1] if series.points else 0.0,
+        history=[list(p) for p in _smoothed_history(history_points)],
+        rocof_history=[list(p) for p in series.points],
+        amplitude_v=statistics.median(recent_amp) if recent_amp else None,
+        samples_per_minute=len([1 for t, _f, _b in pts if latest_t - t <= 60.0]),
+        completeness_pct=min(100.0, 100.0 * len(seconds_with_data) / COMPLETENESS_WINDOW_S),
+        gaps=_find_gaps(history_points),
+        rocof_gaps=_find_gaps(series.points),
+        rocof_suppressed_count=series.skipped_boundary + series.skipped_implausible,
+    )
+    return out
+
+
+def _parse_time_us(v: str) -> int:
+    """Unix seconds (float) or an ISO-8601 UTC timestamp -> integer microseconds."""
+    try:
+        return int(round(float(v) * US))
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"cannot parse time {v!r} (use Unix seconds or ISO-8601 UTC)") from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - _EPOCH) // timedelta(microseconds=1)
+
+
+def _dir_size(path: str) -> int:
+    total = 0
+    stack = [path]
+    while stack:
+        p = stack.pop()
+        try:
+            with os.scandir(p) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        elif e.is_file(follow_symlinks=False):
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total
+
+
+class _TtlCache:
+    def __init__(self):
+        self._v: Dict[str, Tuple[float, object]] = {}
+
+    def get(self, key: str, ttl_s: float, fn):
+        now = time.monotonic()
+        hit = self._v.get(key)
+        if hit is not None and now - hit[0] < ttl_s:
+            return hit[1]
+        val = fn()
+        self._v[key] = (now, val)
+        return val
+
+
+def _row_json(r: Row) -> dict:
+    return dict(
+        t=r.gps_utc_us / US if r.gps_utc_us is not None else None,
+        gps_utc_us=r.gps_utc_us, freq_hz=r.freq_hz, amplitude_v=r.amplitude_v,
+        boot_id=r.boot_id, seq=r.seq, flags=r.flags, time_src=r.time_src,
+        gps_locked=bool(r.gps_locked), received_at=r.received_at, id=r.id,
+    )
+
+
 def create_app(
     simulated_units: Optional[List[dict]] = None,
+    db_path: Optional[str] = None,
+    clock=time.time,
+    retention_config: Optional[RetentionConfig] = None,
+    quota_bytes: Optional[int] = None,
+    quota_root: Optional[str] = None,
 ) -> Flask:
+    """``db_path`` (else $TREMOR_DB_PATH, else an ephemeral temp file) is where
+    every ingested reading is stored permanently. ``clock`` supplies receipt time
+    and staleness -- injectable so tests can freeze it."""
     simulated_units = SIMULATED_UNITS if simulated_units is None else simulated_units
+
+    db_path = db_path or os.environ.get("TREMOR_DB_PATH")
+    if not db_path:
+        db_path = os.path.join(tempfile.mkdtemp(prefix="tremor-"), "readings.db")
+        log.warning("TREMOR_DB_PATH not set: using an EPHEMERAL database at %s", db_path)
+    store: ReadingStore = open_store(
+        db_path, synchronous=os.environ.get("TREMOR_SQLITE_SYNCHRONOUS", "FULL"))
+    cfg = retention_config or RetentionConfig.from_env(
+        os.path.join(os.path.dirname(os.path.abspath(db_path)), "exports"))
+    engine = RetentionEngine(store, cfg, clock)
+    if quota_bytes is None:
+        quota_bytes = int(float(os.environ.get("TREMOR_QUOTA_MB", "512")) * 1024 * 1024)
+    quota_root = quota_root or os.environ.get("TREMOR_QUOTA_ROOT") or None
+    size_cache = _TtlCache()
 
     state = _UnitsState()
     stop_event = threading.Event()
     feeds_and_threads = []
 
-    for cfg in simulated_units:
-        unit_id = cfg["unit_id"]
-        feed_kwargs = {k: v for k, v in cfg.items() if k != "unit_id"}
+    for cfg_u in simulated_units:
+        unit_id = cfg_u["unit_id"]
+        feed_kwargs = {k: v for k, v in cfg_u.items() if k != "unit_id"}
         feed = SyntheticUnitFeed(unit_id=unit_id, label=_default_label(unit_id), **feed_kwargs)
         feed.start()
         consumer = threading.Thread(
@@ -447,87 +600,175 @@ def create_app(
 
     @app.get("/api/units")
     def api_units():
-        return jsonify(state.snapshot())
+        out = state.snapshot()                                  # synthetic feeds only
+        try:
+            now = clock()
+            db_units = []
+            for u in store.unit_states():
+                db_units.append(_db_unit_snapshot(u, store.window(u.unit_id, WINDOW_S), now))
+        except StoreError as exc:
+            log.error("/api/units: storage unavailable: %s", exc)
+            return jsonify(error="storage unavailable"), 503
+        ids = {d["id"] for d in db_units}
+        return jsonify([s for s in out if s["id"] not in ids] + db_units)
 
     @app.post("/api/ingest")
     def api_ingest():
         """Batched ingest for a real unit's readings -- what a Pico's WiFi
-        client will eventually POST, one batch per uplink. Body shape:
-            {"unit_id": "unit-1",
-             "readings": [{"frequency_hz": 49.98, "amplitude_v": 0.72,
-                            "gps_utc_s": 41023.5}, ...]}
-        amplitude_v/gps_utc_s are optional per-reading (gps_utc_s is blank
-        on the device until PPS sync, same as overnight_log.py's schema).
-        unit_id isn't checked against a fixed roster -- a new unit_id gets
-        its own dashboard card automatically on its first accepted batch
-        (see _UnitsState.add_reading), no code change needed to "add" it.
-        Readings are timestamped by server receipt time, not gps_utc_s --
-        gps_utc_s is seconds-of-day and can be absent pre-sync, so it isn't
-        safe as the window/RoCoF ordering key; it's stored alongside purely
-        as metadata. Readings within a batch are spaced READING_INTERVAL_S
-        apart, working backward from receipt time (the last reading in the
-        batch lands ~now, earlier ones progressively before it) -- matching
-        wifi_unit_client.py's real one-reading-per-second cadence, not
-        compressed into a few milliseconds. Compressing them (an earlier
-        version used a flat 0.02s step, modeled on per-mains-cycle spacing
-        that never matched any real client) corrupted rocof_from_window's
-        slope: dividing a real ~1s frequency delta by an apparent ~0.02s
-        gap inflated RoCoF by ~50x, visible on the dashboard as physically
-        impossible spikes and gave the chart's line a bursts-with-gaps
-        shape instead of a continuous trace.
+        client POSTs, one batch per uplink. Two payload generations (see
+        ingest.py): legacy v1 (``gps_utc_s`` seconds-of-day float) and v2
+        (``boot_id`` + per-reading ``seq`` + integer ``gps`` time).
+
+        Readings are stored under their own GPS UTC time. Receipt time is only
+        metadata (and, for v1 alone, the hint that picks which calendar day the
+        device's seconds-of-day belongs to). Retried batches are idempotent:
+        duplicates are ignored, so any failure here is safe for the device to
+        retry -- which is why a storage failure answers 503, not 200.
         """
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict):
-            return jsonify(error="expected a JSON object"), 400
+        try:
+            batch = parse_payload(request.get_json(silent=True))
+        except PayloadError as exc:
+            return jsonify(error=str(exc)), 400
+        try:
+            res = store.ingest(batch, clock())
+        except StoreError as exc:
+            log.error("/api/ingest: storage unavailable: %s", exc)
+            resp = jsonify(error="storage unavailable")
+            resp.status_code = 503
+            resp.headers["Retry-After"] = "30"
+            return resp
+        resp = jsonify(accepted=res.accepted, inserted=res.inserted, duplicates=res.duplicates,
+                       unlocked=res.unlocked, implausible=res.implausible)
+        resp.status_code = 202
+        resp.call_on_close(engine.maybe_step)       # after the device has its answer
+        return resp
 
-        unit_id = payload.get("unit_id")
-        if not isinstance(unit_id, str) or not unit_id.strip():
-            return jsonify(error=f"invalid unit_id {unit_id!r}"), 400
+    @app.get("/api/history")
+    def api_history():
+        unit = request.args.get("unit", "")
+        if not unit:
+            return jsonify(error="unit is required"), 400
+        try:
+            limit = int(request.args.get("limit", HISTORY_DEFAULT_LIMIT))
+            after_id = int(request.args.get("after_id", 0))
+            if limit < 1:
+                raise ValueError("limit must be >= 1")
+            limit = min(limit, HISTORY_MAX_LIMIT)
+            include_unlocked = request.args.get("include_unlocked", "0") in ("1", "true", "yes")
+            res_mode = request.args.get("resolution", "auto")
+            if res_mode not in ("raw", "1min", "auto"):
+                raise ValueError("resolution must be raw, 1min or auto")
+            to_us = _parse_time_us(request.args["to"]) if "to" in request.args else None
+            from_us = _parse_time_us(request.args["from"]) if "from" in request.args else None
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        try:
+            states = {u.unit_id: u for u in store.unit_states()}
+            if unit not in states:
+                return jsonify(error=f"unknown unit {unit!r}"), 404
+            if to_us is None:
+                to_us = states[unit].last_gps_us if states[unit].last_gps_us is not None else int(clock() * US)
+            if from_us is None:
+                from_us = to_us - int(HISTORY_DEFAULT_SPAN_S * US)
+            if from_us > to_us:
+                return jsonify(error="from must not be after to"), 400
+            if res_mode == "auto":
+                raw_floor = (clock() - cfg.raw_days * 86400) * US
+                res_mode = "raw" if from_us >= raw_floor else "1min"
+            if res_mode == "1min":
+                aggs = store.aggregates(unit, from_us // (60 * US), to_us // (60 * US), limit + 1)
+                truncated = len(aggs) > limit
+                aggs = aggs[:limit]
+                return jsonify(
+                    unit=unit, resolution="1min", from_us=from_us, to_us=to_us, limit=limit,
+                    count=len(aggs), truncated=truncated,
+                    next_from_us=(aggs[-1].minute + 1) * 60 * US if truncated else None,
+                    aggregates=[dict(minute=a.minute, t=a.minute * 60.0, n=a.n, n_unlocked=a.n_unlocked,
+                                     freq_mean=a.freq_mean, freq_min=a.freq_min, freq_max=a.freq_max,
+                                     freq_std=a.freq_std, rocof_max_abs=a.rocof_max_abs,
+                                     amp_mean=a.amp_mean) for a in aggs])
+            # Unlocked rows have no GPS time; without an explicit `to`, list every one received
+            # up to now rather than cutting them off at the newest GPS-timed reading.
+            page = store.history(unit, from_us, to_us, limit, after_id=after_id,
+                                 include_unlocked=include_unlocked,
+                                 unlocked_to_us=None if "to" in request.args else int(clock() * US))
+        except StoreError as exc:
+            log.error("/api/history: storage unavailable: %s", exc)
+            return jsonify(error="storage unavailable"), 503
+        body = dict(unit=unit, resolution="raw", from_us=from_us, to_us=to_us, limit=limit,
+                    count=len(page.rows), truncated=page.truncated,
+                    next_from_us=page.next_from_us, next_after_id=page.next_after_id,
+                    readings=[_row_json(r) for r in page.rows])
+        if include_unlocked:
+            body["unlocked"] = [_row_json(r) for r in page.unlocked]
+        return jsonify(body)
 
-        readings = payload.get("readings")
-        if not isinstance(readings, list) or not readings:
-            return jsonify(error="'readings' must be a non-empty list"), 400
+    @app.get("/api/health")
+    def api_health():
+        try:
+            h = store.health()
+            units = store.unit_states()
+        except StoreError as exc:
+            return jsonify(status="error", error=str(exc)), 503
+        exports = size_cache.get("exports", 60.0, lambda: _dir_size(cfg.export_dir))
+        if quota_root:
+            used = size_cache.get("root", 600.0, lambda: _dir_size(quota_root))
+            measured = f"all files under {quota_root}"
+        else:
+            used = h["db_bytes"] + h["journal_bytes"] + exports
+            measured = "database + exports only (set TREMOR_QUOTA_ROOT to measure the whole quota)"
+        frac = used / quota_bytes if quota_bytes else 0.0
+        warning = frac >= QUOTA_WARNING_FRACTION
+        status = "attention" if h["days_needing_attention"] else ("warning" if warning else "ok")
+        now = clock()
+        return jsonify(
+            status=status, server_time=now,
+            storage=dict(db_bytes=h["db_bytes"], journal_bytes=h["journal_bytes"], exports_bytes=exports,
+                         used_bytes=used, quota_bytes=quota_bytes, used_fraction=round(frac, 4),
+                         warning=warning, warning_threshold=QUOTA_WARNING_FRACTION, measured=measured),
+            store=h,
+            retention=dict(raw_days=cfg.raw_days, rocof_event_hz_s=cfg.rocof_event_hz_s,
+                           freq_band=[cfg.freq_lo, cfg.freq_hi], event_margin_s=cfg.event_margin_s,
+                           export_dir=cfg.export_dir),
+            units=[dict(unit_id=u.unit_id, last_received_at=u.last_received_at,
+                        seconds_since_last_reading=now - u.last_received_at,
+                        readings_total=u.readings_total, unlocked_total=u.unlocked_total,
+                        duplicates_total=u.duplicates_total, implausible_total=u.implausible_total)
+                   for u in units],
+        )
 
-        parsed = []
-        for r in readings:
-            if not isinstance(r, dict):
-                return jsonify(error="each reading must be an object"), 400
-            try:
-                freq_hz = float(r["frequency_hz"])
-                amplitude_v = float(r["amplitude_v"]) if r.get("amplitude_v") is not None else None
-                gps_utc_s = float(r["gps_utc_s"]) if r.get("gps_utc_s") is not None else None
-            except (KeyError, TypeError, ValueError):
-                return jsonify(error="each reading needs a numeric frequency_hz"), 400
-            parsed.append((freq_hz, amplitude_v, gps_utc_s))
-
-        now = time.time()
-        n = len(parsed)
-        batch_id = state.next_batch_id()  # see _fit_time_for_point: every reading in
-                                           # this POST shares one id, distinguishing
-                                           # "same batch" from "different batch" for
-                                           # the RoCoF cross-batch guard
-        for i, (freq_hz, amplitude_v, gps_utc_s) in enumerate(parsed):
-            state.add_reading(unit_id, UnitReading(
-                t=now - (n - 1 - i) * READING_INTERVAL_S,
-                freq_hz=freq_hz,
-                amplitude_v=amplitude_v,
-                gps_utc_s=gps_utc_s,
-            ), batch_id=batch_id)
-
-        return jsonify(accepted=len(parsed)), 202
+    @app.get("/api/export/<unit>/<day>")
+    def api_export(unit, day):
+        """Download one day's gzip CSV export (so it can be pulled off the server)."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", unit) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            return jsonify(error="not found"), 404
+        try:
+            d = (datetime.strptime(day, "%Y-%m-%d").date() - day_to_date(0)).days
+        except ValueError:
+            return jsonify(error="not found"), 404
+        path = engine.export_path(unit, d)
+        if not os.path.isfile(path):
+            return jsonify(error="not found"), 404
+        return send_file(path, mimetype="application/gzip", as_attachment=True,
+                         download_name=os.path.basename(path))
 
     def shutdown() -> None:
         stop_event.set()
         for feed, _thread in feeds_and_threads:
             feed.stop()
+        store.close()
 
     app.config["TREMOR_STATE"] = state
+    app.config["TREMOR_STORE"] = store
+    app.config["TREMOR_RETENTION"] = engine
     app.config["TREMOR_SHUTDOWN"] = shutdown
     return app
 
 
 def main() -> None:
-    app = create_app()
+    db_path = os.environ.get("TREMOR_DB_PATH") or os.path.join(
+        os.path.expanduser("~"), "tremor_data", "readings.db")
+    app = create_app(db_path=db_path)
     try:
         app.run(host="127.0.0.1", port=5000, debug=False)
     finally:

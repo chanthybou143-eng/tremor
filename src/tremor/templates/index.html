@@ -383,6 +383,17 @@ function updateCard(card, unit) {
     staleBanner.hidden = true;
   }
 
+  // A unit that has reported, but only readings without a usable GPS time: they are
+  // stored and counted, never plotted (a reading is only ever placed on the time axis
+  // by its own GPS time), so there is no frequency to show -- say so explicitly.
+  if (unit.freq_hz == null) {
+    card.querySelector('.reading.freq .value').textContent = '\u2014';
+    card.querySelector('.reading.rocof .value').textContent = '\u2014';
+    completeness.textContent =
+      `No GPS lock \u2014 ${unit.unlocked_count || 0} reading(s) held, not plotted`;
+    rocofSuppressed.hidden = true;
+    return;
+  }
   card.querySelector('.reading.freq .value').textContent = unit.freq_hz.toFixed(3);
   const rocof = unit.rocof_hz_s;
   card.querySelector('.reading.rocof .value').textContent =
