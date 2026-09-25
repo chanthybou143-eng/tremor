@@ -61,6 +61,14 @@ class _RingStorage:
         self.has_amp = bytearray(capacity)
         self.gps = array.array(FLOAT_TYPECODE, [0.0] * capacity)
         self.has_gps = bytearray(capacity)
+        # v2 payload fields (see IngestBuffer's boot_id). Integer typecodes only:
+        # seq is a per-boot reading counter; the gps triple is the device's
+        # full-precision integer UTC from PPSTimeSync.ticks_to_gps().
+        self.seq = array.array("I", [0] * capacity)
+        self.gday = array.array("H", [0] * capacity)      # days since 1970-01-01
+        self.gsec = array.array("I", [0] * capacity)      # second of day
+        self.gus = array.array("I", [0] * capacity)       # microsecond
+        self.has_gpsi = bytearray(capacity)
         self.head = 0
         self.count = 0
 
@@ -163,8 +171,15 @@ class IngestBuffer:
     more multi-second blocking stall.
     """
 
-    def __init__(self, unit_id, post_fn, max_readings=600, max_readings_per_post=None):
+    def __init__(self, unit_id, post_fn, max_readings=600, max_readings_per_post=None, boot_id=None):
         self.unit_id = unit_id
+        # boot_id=None -> the legacy (v1) wire format, exactly as before. A
+        # boot_id (see make_boot_id) switches to v2: every reading carries a
+        # per-boot sequence number and the integer GPS time, and the batch
+        # carries the boot_id, so the server can drop retried duplicates exactly
+        # and never confuses readings from two different power-ups.
+        self.boot_id = boot_id
+        self._next_seq = 0
         self._post_fn = post_fn
         self._max_readings = max_readings
         self._max_readings_per_post = (
@@ -179,7 +194,12 @@ class IngestBuffer:
     def __len__(self):
         return self._storages[self._active].count  # unlocked -- see class docstring
 
-    def append(self, frequency_hz, amplitude_v, gps_utc_s=None):
+    def append(self, frequency_hz, amplitude_v, gps_utc_s=None, gps=None):
+        """gps: optional (days_since_1970, second_of_day, microsecond) ints from
+        PPSTimeSync.ticks_to_gps(); only sent when a boot_id is set. seq is
+        assigned here, for EVERY reading including ones later dropped from a
+        full buffer, so a gap in the sequence the server sees is exactly the
+        readings this device lost."""
         self._lock.acquire()
         try:
             buf = self._storages[self._active]
@@ -189,6 +209,15 @@ class IngestBuffer:
                 self.dropped_count += 1
             else:
                 buf.count += 1
+            buf.seq[idx] = self._next_seq
+            self._next_seq += 1
+            if gps is None:
+                buf.has_gpsi[idx] = 0
+            else:
+                buf.gday[idx] = gps[0]
+                buf.gsec[idx] = gps[1]
+                buf.gus[idx] = gps[2]
+                buf.has_gpsi[idx] = 1
             buf.freq[idx] = frequency_hz
             if amplitude_v is None:
                 buf.has_amp[idx] = 0
@@ -211,17 +240,28 @@ class IngestBuffer:
         # safe to call with a large n (see the docstring's caveat about the
         # uncapped default).
         readings = []
+        v2 = self.boot_id is not None
         for i in range(n):
             idx = (buf.head + i) % self._max_readings
-            readings.append({
+            r = {
                 "frequency_hz": buf.freq[idx],
                 "amplitude_v": buf.amp[idx] if buf.has_amp[idx] else None,
+                # kept in v2 too: an older server (rollback) still gets a usable
+                # (float32) time; a v2 server prefers "gps" below
                 "gps_utc_s": buf.gps[idx] if buf.has_gps[idx] else None,
-            })
-        return {
+            }
+            if v2:
+                r["seq"] = buf.seq[idx]
+                if buf.has_gpsi[idx]:
+                    r["gps"] = [buf.gday[idx], buf.gsec[idx], buf.gus[idx]]
+            readings.append(r)
+        payload = {
             "unit_id": self.unit_id,
             "readings": readings,
         }
+        if v2:
+            payload["boot_id"] = self.boot_id
+        return payload
 
     def _merge_failed_batch(self, send_buf, current):
         """Prepend send_buf's un-sent readings (chronologically older) in
@@ -248,6 +288,11 @@ class IngestBuffer:
             current.has_amp[current.head] = send_buf.has_amp[src_idx]
             current.gps[current.head] = send_buf.gps[src_idx]
             current.has_gps[current.head] = send_buf.has_gps[src_idx]
+            current.seq[current.head] = send_buf.seq[src_idx]
+            current.gday[current.head] = send_buf.gday[src_idx]
+            current.gsec[current.head] = send_buf.gsec[src_idx]
+            current.gus[current.head] = send_buf.gus[src_idx]
+            current.has_gpsi[current.head] = send_buf.has_gpsi[src_idx]
         current.count += n_to_prepend
 
         send_buf.head = 0
@@ -302,3 +347,28 @@ class IngestBuffer:
         finally:
             self._lock.release()
         return ok
+
+
+def make_boot_id(urandom=None, fallback=None):
+    """A fresh 16-hex-character id for THIS power-up, sent with every batch.
+
+    The server dedupes on (unit_id, boot_id, seq), so ids from two boots must
+    not collide: 64 random bits. ``urandom`` defaults to os.urandom (MicroPython's
+    is backed by the RP2350's hardware RNG); on a build without it ``fallback``
+    (a callable returning 8 bytes, e.g. mixing machine.unique_id() and
+    time.ticks_us()) is used. Plain string formatting only -- no bytes.hex(),
+    which older MicroPython builds lack."""
+    if urandom is None:
+        import os
+        urandom = getattr(os, "urandom", None)
+    raw = None
+    if urandom is not None:
+        try:
+            raw = urandom(8)
+        except (OSError, NotImplementedError):
+            raw = None
+    if raw is None:
+        if fallback is None:
+            raise RuntimeError("no random source for boot_id")
+        raw = fallback()
+    return "".join("{:02x}".format(b) for b in raw)

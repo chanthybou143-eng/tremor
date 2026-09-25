@@ -72,7 +72,7 @@ from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
-from wifi_ingest import IngestBuffer
+from wifi_ingest import IngestBuffer, make_boot_id
 from http_client import PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
@@ -557,8 +557,21 @@ def _post_batch(payload):
     return ok
 
 
+# v2 wire format: a fresh random id per power-up plus a per-reading sequence
+# number, so the server can drop retried duplicates exactly (see
+# wifi_ingest.IngestBuffer / tremor.ingest). Deliberately NO weak fallback: if
+# this build has no random source, run the legacy (v1) format instead -- a
+# repeated boot_id would restart seq at 0 and make the server silently discard
+# the new boot's readings as duplicates, which is worse than v1's GPS-time dedupe.
+try:
+    BOOT_ID = make_boot_id()
+except Exception as _exc:
+    BOOT_ID = None
+    print("# BOOT_ID_UNAVAILABLE {} -- using legacy payload".format(_exc))
+print("# BOOT_ID boot_id={}".format(BOOT_ID))
+
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS,
-                       max_readings_per_post=MAX_READINGS_PER_POST)
+                       max_readings_per_post=MAX_READINGS_PER_POST, boot_id=BOOT_ID)
 
 _last_consumed_ticks = t0
 _elapsed_us_total = 0
@@ -697,8 +710,13 @@ while True:
         try:
             frequency_hz, amplitude_v = summarize_chunk(
                 _chunk_ts_s, _voltages, n=_chunk_len, filtered_buf=_filtered_buf)
-            gps_utc_s = sync.ticks_to_utc(_chunk_ticks[_chunk_len - 1])
-            buffer.append(frequency_hz, amplitude_v, gps_utc_s)
+            _last_tick = _chunk_ticks[_chunk_len - 1]
+            gps_utc_s = sync.ticks_to_utc(_last_tick)
+            # Full-precision integer UTC (days, second-of-day, microsecond) for the
+            # v2 payload; the float above is single precision (~4-8 ms) and is
+            # only kept for the legacy format / an older server.
+            gps = sync.ticks_to_gps(_last_tick) if BOOT_ID is not None else None
+            buffer.append(frequency_hz, amplitude_v, gps_utc_s, gps)
         except DegenerateTimestampsError as exc:
             # Distinguished from the routine ValueError skip below
             # specifically so this rarer failure is counted and its

@@ -12,7 +12,7 @@ converted to UTC by measuring its ticks offset from the anchor.
 from machine import Pin
 import time
 
-from nmea_parser import parse_rmc
+from nmea_parser import parse_rmc_both
 
 _ANCHOR_SANITY_TOLERANCE_S = 0.250  # see feed_nmea: reject an anchor whose
                                     # ticks/UTC deltas disagree by more than this
@@ -31,7 +31,23 @@ _ANCHOR_MAX_AGE_S = 300  # see ticks_to_utc/_is_anchor_fresh: an anchor normally
                           # range -- rather than silently producing a wrapped,
                           # wrong UTC value from a diff against a months-old
                           # anchor with no indication anything's wrong.
+_ANCHOR_MAX_AGE_US = _ANCHOR_MAX_AGE_S * 1000000  # 3e8 -- inside MicroPython's 31-bit small-int range (< 1.07e9)
 _SECONDS_PER_DAY = 86400
+
+
+def days_from_civil(year, month, day):
+    """Days since 1970-01-01 for a proleptic-Gregorian date, integer-only
+    (Howard Hinnant's algorithm). No float, no datetime/calendar module -- so it
+    runs identically on CPython (where it is tested against datetime.date) and
+    on MicroPython."""
+    if month <= 2:
+        year -= 1
+    era = (year if year >= 0 else year - 399) // 400
+    yoe = year - era * 400
+    mp = month - 3 if month > 2 else month + 9
+    doy = (153 * mp + 2) // 5 + day - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
 
 
 class PPSTimeSync:
@@ -48,6 +64,11 @@ class PPSTimeSync:
         self._anchor_ticks = None       # ticks_us() at the PPS edge that starts _anchor_utc_s
         self._anchor_utc_s = None       # UTC seconds-of-day at _anchor_ticks
         self._anchor_date = None        # (year, month, day) at _anchor_ticks
+        # Integer twin of the anchor above, for ticks_to_gps(): the RMC time/date
+        # parsed WITHOUT any float (see nmea_parser.parse_rmc_int).
+        self._anchor_days = None        # days since 1970-01-01 at the anchor's PPS edge
+        self._anchor_sod = None         # whole UTC second-of-day at the anchor
+        self._anchor_usec = 0           # microsecond within that second
 
         self._pin = Pin(pps_pin, Pin.IN)
         self._pin.irq(trigger=Pin.IRQ_RISING, handler=self._on_pps)
@@ -69,10 +90,10 @@ class PPSTimeSync:
         """Call from the main loop with each raw GPS UART line (whatever
         sentence type -- non-RMC lines and void fixes are simply ignored).
         Non-blocking, does no I/O itself."""
-        result = parse_rmc(line)
-        if result is None:
+        both = parse_rmc_both(line)
+        if both is None:
             return
-        utc_s, date = result
+        (utc_s, date), (int_sod, int_usec, _date) = both
 
         edge_ticks = self._pending_edge_ticks
         if edge_ticks is None:
@@ -95,6 +116,9 @@ class PPSTimeSync:
         self._anchor_ticks = edge_ticks
         self._anchor_utc_s = utc_s
         self._anchor_date = date
+        self._anchor_days = days_from_civil(date[0], date[1], date[2])
+        self._anchor_sod = int_sod
+        self._anchor_usec = int_usec
         self.sync_count += 1
 
     def ticks_to_utc(self, ticks_us_value):
@@ -112,6 +136,31 @@ class PPSTimeSync:
         elif utc_s < 0:
             utc_s += _SECONDS_PER_DAY
         return utc_s
+
+    def ticks_to_gps(self, ticks_us_value):
+        """Full-precision GPS UTC for a time.ticks_us() reading, as three small
+        ints ``(days_since_1970, second_of_day, microsecond)`` -- or None if not
+        synced / the anchor is stale (same 300 s rule as ticks_to_utc).
+
+        Integer-only on purpose: ticks_to_utc()'s float result is single
+        precision on a stock MicroPython build (~4-8 ms at these magnitudes),
+        far too coarse for TREMOR's inter-unit arrival-time comparisons. Every
+        intermediate here fits MicroPython's 31-bit small ints (|delta| <= 3e8 us,
+        anchor microseconds < 1e6, days ~2e4, seconds < 86400 + 300), so no
+        long-int allocation and no rounding; // and % are floor operations, so
+        a reading slightly BEFORE the anchor (negative delta) and a rollover
+        past 24:00:00 both normalise correctly."""
+        if self._anchor_sod is None:
+            return None
+        delta_us = time.ticks_diff(ticks_us_value, self._anchor_ticks)
+        if delta_us > _ANCHOR_MAX_AGE_US or delta_us < -_ANCHOR_MAX_AGE_US:
+            return None
+        us = self._anchor_usec + delta_us
+        sec = self._anchor_sod + us // 1000000
+        us = us % 1000000
+        days = self._anchor_days + sec // _SECONDS_PER_DAY
+        sec = sec % _SECONDS_PER_DAY
+        return days, sec, us
 
     def _is_anchor_fresh(self):
         if self._anchor_ticks is None:
