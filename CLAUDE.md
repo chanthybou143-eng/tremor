@@ -244,30 +244,125 @@ header; tokens live only in the environment (the PythonAnywhere WSGI file) and, 
 - **Client:** `INGEST_TOKEN` in `wifi_config.py` (optional) is sent by `wifi_unit_client.py` via
   `timeout_post(extra_headers=...)` and never printed.
 
-### Flash-session checklist (NOT yet done -- the v2 client is committed but never flashed)
+### Standalone Unit 1 (flashed 2026-09-26; `main.py`, `boot_support.py`, `wdt_support.py`, `RECOVERY.md`)
 
-Server first (see `deploy/DEPLOY_SERVER_PERSISTENCE.md`), client second. Before/while flashing the v2 client
-(`wifi_ingest.py`, `pps_time_sync.py`, `nmea_parser.py`, `wifi_unit_client.py`) run these ON THE DEVICE -- none
-of them could be checked on the host:
+The Pico now runs by itself at power-up (no Mac). Flash holds: `main.py`, `boot_support.py`, `wdt_support.py`,
+`wifi_unit_client.py`, `http_client.py`, `pps_time_sync.py`, `nmea_parser.py`, `wifi_ingest.py`,
+`chunk_summary.py`, `freq_estimator.py`, `wifi_config.py` (copied from the local gitignored file; holds the
+Wi-Fi password and `INGEST_TOKEN`), and the leftover unused `http_keepalive.py`. Before that, the flash held
+only the 8 files in `~/tremor-flash-backup-20260926/` (the rollback point; see `RECOVERY.md`).
 
-1. **Floor division and modulo on negative ints.** `ticks_to_gps` relies on `//` and `%` flooring (Python
-   semantics) for a reading slightly *before* the anchor and for midnight rollover. On the Pico REPL:
-   `print(-1 // 1000000, -1 % 1000000, -250001 // 1000000, -250001 % 1000000)` must print
-   `-1 999999 -1 749999`.
-2. **`os.urandom` exists** (`import os; print(os.urandom(8))`). If not, the client falls back to the legacy
-   payload (no `boot_id`) by design -- but then dedupe is by GPS time only, so find out.
-3. **Heap headroom with the +17.6 KB** of new per-reading arrays (`seq`, `gday`, `gsec`, `gus` and a flag
-   byte, x600 x2 buffers). The soak's minimum free heap was 358,192 B; watch `heap_free` and
-   `heap_free_at_try_start` on the first STATUS lines and through a failure run (buffer full = worst case).
-4. **`json.dumps` of the v2 batch**: transient allocation for 60 readings (`seq`, `gps` list) is larger than
-   v1; confirm no `MemoryError` and that POST durations stay near the ~2.4 s median.
-5. **Integer time sanity**: with GPS locked, compare a `ticks_to_gps` triple against the RMC time/date at the
-   same PPS edge, and check it across a UTC midnight (09:30 ACST) if you can wait for one.
-6. **Token**: put `INGEST_TOKEN = "..."` in the Pico's `wifi_config.py` (never the repo), confirm the boot line
-   `# AUTH ingest token configured`, then watch `/api/health` `ingest_auth.authenticated` rise and
-   `missing_accepted` stop rising -- only then switch the server to `TREMOR_INGEST_AUTH=required`.
-7. **`SEND_LEGACY_FLOAT`**: leave `False` unless a pre-v2 server has to keep working.
-8. The PPS interval filter for `pps_time_sync.py` is a separate open item to go into the same flash session.
+* **Boot order (`main.py`).** (1) Escape hatch: GP22 (physical pin 29, internal pull-up, 8 low reads over ~40 ms)
+  jumpered to GND (pin 28, next to it -- **never pin 30, which is RUN**) -> print a message, set the LED steady on,
+  arm no watchdog, start no client, return to the REPL. This check uses only `machine`/`time`, before anything
+  else is imported. (2) `wifi_config.py` is imported and its required fields validated BEFORE the watchdog is
+  armed (`boot_support.REQUIRED_FIELDS`: `WIFI_SSID WIFI_PASSWORD UNIT_ID INGEST_URL INGEST_TOKEN`, non-empty
+  text, `INGEST_URL` http(s)); a failure prints only the exception type, `file:line` and field NAMES, never a
+  value or a message, then fast-blinks and returns to the REPL. (3) Otherwise `import wifi_unit_client` (arms
+  the watchdog, runs forever); a crash or exit prints type + locations only and forces a watchdog reboot, so the
+  unit keeps retrying. Any change to how `wifi_config.py` is checked must keep the "never print a value" rule
+  (a traceback message can echo the file: on 2026-09-26 an `ast.parse` traceback leaked the token once).
+* **LED (onboard):** steady on = maintenance (jumper); slow blink 1 Hz = running; fast blink 5 Hz = config
+  error; off = not started. One timer, allocation-free callback; verified to keep blinking through an 8 s
+  stalled TLS handshake. It says the timer is alive, not that the main loop is healthy (the watchdog does that).
+* **Consecutive WDT resets** are counted in WATCHDOG SCRATCH3 (`wdt_support.ResetCounter`: magic | armed flag |
+  count) and printed at boot as `# BOOT_COUNTER consecutive_wdt_resets=N` together with `# PREV_FREEZE`. The
+  armed flag (set just before the client starts, cleared when `main.py` returns without arming) is what tells
+  a real watchdog reset from a soft reset, because `machine.reset_cause()` keeps saying WDT_RESET across soft
+  resets. The client zeroes the count after its first successful POST. It never stops the unit.
+* **`mem32` reads are SIGNED on this build** (`0xC0DE8000` reads back as `-0x3F218000`): mask with
+  `& 0xFFFFFFFF` before comparing (the counter never counted until this was found on the device).
+* **Killing `mpremote` does not stop the client**, and Ctrl-C leaves the watchdog armed (the board reboots
+  ~8 s later): use the jumper for any maintenance session. `mpremote run/mount` tests of the client from RAM
+  work as before (`mpremote mount DIR run launcher.py`, with real copies, not symlinks, in DIR).
+* **RP2350 caveat found while testing:** an input with the internal PULL-DOWN can stay latched high on this chip
+  (erratum RP2350-E9), so pull-down readings are unreliable; the escape hatch uses the pull-up only.
+* **Verification done (2026-09-26):** (a) power-cycle on Mac USB started and posted by itself; (b) jumper
+  pin 29 -> pin 28 + power-cycle: LED steady on, REPL, uptime kept counting for 98 s with reset cause PWRON
+  (no watchdog); (c) jumper removed + power-cycle: ran again; (d) on a USB phone charger with no Mac it posted,
+  authenticated, with a new `boot_id` and `time_src` 2. One unexplained PWRON reset (~04:37 UTC, 90 s after the
+  first power-up, on the Mac USB port) was seen; a cable/port glitch is the suspect. If unplanned PWRON
+  boot_ids keep appearing, suspect the supply or cable, not the firmware (a watchdog reset reads WDT_RESET).
+
+### Overnight freeze of 2026-09-25 15:04 UTC (root cause and fixes)
+
+The soak log showed a WDT reset ~8 s into a POST with no STATUS line and 355 KB heap free. Reproduced on the
+device from RAM:
+
+* `ssl.wrap_socket`'s handshake honours `sock.settimeout(4)` **per socket operation**, not for the whole
+  handshake: with every individual wait at 3.6 s it took 8.18 s, longer than the 8 s watchdog. A silent peer is
+  cut at ~4.0 s (that path is fine).
+* `socket.getaddrinfo` has **no timeout** (6.5-7 s against a dead DNS server; 27 ms healthy, 0 ms if lwIP has
+  it cached). The DNS stage also had no watchdog feed before it.
+* Timer callbacks (soft and hard) DO run while the main thread is inside such a C call.
+
+Fixes (all in `http_client.py`, `wdt_support.py`, `wifi_unit_client.py`):
+
+* **Stage log** at the START of every POST stage, before its blocking call:
+  `# POST_STAGE stage=dns|connect|tls_handshake|send|read_response|done t_ms=... [cache|lookup|stale]` -- the last
+  line before any silence names the frozen stage. The stage is also kept in WATCHDOG SCRATCH0-2
+  (`Breadcrumb`), so the next boot prints `# PREV_FREEZE last_stage=... post_no=...` even with no USB host.
+* **DNS cache** (`DnsCache`): resolve once, reuse; max age 1 h, stale-if-error up to 24 h; dropped on a
+  connect/TLS failure, a non-2xx reply, or every 3rd consecutive failure. If the server IP changes, the old
+  address stops answering, so 1-2 POSTs fail (readings stay buffered), the cache is dropped and the next POST
+  re-resolves and succeeds. SNI always uses the real hostname.
+* **Bounded watchdog guard** (`WatchdogGuard`, `POST_WDT_GUARD_MS = 25000`, 0 disables): a 1 s Timer feeds the
+  watchdog only inside a POST window, so a slow stall costs some overflowed ADC samples instead of a reboot that
+  discards the RAM buffer (up to ~10 min of readings). The 25 s cap is enforced by the timer itself, not by
+  the POST code: with no `stop()` and no main-thread feeds it expired at 25.0 s and the watchdog then reset
+  the board (verified on the device). Every stall the bare 8 s watchdog would not have survived is logged as
+  `# WDT_GUARD_EXTENDED stage=... stalled_ms=...`; the cap expiring logs `# WDT_GUARD_EXPIRED`. STATUS carries
+  `dns_*`, `guard_windows/feeds/expired/ext/longest_stall_ms`.
+
+### PPS interval filter and anchor recovery (`pps_time_sync.py`)
+
+Plugpack switching puts glitch edges on the PPS line (~1-1.7 extra edges per second while the plugpack is
+unplugged, measured exactly on the device).
+
+* **Hard IRQ** (`Pin.irq(..., hard=True)`): a soft handler does not run while the main thread is inside a
+  blocking network call, so every ~2.3 s POST used to cost about one late/lost edge (40 resyncs and 58 rejected
+  anchors in 30 min). With hard=True: 0 lost edges. `_on_pps` is integer-only and allocation-free (an AST test
+  enforces it).
+* **Edge filter:** an edge is accepted only if it arrives within +/-50 ms (`PPS_TOLERANCE_US`) of k x 1 s,
+  k = 1..5, after the last ACCEPTED edge (k > 1 = a missed edge, counted as a resync); after 6 s with nothing
+  accepted the next edge re-anchors unconditionally. Only accepted edges become the pending edge that pairs
+  with an RMC sentence. Known limitation (tested, documented): a glitch landing within 50 ms BEFORE a true edge
+  is accepted and the true edge rejected; the timing error is bounded by the tolerance and self-corrects at
+  the next edge. Plugpack test (3 unplug/replug cycles, 303 s): 348 edges, 304 accepted (one per second),
+  44 glitches rejected, 0 resyncs, 0 anchors lost to glitches.
+* **Anchor recovery:** the 250 ms sanity check compares each candidate anchor with the CURRENT anchor, so a
+  wrong first anchor (an RMC read after the NEXT edge, e.g. after the boot-time Wi-Fi connect) made every later
+  correct candidate look wrong and the unit ran ~1 s off until reboot (seen on the device). Now 5 rejected
+  candidates in a row (`PPS_REANCHOR_STREAK`) that agree with each other replace the anchor, logged as
+  `# REANCHOR old_utc=... new_utc=... correction_us=...` (both UTC at the new edge; < 0 = old anchor was fast).
+* **Blocked-window shadow:** while the main loop is blocked (a POST, the boot-time connect) the GPS UART goes
+  unread and the first sentence read afterwards is stale, yet gets paired with the newest edge; same-length
+  slow POSTs (a long outage) make such mispairs agree with each other. `blocking_started()/blocking_ended()`
+  (called by the client around every POST and once before the main loop) mark that; a candidate read within 2 s
+  (`PPS_BLOCK_SHADOW_US`) of the end of a blocking window is ignored (neither extends nor resets the streak),
+  and cannot be a FIRST anchor either. Tested with a worst-case outage (same-size stale mispairs, no good
+  anchor in between) with and without the guard.
+* STATUS carries `pps_edges/accepted/rejected/resync`, `sync_count`, `sync_rejected`, `no_edge`, `reanchors`,
+  `sync_shadow`.
+
+### Open items
+
+* **TLS certificate verification is off** (no CA on the Pico), so a man-in-the-middle could read the ingest
+  token. Accepted for now. To do: estimate the heap cost (and handshake time) of verifying the server
+  certificate with the CA root on this MicroPython build (v1.27.0, `ssl` with `cadata`/`CERT_REQUIRED`) before
+  deciding.
+* **NMEA pairing losses during POSTs** (left as is): while a POST blocks the loop the UART goes unread, so
+  ~1 anchor per POST is lost (the 250 ms sanity check rejects it; none is accepted wrongly). Possible fix: ignore
+  sentences whose paired edge is > ~0.9 s old (note: this does NOT catch a sentence that is merely late, which is
+  what the blocked-window shadow is for).
+* Optional: precompile the client with `mpy-cross` (boot compiles ~52 KB of source each time).
+* `http_keepalive.py` is on the flash but unused; leave it or remove it in a maintenance session.
+
+### Switching the server to `TREMOR_INGEST_AUTH=required`
+
+Do it only when all hold after >= 24 h of standalone running: `ingest_auth.missing_accepted` has not risen
+since the standalone unit's first POST, `rejected_wrong` is 0, `units_seen_without_token` is empty, and
+`authenticated` keeps rising at ~2 per minute. Roll back by setting `optional` again and reloading.
 
 ### Known-bad data (exclude from analysis)
 
@@ -277,7 +372,9 @@ of them could be checked on the host:
   later correct candidate was then rejected against it; fixed in 4361f64, hardened by the blocked-window
   shadow after it). Evidence: the server's receive lag for that boot is 3.83 s median vs 2.96 / 2.88 s for the
   two good boots of the same session. Exclude it when analysing (`WHERE boot_id != '398474c3bef237a1'`). The
-  rows are still on the server; a guarded one-off delete is to be provided at the end of the standalone work.
+  rows are still on the server; delete them with the guarded one-off `scripts/delete_boot_rows.py` (dry run by
+  default; needs `--expect-rows` to match exactly and the boot id typed again; saves the rows to a quarantine
+  file first; see its docstring). Its dry run reports the exact row count (289 is what `/api/history` showed).
 * Other 2026-09-26 RAM-run boots on unit-1 (and the earlier legacy soak) are test data too. Boots
   `87e9675a612ac091`, `c7181effaa38c678`, `5887ce55578f0a22` and `7bc83d47bbd0d653` had clean sync counters
   (anchors good; the lag check above agrees for the first two). Short throw-away boots from the reset-counter
