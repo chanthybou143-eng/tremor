@@ -409,3 +409,86 @@ def test_the_pps_pin_uses_a_hard_irq_so_a_blocking_network_call_cannot_delay_the
     on the device every POST (~2.3 s) then cost about one lost/late PPS edge and one rejected anchor."""
     pin = rig.s._pin
     assert pin.hard is True and pin.handler == rig.s._on_pps
+
+
+# --- anchor recovery: a wrong FIRST anchor must not lock the unit out ----------------------------------------------
+
+def test_a_wrong_first_anchor_is_replaced_once_later_candidates_agree_with_each_other(rig):
+    """Seen on the device (2026-09-26, plugpack run): the first RMC was read after the NEXT edge had arrived,
+    so the first anchor was a whole second off; every later (correct) candidate then disagreed with it, was
+    rejected, and the unit ran ~1 s off until reboot -- sync_count=3, sync_rejected=281 after 300 s."""
+    rig.edge(T0)
+    rig.s.feed_nmea(rmc(hhmmss(SOD0 + 1)))                    # edge for second SOD0 paired with the sentence of SOD0+1
+    assert rig.s.ticks_to_gps(T0) == (20721, SOD0 + 1, 0)     # ... one second FAST: wrong
+    for i in range(1, 5):
+        rig.second(SOD0 + i, T0 + i * S)                      # the true seconds: rejected, but agreeing with each other
+        assert rig.s.reanchor_count == 0 and rig.s.rejected_count == i
+        assert rig.s.ticks_to_gps(T0) == (20721, SOD0 + 1, 0) # still wrong ...
+    rig.second(SOD0 + 5, T0 + 5 * S)                          # the 5th consistent candidate wins
+    assert rig.s.reanchor_count == 1 and rig.s.sync_count == 2 and rig.s.rejected_count == 5
+    assert rig.s.ticks_to_gps(T0 + 5 * S) == (20721, SOD0 + 5, 0)
+    assert rig.s.ticks_to_gps(T0 + 5 * S + 250_000) == (20721, SOD0 + 5, 250_000)
+    for i in range(6, 12):                                    # and from here on every anchor is accepted normally
+        rig.second(SOD0 + i, T0 + i * S)
+    assert rig.s.sync_count == 8 and rig.s.rejected_count == 5 and rig.s.reanchor_count == 1
+
+
+def test_the_recovery_takes_exactly_pps_reanchor_streak_candidates(rig):
+    assert rig.mod.PPS_REANCHOR_STREAK == 5
+    rig.edge(T0)
+    rig.s.feed_nmea(rmc(hhmmss(SOD0 + 2)))                    # 2 s off this time
+    for i in range(1, 4):
+        rig.second(SOD0 + i, T0 + i * S)
+    assert rig.s.reanchor_count == 0
+    rig.second(SOD0 + 4, T0 + 4 * S)
+    rig.second(SOD0 + 5, T0 + 5 * S)
+    assert rig.s.reanchor_count == 1 and rig.s.ticks_to_gps(T0 + 5 * S) == (20721, SOD0 + 5, 0)
+
+
+def test_mispairs_during_a_post_do_not_replace_a_good_anchor(rig):
+    """A good anchor, then a POST-like burst of mispaired candidates, each off by a different amount: they
+    never agree with each other, so the anchor stays."""
+    for i in range(3):
+        rig.second(SOD0 + i, T0 + i * S)
+    good = rig.s.ticks_to_gps(T0 + 2 * S)
+    for k, wrong in enumerate((1, 3, 2, 4, 1, 5, 2)):           # each candidate off by a different number of seconds
+        rig.edge(T0 + (3 + k) * S)
+        rig.s.feed_nmea(rmc(hhmmss(SOD0 + 3 + k + wrong + k * 7)))
+    assert rig.s.reanchor_count == 0 and rig.s.ticks_to_gps(T0 + 2 * S) == good
+    assert rig.s.rejected_count == 7
+
+
+def test_an_accepted_anchor_resets_the_streak(rig):
+    rig.second(SOD0, T0)
+    seq = [1, 1, 1, 1]                                          # 4 consistent-but-wrong candidates ...
+    t = 1
+    for _ in seq:
+        rig.second(SOD0 + t + 1, T0 + t * S)                    # off by +1 s, consistent with each other
+        t += 1
+    assert rig.s.rejected_count == 4 and rig.s.reanchor_count == 0
+    rig.second(SOD0 + t, T0 + t * S)                            # ... then a good one: accepted, streak cleared
+    assert rig.s.sync_count == 2
+    t += 1
+    for _ in range(4):
+        rig.second(SOD0 + t + 1, T0 + t * S)
+        t += 1
+    assert rig.s.reanchor_count == 0 and rig.s.rejected_count == 8
+
+
+def test_recovery_works_across_utc_midnight(rig):
+    sod = 86_397
+    rig.edge(T0)
+    rig.s.feed_nmea(rmc(hhmmss(sod + 1)))                       # wrong first anchor, 23:59:58
+    for i in range(1, 6):                                       # true seconds run through midnight
+        s_of_day = (sod + i) % 86400
+        date = "250926" if sod + i < 86400 else "260926"
+        rig.edge(T0 + i * S)
+        rig.s.feed_nmea(rmc(hhmmss(s_of_day), date))
+    assert rig.s.reanchor_count == 1
+    assert rig.s.ticks_to_gps(T0 + 5 * S) == (20722, (sod + 5) % 86400, 0)
+
+
+def test_reanchor_count_is_in_status_and_on_the_client_status_line(rig):
+    assert rig.s.status["reanchor_count"] == 0
+    src = (ROOT / "wifi_unit_client.py").read_text()
+    assert "reanchors={}" in src and 's["reanchor_count"]' in src

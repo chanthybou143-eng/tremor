@@ -39,6 +39,14 @@ _ANCHOR_MAX_AGE_S = 300  # see ticks_to_utc/_is_anchor_fresh: an anchor normally
 PPS_TOLERANCE_US = 50000
 PPS_MAX_MULTIPLE = 5
 PPS_REANCHOR_US = 6000000
+# Anchor recovery. The 250 ms sanity check compares every new candidate anchor with the CURRENT anchor, so
+# a wrong first anchor (e.g. an RMC read after the NEXT edge had already arrived, which pairs it a whole
+# second off) made every later, correct candidate look wrong and the unit stayed ~1 s off until it
+# rebooted (seen on the device, 2026-09-26). If PPS_REANCHOR_STREAK rejected candidates in a row agree
+# with EACH OTHER, the old anchor is the outlier and the newest candidate replaces it. Mispairs during a
+# POST disagree with each other (and are interleaved with good anchors, which reset the streak), so they
+# never trigger this.
+PPS_REANCHOR_STREAK = 5
 _ANCHOR_MAX_AGE_US = _ANCHOR_MAX_AGE_S * 1000000  # 3e8 -- inside MicroPython's 31-bit small-int range (< 1.07e9)
 _SECONDS_PER_DAY = 86400
 
@@ -70,6 +78,10 @@ class PPSTimeSync:
         self.sync_count = 0
         self.rejected_count = 0
         self.no_edge_count = 0  # diagnostic: valid RMC parsed, but no pending PPS edge to pair it with
+        self.reanchor_count = 0         # times a run of mutually consistent rejected candidates replaced the anchor
+        self._cand_ticks = None         # the previous REJECTED candidate anchor (edge ticks, UTC seconds) ...
+        self._cand_utc = None
+        self._cand_streak = 0           # ... and how many rejected candidates in a row have agreed with each other
 
         self._pps_period_us = None
         self._pending_edge_ticks = None  # most recent PPS edge not yet paired to a sentence
@@ -124,6 +136,19 @@ class PPSTimeSync:
         if resync:
             self.pps_resync += 1
 
+    @staticmethod
+    def _agrees(edge_ticks, utc_s, ref_ticks, ref_utc_s):
+        """Do (edge_ticks, utc_s) and the reference (ref_ticks, ref_utc_s) describe the same clock?
+        ticks elapsed vs UTC elapsed, within _ANCHOR_SANITY_TOLERANCE_S, folded across UTC midnight."""
+        ticks_delta_s = time.ticks_diff(edge_ticks, ref_ticks) / 1e6
+        utc_delta_s = utc_s - ref_utc_s
+        # UTC midnight rollover: fold the delta back into (-12h, 12h]
+        if utc_delta_s > _SECONDS_PER_DAY / 2:
+            utc_delta_s -= _SECONDS_PER_DAY
+        elif utc_delta_s < -_SECONDS_PER_DAY / 2:
+            utc_delta_s += _SECONDS_PER_DAY
+        return abs(ticks_delta_s - utc_delta_s) <= _ANCHOR_SANITY_TOLERANCE_S
+
     def feed_nmea(self, line):
         """Call from the main loop with each raw GPS UART line (whatever
         sentence type -- non-RMC lines and void fixes are simply ignored).
@@ -140,16 +165,19 @@ class PPSTimeSync:
         self._pending_edge_ticks = None  # consume it -- don't pair it again
 
         if self._anchor_ticks is not None:
-            ticks_delta_s = time.ticks_diff(edge_ticks, self._anchor_ticks) / 1e6
-            utc_delta_s = utc_s - self._anchor_utc_s
-            # UTC midnight rollover: fold the delta back into (-12h, 12h]
-            if utc_delta_s > _SECONDS_PER_DAY / 2:
-                utc_delta_s -= _SECONDS_PER_DAY
-            elif utc_delta_s < -_SECONDS_PER_DAY / 2:
-                utc_delta_s += _SECONDS_PER_DAY
-            if abs(ticks_delta_s - utc_delta_s) > _ANCHOR_SANITY_TOLERANCE_S:
+            if not self._agrees(edge_ticks, utc_s, self._anchor_ticks, self._anchor_utc_s):
                 self.rejected_count += 1
-                return
+                if self._cand_ticks is not None and self._agrees(edge_ticks, utc_s, self._cand_ticks, self._cand_utc):
+                    self._cand_streak += 1
+                else:
+                    self._cand_streak = 1
+                self._cand_ticks = edge_ticks
+                self._cand_utc = utc_s
+                if self._cand_streak < PPS_REANCHOR_STREAK:
+                    return
+                self.reanchor_count += 1        # the candidates agree with each other, not with the anchor: replace it
+        self._cand_ticks = None
+        self._cand_streak = 0
 
         self._anchor_ticks = edge_ticks
         self._anchor_utc_s = utc_s
@@ -218,6 +246,7 @@ class PPSTimeSync:
             "sync_count": self.sync_count,
             "rejected_count": self.rejected_count,
             "no_edge_count": self.no_edge_count,
+            "reanchor_count": self.reanchor_count,
             "pps_period_us": self._pps_period_us,
             "anchor_date": self._anchor_date,
         }
