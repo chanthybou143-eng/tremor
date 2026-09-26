@@ -269,6 +269,20 @@ of them could be checked on the host:
 7. **`SEND_LEGACY_FLOAT`**: leave `False` unless a pre-v2 server has to keep working.
 8. The PPS interval filter for `pps_time_sync.py` is a separate open item to go into the same flash session.
 
+### Known-bad data (exclude from analysis)
+
+* **boot_id `398474c3bef237a1`, unit-1, 289 rows** (RAM test run of 2026-09-26 ~04:00 UTC, the first plugpack
+  toggle test): every timestamp is ~1 s EARLY. Cause: the anchor-lockout bug (the first PPS anchor was paired
+  with an RMC sentence a whole second off because the main loop had not been reading the GPS UART, and every
+  later correct candidate was then rejected against it; fixed in 4361f64, hardened by the blocked-window
+  shadow after it). Evidence: the server's receive lag for that boot is 3.83 s median vs 2.96 / 2.88 s for the
+  two good boots of the same session. Exclude it when analysing (`WHERE boot_id != '398474c3bef237a1'`). The
+  rows are still on the server; a guarded one-off delete is to be provided at the end of the standalone work.
+* Other 2026-09-26 RAM-run boots on unit-1 (and the earlier legacy soak) are test data too. Boots
+  `87e9675a612ac091`, `c7181effaa38c678`, `5887ce55578f0a22` and `7bc83d47bbd0d653` had clean sync counters
+  (anchors good; the lag check above agrees for the first two). Short throw-away boots from the reset-counter
+  experiments (e.g. `b6b28fd1b272156d`) were not checked individually.
+
 ### Test tolerances are tied to real hardware constraints
 
 Tests in `tests/test_frequency.py` and `tests/test_filters.py` are
