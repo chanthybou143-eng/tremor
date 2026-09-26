@@ -73,7 +73,8 @@ from machine import ADC, UART, Pin, Timer, WDT
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer, make_boot_id
-from http_client import PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
+from http_client import DnsCache, PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
+from wdt_support import Breadcrumb, WatchdogGuard
 import wifi_config
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
@@ -315,6 +316,32 @@ if WDT_TIMEOUT_MS_CANDIDATES:
         WDT_TIMEOUT_MS_ACTUAL,
         _wdt_effective if _wdt_effective is not None else "not_exposed_by_driver"))
 
+# --- Freeze forensics + bounded watchdog guard (2026-09-26; see wdt_support.py) --------------------
+# Overnight 2026-09-25 the board reset ~8 s into a POST with no trace. Reproduced on the device: one
+# blocking C call (a TLS handshake whose every socket wait is under SOCKET_OP_TIMEOUT_S, or a
+# getaddrinfo with a dead DNS server) can hold the CPU past the 8 s watchdog, because the socket
+# timeout is per OPERATION, not per handshake. Two defences:
+#   1. Breadcrumb: the current POST stage is kept in WATCHDOG scratch registers (they survive a WDT
+#      reset), so the next boot prints "# PREV_FREEZE last_stage=..." -- readable later even when no
+#      USB host was attached.
+#   2. Guard: a 1 s Timer feeds the watchdog while a POST is in flight, for at most
+#      POST_WDT_GUARD_MS from its start. A stall then costs some overflowed ADC samples instead of a
+#      reboot that discards the RAM buffer; a genuine hang is still reset after guard + 8 s. It does
+#      nothing outside a POST. 0 disables it.
+POST_WDT_GUARD_MS = 25000
+_breadcrumb = Breadcrumb(machine.mem32)
+_prev_freeze = _breadcrumb.read_and_clear()
+if _prev_freeze is not None:
+    if BOOT_RESET_CAUSE_NAME == "WDT_RESET":
+        print("# PREV_FREEZE last_stage={} post_no={} stage_started_at_uptime_ms={}".format(
+            _prev_freeze["stage"], _prev_freeze["post_no"], _prev_freeze["at_ms"]))
+_wdt_guard = None
+if wdt is not None and POST_WDT_GUARD_MS:
+    _wdt_guard = WatchdogGuard(wdt.feed, time.ticks_ms, time.ticks_diff, window_ms=POST_WDT_GUARD_MS)
+    _guard_timer = Timer()
+    _guard_timer.init(mode=Timer.PERIODIC, period=1000, callback=_wdt_guard.tick)
+    print("# POST_GUARD window_ms={}".format(POST_WDT_GUARD_MS))
+
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
 sync = PPSTimeSync(pps_pin=15)
@@ -386,6 +413,25 @@ def _wifi_service():
 def _feed_wdt():
     if wdt is not None:
         wdt.feed()
+
+
+# DNS: resolve once and reuse (http_client.DnsCache explains the IP-change behaviour); a
+# connect/TLS failure, a non-2xx answer, or every 3rd consecutive failure invalidates it.
+_dns_cache = DnsCache()
+
+_CRUMB_STAGES = ("dns", "connect", "tls_handshake", "send", "read_response")
+
+
+def _stage_log(stage, note=None):
+    """Called by http_client.timeout_post at the START of every POST stage, before its blocking
+    call -- so the last "# POST_STAGE" line before any silence names the stage that froze."""
+    t = time.ticks_ms()
+    if note is None:
+        print("# POST_STAGE stage={} t_ms={}".format(stage, t))
+    else:
+        print("# POST_STAGE stage={} t_ms={} {}".format(stage, t, note))
+    if stage in _CRUMB_STAGES:
+        _breadcrumb.mark(stage, post_attempts, t)
 
 
 PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to check
@@ -499,11 +545,17 @@ def _post_batch(payload):
         # so a stalled attempt that eventually raises still updates this;
         # that's often the more interesting case for spotting stalls.
         _post_start_ticks = time.ticks_us()
+        if _wdt_guard is not None:
+            _wdt_guard.start()
         try:
             status_code, _headers, _body = timeout_post(
                 INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
-                extra_headers=_AUTH_HEADERS, feed_fn=_feed_wdt)
+                extra_headers=_AUTH_HEADERS, feed_fn=_feed_wdt,
+                dns_cache=_dns_cache, stage_log_fn=_stage_log)
         finally:
+            if _wdt_guard is not None:
+                _wdt_guard.stop()
+            _breadcrumb.mark("idle", post_attempts, time.ticks_ms())
             duration_us = time.ticks_diff(time.ticks_us(), _post_start_ticks)
             duration_s = duration_us / 1e6
             last_post_duration_ms = duration_us // 1000
@@ -513,6 +565,7 @@ def _post_batch(payload):
                 slow_post_count += 1
         ok = 200 <= status_code < 300
         if not ok:
+            _dns_cache.invalidate()                # a wrong answer may mean a stale address: look it up again next time
             print("# POST_FAIL reason=http_status stage=n/a status={} heap_free_at_try_start={} "
                   "heap_free_now={}".format(
                 status_code, heap_free_at_try_start, gc.mem_free()))
@@ -545,6 +598,8 @@ def _post_batch(payload):
         _current_post_interval_s = POST_INTERVAL_S
     else:
         _consecutive_failures += 1
+        if _consecutive_failures % 3 == 0:
+            _dns_cache.invalidate()                # e.g. a stale address that accepts TCP but never answers
         if _consecutive_failures > max_consecutive_failures:
             max_consecutive_failures = _consecutive_failures
         _current_post_interval_s = min(
@@ -805,7 +860,9 @@ while True:
               "stage_fail_dns={} "
               "stage_fail_connect={} stage_fail_tls_handshake={} stage_fail_send={} "
               "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
-              "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={}".format(
+              "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={} "
+              "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
+              "guard_windows={} guard_feeds={} guard_expired={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -816,4 +873,8 @@ while True:
             stage_failure_counts["read_response"], stage_failure_counts["body"],
             readings_sent_ok, max_consecutive_failures, last_heap_free_at_try_start,
             read_rssi(wlan),
+            _dns_cache.lookups, _dns_cache.hits, _dns_cache.stale_uses, _dns_cache.invalidations,
+            _wdt_guard.windows if _wdt_guard is not None else 0,
+            _wdt_guard.feeds if _wdt_guard is not None else 0,
+            _wdt_guard.expired if _wdt_guard is not None else 0,
         ))

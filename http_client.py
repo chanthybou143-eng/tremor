@@ -313,9 +313,83 @@ def _read_response_with_deadline(sock_like, now_fn, ticks_diff_fn, feed_fn, star
     return status_code, headers, body
 
 
+# --- DNS cache --------------------------------------------------------------------------
+#
+# socket.getaddrinfo() has NO timeout parameter. Measured on the device (2026-09-26): with a DNS
+# server that never answers it blocks 6.5-7.0 s (lwIP's own retry schedule) -- within about a
+# second of the 8 s watchdog -- and a healthy lookup is ~27 ms, ~0 ms when lwIP has it cached.
+# Resolving once and reusing the address removes that stall from almost every POST.
+#
+# What happens if the server's IP changes: the cached address keeps being used until (a) a
+# connect or TLS-handshake failure, or a non-2xx HTTP answer (wifi_unit_client calls
+# invalidate() for that), or (b) DNS_MAX_AGE_S passes -- whichever is first -- and then the next
+# POST resolves afresh. A retired IP therefore costs one or two failed POSTs (each ~4-9 s, then
+# the client's backoff), during which readings simply stay buffered (600 readings ~ 10 min), so
+# nothing is lost. TLS still sends server_hostname=<the real host> (SNI), so the certificate
+# presented is for the right name regardless of the IP used. If a fresh lookup itself FAILS
+# (DNS down) a previously cached address is reused for up to DNS_STALE_OK_S rather than failing.
+DNS_MAX_AGE_S = 3600
+DNS_STALE_OK_S = 86400
+
+
+class DnsCache:
+    def __init__(self, getaddrinfo_fn=None, now_fn=None, ticks_diff_fn=None,
+                 max_age_s=DNS_MAX_AGE_S, stale_ok_s=DNS_STALE_OK_S):
+        self._getaddrinfo = getaddrinfo_fn or socket.getaddrinfo
+        self._now = now_fn or _DEFAULT_NOW_FN
+        self._ticks_diff = ticks_diff_fn or _DEFAULT_TICKS_DIFF_FN
+        self._max_age_ms = int(max_age_s * 1000)
+        self._stale_ok_ms = int(stale_ok_s * 1000)
+        self._entries = {}              # (host, port) -> (addr_info entry, resolved_at_ms)
+        self.lookups = 0                # real getaddrinfo() calls made
+        self.hits = 0                   # resolutions served from the cache
+        self.stale_uses = 0             # lookup failed, an older cached address was used instead
+        self.invalidations = 0
+
+    def _age_ms(self, key):
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        return self._ticks_diff(self._now(), entry[1])
+
+    def is_fresh(self, host, port):
+        age = self._age_ms((host, port))
+        return age is not None and age < self._max_age_ms
+
+    def resolve(self, host, port, socktype=None):
+        """(addr_info_entry, source): source is "cache", "lookup" or "stale"."""
+        key = (host, port)
+        age = self._age_ms(key)
+        if age is not None and age < self._max_age_ms:
+            self.hits += 1
+            return self._entries[key][0], "cache"
+        self.lookups += 1
+        try:
+            info = self._getaddrinfo(host, port, 0, socktype if socktype is not None else socket.SOCK_STREAM)
+        except OSError:
+            if age is not None and age < self._stale_ok_ms:
+                self.stale_uses += 1
+                return self._entries[key][0], "stale"
+            raise
+        self._entries[key] = (info[0], self._now())
+        return info[0], "lookup"
+
+    def invalidate(self, host=None, port=None):
+        """Forget one address (or everything): the next resolve() does a real lookup. The stale
+        fallback is dropped too -- an address that just failed must not be resurrected."""
+        if host is None:
+            n = len(self._entries)
+            self._entries.clear()
+        else:
+            n = 1 if self._entries.pop((host, port), None) is not None else 0
+        self.invalidations += n
+        return n
+
+
 def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
                   socket_factory=None, ssl_wrap_fn=None, getaddrinfo_fn=None,
-                  now_fn=None, ticks_diff_fn=None, feed_fn=None):
+                  now_fn=None, ticks_diff_fn=None, feed_fn=None,
+                  dns_cache=None, stage_log_fn=None):
     """One-shot HTTPS POST with SOCKET_OP_TIMEOUT_S applied to every
     individual blocking call and POST_DEADLINE_S enforced across the
     whole attempt (see both constants' comments above for why both are
@@ -353,6 +427,14 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
     duration of a legitimately slow but working POST. Defaults to a
     no-op so tests and any other caller don't need to pass one.
 
+    dns_cache, if given (a DnsCache), replaces the per-POST getaddrinfo() call and is
+    invalidated on a connect or TLS-handshake failure (see DnsCache for why).
+
+    stage_log_fn(stage, note) is called at the START of every stage -- BEFORE its blocking call
+    -- with stage one of dns / connect / tls_handshake / send / read_response, and once more
+    with "done" on success. Because it fires before the call, the last line printed before a
+    freeze names the stage that froze. (dns's note is "cache" or "lookup".)
+
     socket_factory/ssl_wrap_fn/getaddrinfo_fn default to the real
     socket.socket/ssl.wrap_socket/socket.getaddrinfo -- tests inject
     fakes instead of touching a real network (see
@@ -370,6 +452,9 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
     now_fn = now_fn or _DEFAULT_NOW_FN
     ticks_diff_fn = ticks_diff_fn or _DEFAULT_TICKS_DIFF_FN
     feed_fn = feed_fn or (lambda: None)
+    stage_log = stage_log_fn or (lambda stage, note=None: None)
+    if dns_cache is None:
+        dns_cache = DnsCache(getaddrinfo_fn, now_fn, ticks_diff_fn, max_age_s=0)   # no reuse: one lookup per POST
 
     deadline_ms = int(POST_DEADLINE_S * 1000)
     start_at = now_fn()
@@ -377,33 +462,44 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
     ssl_sock = None
     try:
         stage_start_at = now_fn()
+        # Feed BEFORE the lookup: this used to be the one blocking call with no feed ahead of it,
+        # so the watchdog window started at the main loop's last feed, not at the lookup.
+        feed_fn()
+        stage_log("dns", "cache" if dns_cache.is_fresh(host, port) else "lookup")
         try:
-            addr_info = getaddrinfo_fn(host, port, 0, socket.SOCK_STREAM)
+            addr_entry, dns_source = dns_cache.resolve(host, port, socket.SOCK_STREAM)
         except OSError as exc:
             raise _stage_error("dns", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
-        addr_family, addr_type, addr_proto, _canonname, addr = addr_info[0]
+        if dns_source == "stale":
+            stage_log("dns_stale", "using the last known address")
+        addr_family, addr_type, addr_proto, _canonname, addr = addr_entry
 
         stage_start_at = now_fn()
         _check_deadline("connect", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
+        stage_log("connect", None)
         try:
             sock = socket_factory(addr_family, addr_type, addr_proto)
             sock.settimeout(SOCKET_OP_TIMEOUT_S)
             sock.connect(addr)
         except OSError as exc:
+            dns_cache.invalidate(host, port)          # a dead/retired address must not be reused
             raise _stage_error("connect", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
 
         stage_start_at = now_fn()
         _check_deadline("tls_handshake", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
+        stage_log("tls_handshake", None)
         try:
             ssl_sock = ssl_wrap_fn(sock, server_hostname=host)
         except OSError as exc:
+            dns_cache.invalidate(host, port)
             raise _stage_error("tls_handshake", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
 
         stage_start_at = now_fn()
         _check_deadline("send", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
         feed_fn()
+        stage_log("send", None)
         request = _build_request("POST", host, path, payload_bytes, extra_headers)
         try:
             ssl_sock.write(request)
@@ -412,7 +508,10 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
 
         stage_start_at = now_fn()
         _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
-        return _read_response_with_deadline(ssl_sock, now_fn, ticks_diff_fn, feed_fn, start_at, deadline_ms)
+        stage_log("read_response", None)
+        result = _read_response_with_deadline(ssl_sock, now_fn, ticks_diff_fn, feed_fn, start_at, deadline_ms)
+        stage_log("done", None)
+        return result
     finally:
         if ssl_sock is not None:
             try:
