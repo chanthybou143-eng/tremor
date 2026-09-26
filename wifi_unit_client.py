@@ -358,7 +358,17 @@ if wdt is not None and POST_WDT_GUARD_MS:
 
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
-sync = PPSTimeSync(pps_pin=15)
+
+
+def _log_reanchor(old, new, correction_us):
+    """PPSTimeSync replaced its anchor because 5 rejected candidates agreed with each other (see
+    pps_time_sync.PPS_REANCHOR_STREAK). old/new are (second_of_day, microsecond) as UTC AT THE NEW EDGE:
+    the old anchor projected forward, and the sentence's own time. correction_us < 0: the old anchor was fast."""
+    print("# REANCHOR old_utc={:05d}.{:06d} new_utc={:05d}.{:06d} correction_us={} t_ms={}".format(
+        old[0], old[1], new[0], new[1], correction_us, time.ticks_ms()))
+
+
+sync = PPSTimeSync(pps_pin=15, on_reanchor=_log_reanchor)
 wlan = network.WLAN(network.STA_IF)
 
 t0 = time.ticks_us()
@@ -563,6 +573,7 @@ def _post_batch(payload):
         # so a stalled attempt that eventually raises still updates this;
         # that's often the more interesting case for spotting stalls.
         _post_start_ticks = time.ticks_us()
+        sync.blocking_started()        # the GPS UART goes unread until this returns: sentences read right after may be stale
         if _wdt_guard is not None:
             _wdt_guard.start()
         try:
@@ -573,6 +584,7 @@ def _post_batch(payload):
         finally:
             if _wdt_guard is not None:
                 _wdt_guard.stop()
+            sync.blocking_ended()
             _breadcrumb.mark("idle", post_attempts, time.ticks_ms())
             duration_us = time.ticks_diff(time.ticks_us(), _post_start_ticks)
             duration_s = duration_us / 1e6
@@ -661,6 +673,7 @@ buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_RE
                        send_legacy_float=SEND_LEGACY_FLOAT)
 
 _last_consumed_ticks = t0
+sync.blocking_ended()   # nothing has read the GPS UART since boot (Wi-Fi connect etc.): the first sentences may be stale
 _elapsed_us_total = 0
 # Fixed-capacity buffers, allocated once here and reused every chunk by
 # writing to index _chunk_len (never .append()'d/reallocated) -- see
@@ -883,7 +896,7 @@ while True:
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
               "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
-              "sync_count={} sync_rejected={} no_edge={} reanchors={}".format(
+              "sync_count={} sync_rejected={} no_edge={} reanchors={} sync_shadow={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -901,5 +914,5 @@ while True:
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
-            s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"],
+            s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"], s["shadow_ignored"],
         ))

@@ -47,6 +47,14 @@ PPS_REANCHOR_US = 6000000
 # POST disagree with each other (and are interleaved with good anchors, which reset the streak), so they
 # never trigger this.
 PPS_REANCHOR_STREAK = 5
+# ...and only candidates that were NOT possibly stale. While the main loop is blocked (a POST, up to 25 s;
+# the boot-time Wi-Fi connect) nobody reads the GPS UART, so the first sentence read afterwards can be
+# several seconds old yet gets paired with the newest PPS edge: a mispair whose size is the blocked time.
+# Slow POSTs of similar length (a long outage: every POST times out after the same 4 s) would make those
+# mispairs agree with each other. So a candidate that arrives within PPS_BLOCK_SHADOW_US of the end of a
+# blocking window is IGNORED -- it neither extends nor resets the streak -- and, before the first anchor
+# exists, is not accepted as one either.
+PPS_BLOCK_SHADOW_US = 2000000
 _ANCHOR_MAX_AGE_US = _ANCHOR_MAX_AGE_S * 1000000  # 3e8 -- inside MicroPython's 31-bit small-int range (< 1.07e9)
 _SECONDS_PER_DAY = 86400
 
@@ -67,8 +75,12 @@ def days_from_civil(year, month, day):
 
 
 class PPSTimeSync:
-    def __init__(self, pps_pin=15, tolerance_us=PPS_TOLERANCE_US):
+    def __init__(self, pps_pin=15, tolerance_us=PPS_TOLERANCE_US, on_reanchor=None):
         self._tol_us = tolerance_us
+        self._on_reanchor = on_reanchor     # called with (old_utc, new_utc, correction_us) -- see feed_nmea
+        self._blocked = False               # the main loop is inside a long blocking call (a POST)
+        self._block_end_ticks = None        # when the last blocking window ended
+        self.shadow_ignored = 0             # candidates ignored because they may have been stale (see PPS_BLOCK_SHADOW_US)
         self.pps_count = 0              # every raw rising edge seen, glitches included
         self.pps_accepted = 0           # edges that passed the interval filter
         self.pps_rejected = 0           # glitches: not ~1 s (or a whole number of s) after the last accepted edge
@@ -78,6 +90,7 @@ class PPSTimeSync:
         self.sync_count = 0
         self.rejected_count = 0
         self.no_edge_count = 0  # diagnostic: valid RMC parsed, but no pending PPS edge to pair it with
+        self.reanchor_last_correction_us = None  # how far the replaced anchor was off, at the moment it was replaced
         self.reanchor_count = 0         # times a run of mutually consistent rejected candidates replaced the anchor
         self._cand_ticks = None         # the previous REJECTED candidate anchor (edge ticks, UTC seconds) ...
         self._cand_utc = None
@@ -136,6 +149,22 @@ class PPSTimeSync:
         if resync:
             self.pps_resync += 1
 
+    def blocking_started(self):
+        """The main loop is about to block for a long time (a POST): UART data will pile up unread."""
+        self._blocked = True
+
+    def blocking_ended(self):
+        """The main loop is back (call this once before its first pass, too: boot-time Wi-Fi connect blocks).
+        Sentences read for the next PPS_BLOCK_SHADOW_US may be stale and are not trusted as evidence."""
+        self._blocked = False
+        self._block_end_ticks = time.ticks_us()
+
+    def _in_shadow(self):
+        if self._blocked:
+            return True
+        end = self._block_end_ticks
+        return end is not None and time.ticks_diff(time.ticks_us(), end) < PPS_BLOCK_SHADOW_US
+
     @staticmethod
     def _agrees(edge_ticks, utc_s, ref_ticks, ref_utc_s):
         """Do (edge_ticks, utc_s) and the reference (ref_ticks, ref_utc_s) describe the same clock?
@@ -148,6 +177,17 @@ class PPSTimeSync:
         elif utc_delta_s < -_SECONDS_PER_DAY / 2:
             utc_delta_s += _SECONDS_PER_DAY
         return abs(ticks_delta_s - utc_delta_s) <= _ANCHOR_SANITY_TOLERANCE_S
+
+    def _report_reanchor(self, edge_ticks, new_sod, new_usec):
+        """Old and new anchor, both expressed as UTC at the NEW edge (integers only): the old anchor's
+        projection forward and the sentence's own time. correction_us is what the old anchor was off by."""
+        rel = self._anchor_usec + time.ticks_diff(edge_ticks, self._anchor_ticks)
+        old_sod = self._anchor_sod + rel // 1000000
+        old_usec = rel % 1000000
+        d_sod = (new_sod - old_sod + 43200) % 86400 - 43200          # fold across UTC midnight
+        self.reanchor_last_correction_us = d_sod * 1000000 + (new_usec - old_usec)   # < 0: the old anchor was FAST
+        if self._on_reanchor is not None:
+            self._on_reanchor((old_sod % 86400, old_usec), (new_sod, new_usec), self.reanchor_last_correction_us)
 
     def feed_nmea(self, line):
         """Call from the main loop with each raw GPS UART line (whatever
@@ -164,9 +204,16 @@ class PPSTimeSync:
             return  # no PPS edge seen yet to pair this sentence with
         self._pending_edge_ticks = None  # consume it -- don't pair it again
 
-        if self._anchor_ticks is not None:
+        if self._anchor_ticks is None:
+            if self._in_shadow():
+                self.shadow_ignored += 1
+                return                          # possibly stale (e.g. read after the boot-time Wi-Fi connect): wait for a fresh one
+        else:
             if not self._agrees(edge_ticks, utc_s, self._anchor_ticks, self._anchor_utc_s):
                 self.rejected_count += 1
+                if self._in_shadow():
+                    self.shadow_ignored += 1
+                    return                      # never evidence for a re-anchor: neither extends nor resets the streak
                 if self._cand_ticks is not None and self._agrees(edge_ticks, utc_s, self._cand_ticks, self._cand_utc):
                     self._cand_streak += 1
                 else:
@@ -176,6 +223,7 @@ class PPSTimeSync:
                 if self._cand_streak < PPS_REANCHOR_STREAK:
                     return
                 self.reanchor_count += 1        # the candidates agree with each other, not with the anchor: replace it
+                self._report_reanchor(edge_ticks, int_sod, int_usec)
         self._cand_ticks = None
         self._cand_streak = 0
 
@@ -247,6 +295,8 @@ class PPSTimeSync:
             "rejected_count": self.rejected_count,
             "no_edge_count": self.no_edge_count,
             "reanchor_count": self.reanchor_count,
+            "reanchor_last_correction_us": self.reanchor_last_correction_us,
+            "shadow_ignored": self.shadow_ignored,
             "pps_period_us": self._pps_period_us,
             "anchor_date": self._anchor_date,
         }

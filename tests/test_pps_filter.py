@@ -492,3 +492,151 @@ def test_reanchor_count_is_in_status_and_on_the_client_status_line(rig):
     assert rig.s.status["reanchor_count"] == 0
     src = (ROOT / "wifi_unit_client.py").read_text()
     assert "reanchors={}" in src and 's["reanchor_count"]' in src
+
+
+# --- re-anchor safety: stale sentences after a blocked main loop are never evidence ------------------------------------
+
+def outage_run(rig, posts, guard):
+    """A long outage as the main loop sees it: every POST blocks the loop for 4 s (the connect timeout), the
+    GPS UART goes unread, and the first sentence read afterwards is the one from the START of the POST -- 4 s
+    stale -- yet is paired with the newest edge. All POSTs last the same 4 s, so all the mispairs are off by
+    the same amount and AGREE WITH EACH OTHER: the worst case for the re-anchor rule. Worse than reality, where
+    every ~30 s the loop runs freely for a while and good anchors reset the streak."""
+    for i in range(3):
+        rig.second(SOD0 + i, T0 + i * S)                        # a good anchor first
+    good = rig.s.ticks_to_gps(T0 + 2 * S)
+    t = T0 + 2 * S
+    for _ in range(posts):
+        if guard:
+            rig.s.blocking_started()
+        for j in range(1, 5):
+            rig.edge(t + j * S)                                 # the real edges keep arriving (hard IRQ) and are accepted
+        rig.clock["t"] = t + 4 * S + 300 * MS                   # the POST returns
+        if guard:
+            rig.s.blocking_ended()
+        stale_sod = SOD0 + (t - T0) // S
+        rig.s.feed_nmea(rmc(hhmmss(stale_sod)))                 # the stale sentence, paired with the newest edge
+        t += 4 * S
+    return good
+
+
+def test_consistent_mispairs_from_a_run_of_slow_posts_can_re_anchor_wrongly_WITHOUT_the_guard(rig):
+    """The hazard, demonstrated: with no blocking-window information the 5-agreeing-candidates rule fires on
+    stale mispairs and moves the anchor 4 s the wrong way."""
+    good = outage_run(rig, posts=8, guard=False)
+    assert rig.s.reanchor_count >= 1
+    assert rig.s.ticks_to_gps(T0 + 2 * S) != good
+
+
+def test_consistent_mispairs_from_a_run_of_slow_posts_never_re_anchor_with_the_guard(rig):
+    good = outage_run(rig, posts=12, guard=True)
+    assert rig.s.reanchor_count == 0
+    assert rig.s.ticks_to_gps(T0 + 2 * S) == good              # the anchor is exactly what it was
+    assert rig.s.shadow_ignored == 12 and rig.s.rejected_count == 12
+    assert rig.s.sync_count == 3
+
+
+def test_candidates_outside_the_shadow_still_count_and_recover_a_wrong_anchor(rig):
+    """A wrong first anchor with a POST in the middle: candidates read within 2 s of the POST's end are
+    ignored, the five that count all come from distinct PPS seconds outside it, and they still re-anchor."""
+    rig.edge(T0)
+    rig.s.feed_nmea(rmc(hhmmss(SOD0 + 1)))                      # wrong: 1 s fast
+    for i in range(1, 4):
+        rig.second(SOD0 + i, T0 + i * S)                        # candidates 1-3: streak 3
+    rig.s.blocking_started()
+    rig.clock["t"] = T0 + 3 * S + 500 * MS
+    rig.s.blocking_ended()                                      # a POST ended at +3.5 s: shadow until +5.5 s
+    rig.second(SOD0 + 4, T0 + 4 * S)                            # +4 s: ignored
+    rig.second(SOD0 + 5, T0 + 5 * S)                            # +5 s: ignored
+    assert rig.s.shadow_ignored == 2 and rig.s.reanchor_count == 0
+    rig.second(SOD0 + 6, T0 + 6 * S)                            # +6 s: outside the shadow, streak 4
+    assert rig.s.reanchor_count == 0
+    rig.second(SOD0 + 7, T0 + 7 * S)                            # streak 5 -> re-anchor
+    assert rig.s.reanchor_count == 1 and rig.s.shadow_ignored == 2
+    assert rig.s.ticks_to_gps(T0 + 7 * S) == (20721, SOD0 + 7, 0)
+
+
+def test_an_ignored_candidate_neither_extends_nor_resets_the_streak(rig):
+    rig.edge(T0)
+    rig.s.feed_nmea(rmc(hhmmss(SOD0 + 1)))
+    for i in range(1, 3):
+        rig.second(SOD0 + i, T0 + i * S)                        # streak 2
+    rig.s.blocking_started()
+    rig.clock["t"] = T0 + 2 * S + 200 * MS
+    rig.s.blocking_ended()                                      # shadow until +4.2 s
+    rig.second(SOD0 + 3, T0 + 3 * S)                            # ignored
+    rig.second(SOD0 + 4, T0 + 4 * S)                            # ignored
+    rig.second(SOD0 + 5, T0 + 5 * S)                            # streak 3 (not 1: the ignored ones did not reset it)
+    rig.second(SOD0 + 6, T0 + 6 * S)                            # 4 (not 6: they did not extend it either)
+    assert rig.s.reanchor_count == 0 and rig.s.shadow_ignored == 2
+    rig.second(SOD0 + 7, T0 + 7 * S)                            # 5
+    assert rig.s.reanchor_count == 1
+
+
+def test_the_first_anchor_is_not_taken_from_a_sentence_read_in_the_shadow_of_a_blocked_loop(rig):
+    """The 2026-09-26 bug at its source: after the boot-time Wi-Fi connect the first sentence read was stale.
+    A first anchor must come from a sentence read once the loop has been running freely for a while."""
+    rig.edge(T0)
+    rig.clock["t"] = T0 + 100 * MS
+    rig.s.blocking_ended()                                      # the main loop starts here
+    rig.s.feed_nmea(rmc(hhmmss(SOD0 - 3)))                      # stale (3 s old) but paired with the newest edge
+    assert rig.s.sync_count == 0 and rig.s.shadow_ignored == 1 and rig.s.status["synced"] is False
+    rig.second(SOD0 + 4, T0 + 4 * S)                            # 2+ s later: a fresh edge and sentence
+    assert rig.s.sync_count == 1
+    assert rig.s.ticks_to_gps(T0 + 4 * S) == (20721, SOD0 + 4, 0)
+
+
+def test_a_candidate_that_agrees_with_the_anchor_is_accepted_even_inside_the_shadow(rig):
+    rig.second(SOD0, T0)
+    rig.s.blocking_started()
+    rig.clock["t"] = T0 + 500 * MS
+    rig.s.blocking_ended()
+    rig.second(SOD0 + 1, T0 + S)                                # a correct pairing straight after a POST is fine
+    assert rig.s.sync_count == 2 and rig.s.shadow_ignored == 0
+
+
+def test_the_reanchor_callback_gets_old_and_new_utc_at_the_new_edge_and_the_correction(monkeypatch, pps):
+    mod, clock = pps
+    seen = []
+    r = Rig(mod, clock)
+    r.s = mod.PPSTimeSync(on_reanchor=lambda old, new, corr: seen.append((old, new, corr)))
+    r.edge(T0)
+    r.s.feed_nmea(rmc(hhmmss(SOD0 + 1)))                        # wrong: 1 s fast
+    for i in range(1, 6):
+        r.second(SOD0 + i, T0 + i * S)
+    assert seen == [((SOD0 + 6, 0), (SOD0 + 5, 0), -1_000_000)]
+    assert r.s.status["reanchor_last_correction_us"] == -1_000_000
+
+
+def rmc_frac(sod, frac, ddmmyy):
+    return rmc("%02d%02d%02d.%s" % (sod // 3600, sod // 60 % 60, sod % 60, frac), ddmmyy)
+
+
+def test_the_correction_keeps_the_microseconds_and_folds_across_midnight(pps):
+    mod, clock = pps
+    seen = []
+    r = Rig(mod, clock)
+    r.s = mod.PPSTimeSync(on_reanchor=lambda o, n, c: seen.append((o, n, c)))
+    base = 86400 - 3                                            # true second-of-day at T0: 23:59:57
+    r.edge(T0)
+    r.s.feed_nmea(rmc_frac(base + 2, "25", "250926"))           # wrong first anchor: 2 s fast, 23:59:59.25
+    for i in range(1, 6):
+        sod = base + i
+        r.edge(T0 + i * S)
+        r.s.feed_nmea(rmc_frac(sod % 86400, "25", "250926" if sod < 86400 else "260926"))
+    assert len(seen) == 1
+    old, new, corr = seen[0]
+    assert old == (4, 250_000) and new == (2, 250_000)          # both at the new edge: 00:00:04.25 (old, projected) vs 00:00:02.25
+    assert corr == -2_000_000
+
+
+def test_the_client_reports_every_reanchor_and_tells_pps_time_sync_when_it_is_blocked():
+    src = (ROOT / "wifi_unit_client.py").read_text()
+    assert "# REANCHOR old_utc=" in src and "on_reanchor=_log_reanchor" in src
+    a, b = src.index("sync.blocking_started()"), src.index("sync.blocking_ended()")
+    post = src.index("timeout_post(\n")
+    assert a < post < b                                         # started before the POST, ended in its finally
+    assert src.rindex("finally:", 0, b) > post
+    loop = src.index("\nwhile True:")
+    assert "sync.blocking_ended()" in src[src.rindex("_last_consumed_ticks = t0"):loop]   # and once before the main loop
+    assert "sync_shadow={}" in src and 's["shadow_ignored"]' in src
