@@ -501,3 +501,101 @@ def test_client_invalidates_the_dns_cache_on_a_wrong_answer_and_on_every_third_f
 def test_status_line_reports_the_new_counters():
     for key in ("dns_lookups=", "dns_hits=", "dns_stale=", "dns_inval=", "guard_windows=", "guard_feeds=", "guard_expired="):
         assert key in SRC
+
+
+# --- guard logging: every extension past what the bare watchdog tolerates names its POST stage ---------------------
+
+def simulate_logged(block_ms, main_feed_at=(), window_ms=25000, stage="tls_handshake", log_raises=False,
+                    stage_raises=False):
+    clock = Clock()
+    wdt = FakeWdt(clock)
+    events = []
+
+    def log_fn(kind, stg, stalled_ms, elapsed_ms):
+        events.append((kind, stg, stalled_ms, elapsed_ms, wdt.last))
+        if log_raises:
+            raise RuntimeError("boom")
+
+    def stage_fn():
+        if stage_raises:
+            raise RuntimeError("boom")
+        return stage
+
+    g = WatchdogGuard(wdt.feed, clock, wrap_diff, window_ms=window_ms, wdt_timeout_ms=8000,
+                      stage_fn=stage_fn, log_fn=log_fn)
+    wdt.feed()
+    g.start()
+    for i in range(block_ms // 1000):
+        clock.advance(1000)
+        if clock.t in main_feed_at:              # the main thread got control back and fed itself
+            wdt.feed()
+            g.note_main_feed()
+        g.tick()
+        wdt.check()
+    g.stop()
+    return wdt, g, events
+
+
+def test_a_stall_past_the_bare_watchdog_limit_is_logged_once_with_its_stage_before_the_feed():
+    wdt, g, events = simulate_logged(12_000)
+    assert wdt.reset_at is None
+    assert [(e[0], e[1]) for e in events] == [("extended", "tls_handshake")]
+    kind, stage, stalled, elapsed, last_feed_at_log = events[0]
+    assert stalled == 7000 and elapsed == 7000                               # first tick where the WDT alone would soon fire
+    assert last_feed_at_log == 6000                                          # logged BEFORE that tick's feed
+    assert g.extensions == 1 and g.longest_stall_ms >= 11_000
+
+
+def test_a_stall_the_watchdog_would_survive_anyway_is_not_reported_as_an_extension():
+    _, g, events = simulate_logged(6_000)
+    assert events == [] and g.extensions == 0
+
+
+def test_each_separate_stall_is_logged_when_the_main_thread_feeds_in_between():
+    _, g, events = simulate_logged(24_000, main_feed_at=(10_000,))
+    assert [e[0] for e in events] == ["extended", "extended"] and g.extensions == 2
+    assert events[1][2] == 7000 and events[1][3] == 17_000                   # second stall measured from the main feed
+
+
+def test_the_stage_reported_is_the_one_running_when_it_happened():
+    _, _, events = simulate_logged(12_000, stage="dns")
+    assert events[0][1] == "dns"
+
+
+def test_the_cap_is_enforced_by_the_timer_and_logged_when_it_expires():
+    wdt, g, events = simulate_logged(60_000, window_ms=25_000, stage="read_response")
+    assert wdt.reset_at is not None and wdt.reset_at <= 25_000 + 8_000
+    assert [e[0] for e in events] == ["extended", "expired"] and g.expired == 1
+    assert events[1][1] == "read_response" and events[1][3] >= 25_000
+
+
+def test_the_cap_does_not_depend_on_the_post_code_ever_returning():
+    """No stop() is ever called and the main thread never runs again: the timer alone still ends the
+    feeding at window_ms, so the watchdog resets the board."""
+    clock = Clock()
+    wdt = FakeWdt(clock)
+    g = WatchdogGuard(wdt.feed, clock, wrap_diff, window_ms=25_000)
+    wdt.feed()
+    g.start()
+    for _ in range(60):
+        clock.advance(1000)
+        g.tick()
+        wdt.check()
+    assert wdt.reset_at is not None and 25_000 < wdt.reset_at <= 33_000
+
+
+def test_a_failing_logger_or_stage_lookup_can_neither_stop_the_feed_nor_extend_the_cap():
+    for kw in ({"log_raises": True}, {"stage_raises": True}):
+        wdt, g, _ = simulate_logged(12_000, **kw)
+        assert wdt.reset_at is None and g.extensions == 1
+        wdt, g, _ = simulate_logged(60_000, **kw)
+        assert wdt.reset_at is not None and wdt.reset_at <= 33_000 and g.expired == 1
+
+
+def test_client_logs_guard_extensions_with_the_stage_and_reports_them_on_the_status_line():
+    assert "def _guard_log(kind, stage, stalled_ms, elapsed_ms):" in SRC and "# WDT_GUARD_{} stage={}" in SRC
+    assert "stage_fn=lambda: _current_stage, log_fn=_guard_log" in SRC
+    assert "_current_stage = stage" in SRC
+    feed = SRC[SRC.index("def _feed_wdt():"):SRC.index("# DNS: resolve once")]
+    assert "_wdt_guard.note_main_feed()" in feed
+    assert "guard_ext=" in SRC and "guard_longest_stall_ms=" in SRC

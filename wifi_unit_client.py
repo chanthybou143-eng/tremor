@@ -336,8 +336,21 @@ if _prev_freeze is not None:
         print("# PREV_FREEZE last_stage={} post_no={} stage_started_at_uptime_ms={}".format(
             _prev_freeze["stage"], _prev_freeze["post_no"], _prev_freeze["at_ms"]))
 _wdt_guard = None
+_current_stage = "idle"     # the POST stage in flight, for the guard's log lines (set by _stage_log)
+
+
+def _guard_log(kind, stage, stalled_ms, elapsed_ms):
+    """Runs from the guard's timer while the main thread is stuck in a POST stage. "extended" = the
+    guard is now keeping the watchdog alive through a stall longer than the bare watchdog allows;
+    "expired" = the POST outlived its cap, so feeding stops and the watchdog will reset the board."""
+    print("# WDT_GUARD_{} stage={} stalled_ms={} post_elapsed_ms={} t_ms={}".format(
+        kind.upper(), stage, stalled_ms, elapsed_ms, time.ticks_ms()))
+
+
 if wdt is not None and POST_WDT_GUARD_MS:
-    _wdt_guard = WatchdogGuard(wdt.feed, time.ticks_ms, time.ticks_diff, window_ms=POST_WDT_GUARD_MS)
+    _wdt_guard = WatchdogGuard(wdt.feed, time.ticks_ms, time.ticks_diff, window_ms=POST_WDT_GUARD_MS,
+                               wdt_timeout_ms=WDT_TIMEOUT_MS_ACTUAL,
+                               stage_fn=lambda: _current_stage, log_fn=_guard_log)
     _guard_timer = Timer()
     _guard_timer.init(mode=Timer.PERIODIC, period=1000, callback=_wdt_guard.tick)
     print("# POST_GUARD window_ms={}".format(POST_WDT_GUARD_MS))
@@ -413,6 +426,8 @@ def _wifi_service():
 def _feed_wdt():
     if wdt is not None:
         wdt.feed()
+        if _wdt_guard is not None:
+            _wdt_guard.note_main_feed()
 
 
 # DNS: resolve once and reuse (http_client.DnsCache explains the IP-change behaviour); a
@@ -425,7 +440,9 @@ _CRUMB_STAGES = ("dns", "connect", "tls_handshake", "send", "read_response")
 def _stage_log(stage, note=None):
     """Called by http_client.timeout_post at the START of every POST stage, before its blocking
     call -- so the last "# POST_STAGE" line before any silence names the stage that froze."""
+    global _current_stage
     t = time.ticks_ms()
+    _current_stage = stage
     if note is None:
         print("# POST_STAGE stage={} t_ms={}".format(stage, t))
     else:
@@ -862,7 +879,7 @@ while True:
               "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
               "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={} "
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
-              "guard_windows={} guard_feeds={} guard_expired={} "
+              "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
               "sync_count={} sync_rejected={} no_edge={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
@@ -879,6 +896,8 @@ while True:
             _wdt_guard.windows if _wdt_guard is not None else 0,
             _wdt_guard.feeds if _wdt_guard is not None else 0,
             _wdt_guard.expired if _wdt_guard is not None else 0,
+            _wdt_guard.extensions if _wdt_guard is not None else 0,
+            _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
             s["sync_count"], s["rejected_count"], s["no_edge_count"],
         ))

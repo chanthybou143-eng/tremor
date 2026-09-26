@@ -31,34 +31,69 @@ class WatchdogGuard:
     does nothing at all, so a hang in the main loop keeps the normal 8 s watchdog.
     """
 
-    def __init__(self, feed_fn, ticks_ms_fn, ticks_diff_fn, window_ms=25000):
+    def __init__(self, feed_fn, ticks_ms_fn, ticks_diff_fn, window_ms=25000,
+                 wdt_timeout_ms=8000, period_ms=1000, stage_fn=None, log_fn=None):
         self._feed = feed_fn
         self._ticks_ms = ticks_ms_fn
         self._ticks_diff = ticks_diff_fn
         self.window_ms = window_ms
+        self._extend_after_ms = wdt_timeout_ms - period_ms   # a stall this long is one the WDT alone would not survive
+        self._stage_fn = stage_fn
+        self._log_fn = log_fn
         self._started_at = None
+        self._last_main_feed = None
+        self._ext_logged = False
         self.windows = 0            # POSTs guarded
         self.feeds = 0              # feeds the guard itself performed (i.e. stalls it covered)
         self.expired = 0            # windows that ran out before stop() -- a POST stuck past the cap
+        self.extensions = 0         # stalls that outlasted what the bare watchdog tolerates (each logged)
+        self.longest_stall_ms = 0   # longest time the main thread went without feeding, inside a window
 
     def start(self):
-        self._started_at = self._ticks_ms()
+        now = self._ticks_ms()
+        self._started_at = now
+        self._last_main_feed = now
+        self._ext_logged = False
         self.windows += 1
 
     def stop(self):
         self._started_at = None
 
+    def note_main_feed(self):
+        """The main thread fed the watchdog itself: the current stall (if any) is over."""
+        self._last_main_feed = self._ticks_ms()
+        self._ext_logged = False
+
+    def _log(self, kind, stalled_ms, elapsed_ms):
+        if self._log_fn is not None:
+            try:
+                self._log_fn(kind, self._stage_fn() if self._stage_fn is not None else None,
+                             stalled_ms, elapsed_ms)
+            except Exception:
+                pass                # a logging problem must never stop the feed / the cap
+
     def tick(self, _timer=None):
-        """Timer callback. Must stay allocation-free and cheap."""
+        """Timer callback. The cap is enforced HERE, from the timer, not by the POST code: whatever
+        the main thread is stuck in cannot extend the window."""
         started = self._started_at
         if started is None:
             return
-        if self._ticks_diff(self._ticks_ms(), started) < self.window_ms:
+        now = self._ticks_ms()
+        elapsed = self._ticks_diff(now, started)
+        if elapsed < self.window_ms:
+            stalled = self._ticks_diff(now, self._last_main_feed)
+            if stalled > self.longest_stall_ms:
+                self.longest_stall_ms = stalled
+            if stalled >= self._extend_after_ms and not self._ext_logged:
+                self._ext_logged = True
+                self.extensions += 1
+                self._log("extended", stalled, elapsed)     # BEFORE the feed: names the stage even if it dies next
             self._feed()
             self.feeds += 1
         else:
             self._started_at = None
             self.expired += 1
+            self._log("expired", self._ticks_diff(now, self._last_main_feed), elapsed)
 
 
 class Breadcrumb:
