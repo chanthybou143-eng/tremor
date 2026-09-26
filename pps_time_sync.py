@@ -31,6 +31,14 @@ _ANCHOR_MAX_AGE_S = 300  # see ticks_to_utc/_is_anchor_fresh: an anchor normally
                           # range -- rather than silently producing a wrapped,
                           # wrong UTC value from a diff against a months-old
                           # anchor with no indication anything's wrong.
+# PPS interval filter. An edge is accepted only if its distance from the last ACCEPTED edge is within
+# +/-PPS_TOLERANCE_US of a whole number of seconds (1..PPS_MAX_MULTIPLE -- a real edge that was missed
+# arrives at 2 s, 3 s, ...). Everything else is a glitch: counted, and never used. If no edge has been
+# accepted for PPS_REANCHOR_US the next one is taken unconditionally, so a bad first reference (or a long
+# outage) can never lock the filter out. Integers only: this runs in the pin interrupt.
+PPS_TOLERANCE_US = 50000
+PPS_MAX_MULTIPLE = 5
+PPS_REANCHOR_US = 6000000
 _ANCHOR_MAX_AGE_US = _ANCHOR_MAX_AGE_S * 1000000  # 3e8 -- inside MicroPython's 31-bit small-int range (< 1.07e9)
 _SECONDS_PER_DAY = 86400
 
@@ -51,13 +59,18 @@ def days_from_civil(year, month, day):
 
 
 class PPSTimeSync:
-    def __init__(self, pps_pin=15):
-        self.pps_count = 0
+    def __init__(self, pps_pin=15, tolerance_us=PPS_TOLERANCE_US):
+        self._tol_us = tolerance_us
+        self.pps_count = 0              # every raw rising edge seen, glitches included
+        self.pps_accepted = 0           # edges that passed the interval filter
+        self.pps_rejected = 0           # glitches: not ~1 s (or a whole number of s) after the last accepted edge
+        self.pps_resync = 0             # accepted after a gap (a missed real edge) or by re-anchoring
+        self._good_ticks = None         # the last ACCEPTED edge -- the filter's reference
+        self._reject_interval_us = None # diagnostic: the interval of the most recently rejected edge
         self.sync_count = 0
         self.rejected_count = 0
         self.no_edge_count = 0  # diagnostic: valid RMC parsed, but no pending PPS edge to pair it with
 
-        self._last_edge_ticks = None    # for measuring raw PPS period, independent of sync
         self._pps_period_us = None
         self._pending_edge_ticks = None  # most recent PPS edge not yet paired to a sentence
 
@@ -74,17 +87,37 @@ class PPSTimeSync:
         self._pin.irq(trigger=Pin.IRQ_RISING, handler=self._on_pps)
 
     def _on_pps(self, pin):
-        # ISR: clock read + counter/period bookkeeping only -- no parsing,
-        # no allocation beyond plain ints, no printing. If two edges fire
-        # before feed_nmea() consumes _pending_edge_ticks (main loop
-        # stalled >1s), the earlier edge is silently dropped in favour of
-        # the latest one -- there's no queue, by design, to keep this cheap.
+        # ISR: clock read + integer bookkeeping only -- no parsing, no allocation beyond plain ints,
+        # no printing. Only an ACCEPTED edge becomes the pending edge that feed_nmea() pairs an RMC
+        # sentence with (the previous version overwrote it with every edge, so a glitch between the
+        # real PPS and its sentence stole the pairing).
         now = time.ticks_us()
-        if self._last_edge_ticks is not None:
-            self._pps_period_us = time.ticks_diff(now, self._last_edge_ticks)
-        self._last_edge_ticks = now
-        self._pending_edge_ticks = now
         self.pps_count += 1
+        ref = self._good_ticks
+        if ref is None:
+            self._accept(now, False)                # nothing to compare with yet: take the first edge
+            return
+        interval = time.ticks_diff(now, ref)
+        k = (interval + 500000) // 1000000         # nearest whole number of seconds
+        if 1 <= k <= PPS_MAX_MULTIPLE:
+            err = interval - k * 1000000
+            if -self._tol_us <= err <= self._tol_us:
+                self._accept(now, k > 1)
+                if k == 1:
+                    self._pps_period_us = interval
+                return
+        elif interval >= PPS_REANCHOR_US:
+            self._accept(now, True)                 # nothing accepted for a long time: start over from this edge
+            return
+        self.pps_rejected += 1
+        self._reject_interval_us = interval
+
+    def _accept(self, now, resync):
+        self._good_ticks = now
+        self._pending_edge_ticks = now
+        self.pps_accepted += 1
+        if resync:
+            self.pps_resync += 1
 
     def feed_nmea(self, line):
         """Call from the main loop with each raw GPS UART line (whatever
@@ -173,6 +206,10 @@ class PPSTimeSync:
         return {
             "synced": self._is_anchor_fresh(),
             "pps_count": self.pps_count,
+            "pps_accepted": self.pps_accepted,
+            "pps_rejected": self.pps_rejected,
+            "pps_resync": self.pps_resync,
+            "pps_reject_interval_us": self._reject_interval_us,
             "sync_count": self.sync_count,
             "rejected_count": self.rejected_count,
             "no_edge_count": self.no_edge_count,

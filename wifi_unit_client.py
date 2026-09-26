@@ -862,7 +862,9 @@ while True:
               "stage_fail_read_response={} stage_fail_body={} readings_sent_ok={} "
               "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={} "
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
-              "guard_windows={} guard_feeds={} guard_expired={}".format(
+              "guard_windows={} guard_feeds={} guard_expired={} "
+              "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
+              "sync_count={} sync_rejected={} no_edge={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -877,4 +879,6 @@ while True:
             _wdt_guard.windows if _wdt_guard is not None else 0,
             _wdt_guard.feeds if _wdt_guard is not None else 0,
             _wdt_guard.expired if _wdt_guard is not None else 0,
+            s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
+            s["sync_count"], s["rejected_count"], s["no_edge_count"],
         ))

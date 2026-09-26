@@ -181,11 +181,11 @@ def test_the_newest_anchor_wins_and_wrap_around_ticks_are_handled(pps):
     mod, clock = pps
     near_wrap = TICKS_MASK - 500_000                                       # ticks_us about to wrap
     s = sync_at(mod, clock, near_wrap, "063004.00", "250926")
-    later = (near_wrap + 1_250_000) & TICKS_MASK                           # wrapped past zero
+    later = (near_wrap + 1_000_000) & TICKS_MASK                           # the next PPS edge: exactly 1 s later, wrapped past zero
     assert later < near_wrap
-    assert s.ticks_to_gps(later) == (20721, 23405, 250_000)               # +1.25 s across the wrap
+    assert s.ticks_to_gps(later + 250_000) == (20721, 23405, 250_000)     # +1.25 s across the wrap
     clock["t"] = later
-    s._on_pps(None)
+    s._on_pps(None)                                                        # (the interval filter needs a real 1 s spacing)
     s.feed_nmea(rmc("063005.00", "250926"))
     assert s.ticks_to_gps(later + 10) == (20721, 23405, 10)
 
