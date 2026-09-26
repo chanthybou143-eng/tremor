@@ -33,8 +33,9 @@ class _FakePin:
     def __init__(self, *a, **k):
         self.handler = None
 
-    def irq(self, trigger=None, handler=None):
+    def irq(self, trigger=None, handler=None, hard=False):
         self.handler = handler
+        self.hard = hard
 
 
 @pytest.fixture

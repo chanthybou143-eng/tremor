@@ -84,7 +84,12 @@ class PPSTimeSync:
         self._anchor_usec = 0           # microsecond within that second
 
         self._pin = Pin(pps_pin, Pin.IN)
-        self._pin.irq(trigger=Pin.IRQ_RISING, handler=self._on_pps)
+        # hard=True: the handler runs in the real interrupt, so ticks_us() is read within microseconds of
+        # the edge. A soft (scheduled) handler -- the default -- only runs when the VM next gets to run
+        # scheduled callbacks, which does not happen while the main thread sits in a blocking network
+        # call (each ~2.3 s POST): edges were then stamped late, batched, or dropped (see CLAUDE.md,
+        # 2026-09-26 RAM run). _on_pps is integer-only and allocation-free for exactly this reason.
+        self._pin.irq(trigger=Pin.IRQ_RISING, handler=self._on_pps, hard=True)
 
     def _on_pps(self, pin):
         # ISR: clock read + integer bookkeeping only -- no parsing, no allocation beyond plain ints,

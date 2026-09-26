@@ -34,8 +34,9 @@ class _FakePin:
     def __init__(self, *a, **k):
         self.handler = None
 
-    def irq(self, trigger=None, handler=None):
+    def irq(self, trigger=None, handler=None, hard=False):
         self.handler = handler
+        self.hard = hard
 
 
 @pytest.fixture
@@ -401,3 +402,10 @@ def test_the_client_status_line_reports_the_pps_filter_counters_and_its_format_a
     for key in ("pps_count", "pps_accepted", "pps_rejected", "pps_resync", "sync_count", "rejected_count",
                 "no_edge_count"):
         assert f's["{key}"]' in src
+
+
+def test_the_pps_pin_uses_a_hard_irq_so_a_blocking_network_call_cannot_delay_the_edge_timestamp(rig):
+    """Soft (scheduled) IRQ handlers do not run while the main thread is inside a blocking network call:
+    on the device every POST (~2.3 s) then cost about one lost/late PPS edge and one rejected anchor."""
+    pin = rig.s._pin
+    assert pin.hard is True and pin.handler == rig.s._on_pps
