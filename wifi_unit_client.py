@@ -74,7 +74,7 @@ from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer, make_boot_id
 from http_client import DnsCache, PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
-from wdt_support import Breadcrumb, WatchdogGuard
+from wdt_support import Breadcrumb, WatchdogGuard, ResetCounter
 import wifi_config
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
@@ -330,6 +330,7 @@ if WDT_TIMEOUT_MS_CANDIDATES:
 #      nothing outside a POST. 0 disables it.
 POST_WDT_GUARD_MS = 25000
 _breadcrumb = Breadcrumb(machine.mem32)
+_reset_counter = ResetCounter(machine.mem32)   # main.py's consecutive-WDT-reset count (see wdt_support.ResetCounter)
 _prev_freeze = _breadcrumb.read_and_clear()
 if _prev_freeze is not None:
     if BOOT_RESET_CAUSE_NAME == "WDT_RESET":
@@ -862,6 +863,7 @@ while True:
             if buffer.flush():  # _post_batch checks wlan.isconnected() itself; a
                                  # no-op (returns False, buffer untouched) while down
                 post_successes += 1
+                _reset_counter.mark_healthy()  # first success after a boot ends the run of consecutive WDT resets
         else:
             buffer.flush()  # genuinely nothing to send -- not counted as an attempt
 
@@ -881,7 +883,7 @@ while True:
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
               "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
-              "sync_count={} sync_rejected={} no_edge={}".format(
+              "sync_count={} sync_rejected={} no_edge={} reanchors={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
@@ -899,5 +901,5 @@ while True:
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
-            s["sync_count"], s["rejected_count"], s["no_edge_count"],
+            s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"],
         ))

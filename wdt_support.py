@@ -126,10 +126,71 @@ class Breadcrumb:
         Clears it, so a later soft reboot cannot report the same freeze twice. Only meaningful
         when the previous reset was a watchdog reset -- the caller checks that."""
         m, b = self._m, self._b
-        if m[b] != self.MAGIC:
+        if (m[b] & 0xFFFFFFFF) != self.MAGIC:      # mem32 may hand back a signed value
             return None
-        w1, w2 = m[b + 4], m[b + 8]
+        w1, w2 = m[b + 4] & 0xFFFFFFFF, m[b + 8] & 0xFFFFFFFF
         m[b] = 0
         code = w1 & 0xFF
         stage = self.STAGES[code] if code < len(self.STAGES) else "unknown({})".format(code)
         return {"stage": stage, "post_no": w1 >> 8, "at_ms": w2}
+
+
+class ResetCounter:
+    """Consecutive-watchdog-reset counter in WATCHDOG SCRATCH3 (survives a WDT reset, not a power
+    cycle). One word: [31:16] magic | bit 15 "armed" | [14:0] count.
+
+    "armed" is set by main.py just before it starts the client (the client arms the watchdog at import)
+    and cleared whenever main.py returns to the REPL without arming it. That is what tells a real
+    watchdog reset from a soft reset: machine.reset_cause() keeps reporting WDT_RESET across soft resets
+    (Ctrl-D), so on its own it would count every REPL restart after a freeze.
+
+    on_boot(): WDT_RESET + armed -> count + 1; any other hardware cause (power-on, RUN pin, ...) -> 0;
+    WDT_RESET but not armed (a soft reset from the REPL) -> count unchanged.
+    mark_healthy(): the client calls it after its first successful POST -> count = 0, so "consecutive"
+    means "since the last time the unit demonstrably worked".
+    """
+
+    ADDR = 0x400D8000 + 0x0C + 12          # SCRATCH3
+    MAGIC = 0xC0DE
+    ARMED = 0x8000
+    MAX = 0x7FFF
+
+    def __init__(self, mem32, addr=None):
+        self._m = mem32
+        self._a = self.ADDR if addr is None else addr
+
+    def _read(self):
+        w = self._m[self._a] & 0xFFFFFFFF          # mem32 reads come back SIGNED on this build (0xC0DE8000 -> -0x3F218000)
+        if (w >> 16) != self.MAGIC:
+            return 0, False
+        return w & self.MAX, bool(w & self.ARMED)
+
+    def _write(self, count, armed):
+        self._m[self._a] = (self.MAGIC << 16) | (self.ARMED if armed else 0) | (count if count < self.MAX else self.MAX)
+
+    def on_boot(self, cause_is_wdt):
+        count, armed = self._read()
+        if cause_is_wdt:
+            if armed:
+                count += 1
+        else:
+            count = 0
+        self._write(count, False)
+        return count
+
+    def arm_started(self):
+        count, _ = self._read()
+        self._write(count, True)
+
+    def disarmed(self):
+        count, _ = self._read()
+        self._write(count, False)
+
+    def mark_healthy(self):
+        count, armed = self._read()
+        if count:
+            self._write(0, armed)
+
+    @property
+    def count(self):
+        return self._read()[0]
