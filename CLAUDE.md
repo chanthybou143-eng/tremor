@@ -355,6 +355,18 @@ unplugged, measured exactly on the device).
   ~1 anchor per POST is lost (the 250 ms sanity check rejects it; none is accepted wrongly). Possible fix: ignore
   sentences whose paired edge is > ~0.9 s old (note: this does NOT catch a sentence that is merely late, which is
   what the blocked-window shadow is for).
+* **GPS-disciplined sample clock (correct sample rate from ticks per PPS second)** -- for the next firmware
+  session. Chunk timestamps come from raw `ticks_us` (the Pico crystal), so a crystal error of x ppm biases every
+  reading by -x ppm (~50 µHz per ppm). Measure ticks per accepted PPS second (sum over a window, not one interval)
+  and scale chunk time by it. Measured so far (2026-09-11/19 logs, `period_us`): crystal ~3-5 ppm SLOW, i.e.
+  only ~+0.2 mHz of bias -- this does NOT explain the -1.9 mHz offset vs AEMO SA1 on 2026-09-27 (see
+  ~/tremor-analysis/). Current STATUS lines no longer log `period_us`; add a windowed ticks-per-PPS-second field
+  so temperature drift can be tracked.
+* **Plausibility filter for impossible readings** (e.g. the 80.995 Hz glitch in boot `3bf8ae13fd84b5d0` on
+  2026-09-27, and plugpack-unplugged data) -- for the next firmware session. Flag (don't silently drop) readings
+  outside a physically possible band and readings with near-zero amplitude, rather than sending them as normal
+  data. The band must stay wider than real NEM contingency excursions (~47-52 Hz) so genuine events survive;
+  the offline analysis used 49.5-50.5 Hz only because 2026-09-27 had no event.
 * Optional: precompile the client with `mpy-cross` (boot compiles ~52 KB of source each time).
 * `http_keepalive.py` is on the flash but unused; leave it or remove it in a maintenance session.
 
