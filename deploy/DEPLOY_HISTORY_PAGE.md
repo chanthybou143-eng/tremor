@@ -11,12 +11,12 @@ work) is merged into `master` and pushed.
 Reloading is safe: the server has run `TREMOR_INGEST_AUTH=required` since 2026-09-27, so the in-memory
 auth counters and rate-limit buckets a reload resets no longer gate anything.
 
-Use the same Python version as the web app (Web tab) for every command below, e.g. `python3.10`.
+The web app runs Python 3.9 (3.9.21); use `python3.9` for every command below, so the checks run on the same interpreter.
 
 The page needs the IANA time-zone database on the server (Python's `zoneinfo`). Check once:
 
 ```bash
-python3.10 -c "from zoneinfo import ZoneInfo; from datetime import datetime, timezone; \
+python3.9 -c "from zoneinfo import ZoneInfo; from datetime import datetime, timezone; \
 print(datetime(2026,10,10,6,50,32,tzinfo=timezone.utc).astimezone(ZoneInfo('Australia/Adelaide')))"
 # expect: 2026-10-10 17:20:32+10:30   -- a ZoneInfoNotFoundError means: stop and tell me
 ```
@@ -28,7 +28,7 @@ A separate checkout, so `~/tremor` does not change until the numbers are known. 
 ```bash
 cd ~/tremor && git fetch origin
 git worktree add ~/tremor-bench origin/master          # detached checkout of the new code
-cd ~/tremor-bench && python3.10 scripts/bench_history.py --db ~/tremor_data/readings.db
+cd ~/tremor-bench && python3.9 scripts/bench_history.py --db ~/tremor_data/readings.db
 ```
 
 What it does, in order:
@@ -47,7 +47,7 @@ What it does, in order:
 Each raw read covers at most 6 hours so no statement holds the lock long, but run it at a quiet moment:
 
 ```bash
-cd ~/tremor-bench && python3.10 scripts/bench_history.py --db ~/tremor_data/readings.db --live
+cd ~/tremor-bench && python3.9 scripts/bench_history.py --db ~/tremor_data/readings.db --live
 ```
 
 Reading the output:
@@ -81,7 +81,7 @@ git merge --ff-only origin/master
 git rev-parse HEAD                   # expect: the master commit you were given
 git diff --stat f8c6e77 HEAD -- src/ deploy/   # expect only: history.py, store.py, webapp.py,
                                                # templates/history.html, templates/index.html, this file
-python3.10 -c "import sys; sys.path.insert(0,'src'); import tremor.webapp"   # prints nothing
+python3.9 -c "import sys; sys.path.insert(0,'src'); import tremor.webapp"   # prints nothing
 ```
 
 ## 3. Reload and check
@@ -92,7 +92,7 @@ Web tab → **Reload**. Open the **error log**: no new tracebacks.
 S=https://<username>.pythonanywhere.com
 curl -s -o /dev/null -w "%{http_code}\n" $S/history                                    # 200
 F=$(( $(date +%s) - 8 * 86400 ))
-for i in 1 2; do curl -s "$S/api/history/overview?unit=unit-1&from=$F" | python3.10 -c \
+for i in 1 2; do curl -s "$S/api/history/overview?unit=unit-1&from=$F" | python3.9 -c \
   "import sys,json; j=json.load(sys.stdin); h=j['histogram']; print(j['elapsed_ms'], 'ms', j['cache'], \
    'hist complete' if h['complete'] else f\"{h['pending_hours']} h pending\")"; done
 ```
@@ -111,7 +111,7 @@ for i in 1 2; do curl -s "$S/api/history/overview?unit=unit-1&from=$F" | python3
   - the known-bad boot 398474c3bef237a1 (2026-09-26 03:47-03:53 UTC) under *Excluded data*, 0 readings;
   - plugpack-unplugged readings (the 2026-09-26 toggle tests) as excluded periods. If an unplugged stretch is
     NOT excluded, note its time: its readings had amplitude >= 0.1 V and an in-band frequency.
-- **The Pico is unaffected:** `curl -s $S/api/health | python3.10 -m json.tool | grep -A3 '"units"'` --
+- **The Pico is unaffected:** `curl -s $S/api/health | python3.9 -m json.tool | grep -A3 '"units"'` --
   `seconds_since_last_reading` stays under ~60 s and `readings_total` keeps rising over a few minutes.
 
 ## Rollback
