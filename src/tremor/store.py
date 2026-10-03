@@ -120,6 +120,24 @@ class DayState:
 
 
 @dataclass(frozen=True)
+class AggExclusion:
+    """Which 1-minute aggregates the history overview leaves out (see history.py). A minute is
+    all-or-nothing: its stored statistics can no longer be split into good and bad readings."""
+    freq_lo: float
+    freq_hi: float
+    amp_min: float
+    bad_minutes: Tuple[Tuple[int, int], ...] = ()     # inclusive [first, last] minute ranges
+
+    def sql(self) -> Tuple[str, list]:
+        parts = ["freq_min < ?", "freq_max > ?", "(amp_mean IS NOT NULL AND amp_mean < ?)"]
+        args: list = [self.freq_lo, self.freq_hi, self.amp_min]
+        for a, b in self.bad_minutes:
+            parts.append("(minute >= ? AND minute <= ?)")
+            args += [a, b]
+        return "(" + " OR ".join(parts) + ")", args
+
+
+@dataclass(frozen=True)
 class HistoryPage:
     rows: List[Row]
     unlocked: List[Row]
@@ -153,7 +171,22 @@ class ReadingStore(ABC):
     def aggregates(self, unit_id: str, from_minute: int, to_minute: int, limit: int) -> List[AggRow]: ...
 
     @abstractmethod
-    def health(self) -> dict: ...
+    def rollup_aggregates(self, unit_id: str, from_minute: int, to_minute: int, group_s: int,
+                          exclude: "AggExclusion") -> List[tuple]:
+        """1-minute aggregates in [from_minute, to_minute] summed into ``group_s``-second buckets
+        (aligned to the epoch; ``group_s`` is a multiple of 60) for the history overview. A minute
+        matching ``exclude`` is counted as excluded, never mixed into the statistics. One row per
+        non-empty bucket: (bucket_start_s, n_good, n_excluded, secs_good, secs_excluded,
+        sum(f - 50), sum((f - 50)^2), freq_min, freq_max, rocof_max_abs)."""
+
+    @abstractmethod
+    def read_points(self, unit_id: str, start_us: int, end_us: int) -> List[Tuple[int, float, Optional[float], Optional[str]]]:
+        """Locked readings in [start, end) as slim (gps_utc_us, freq_hz, amplitude_v, boot_id)
+        tuples, in GPS-time order -- the history overview's raw path reads whole days of these."""
+
+    @abstractmethod
+    def excluded_aggregate_minutes(self, unit_id: str, from_minute: int, to_minute: int,
+                                   exclude: "AggExclusion", limit: int) -> List[AggRow]: ...
 
     # --- retention primitives (see retention.py) ----------------------------
     @abstractmethod
@@ -452,6 +485,43 @@ class SqliteReadingStore(ReadingStore):
                 "SELECT unit_id, minute, n, n_unlocked, freq_mean, freq_min, freq_max, freq_std, "
                 "rocof_max_abs, amp_mean FROM readings_1min WHERE unit_id=? AND minute>=? AND minute<=? "
                 "ORDER BY minute LIMIT ?", (unit_id, from_minute, to_minute, limit)).fetchall()
+        return [AggRow(*r) for r in rows]
+
+    def rollup_aggregates(self, unit_id, from_minute, to_minute, group_s, exclude) -> List[tuple]:
+        if group_s % 60:
+            raise ValueError("group_s must be a whole number of minutes")
+        ex, ex_args = exclude.sql()
+        g = group_s // 60
+        with self._read() as db:
+            return db.execute(
+                "SELECT (minute / ?) * ?, "
+                "SUM(CASE WHEN ex THEN 0 ELSE n END), SUM(CASE WHEN ex THEN n ELSE 0 END), "
+                "SUM(CASE WHEN ex THEN 0 ELSE min(n, 60) END), SUM(CASE WHEN ex THEN min(n, 60) ELSE 0 END), "
+                "SUM(CASE WHEN ex THEN 0 ELSE n * (freq_mean - 50.0) END), "
+                "SUM(CASE WHEN ex THEN 0 ELSE n * (COALESCE(freq_std, 0) * COALESCE(freq_std, 0) "
+                "  + (freq_mean - 50.0) * (freq_mean - 50.0)) END), "
+                "MIN(CASE WHEN ex THEN NULL ELSE freq_min END), MAX(CASE WHEN ex THEN NULL ELSE freq_max END), "
+                "MAX(CASE WHEN ex THEN NULL ELSE rocof_max_abs END) "
+                f"FROM (SELECT *, {ex} AS ex FROM readings_1min "
+                "      WHERE unit_id=? AND minute>=? AND minute<=? AND n > 0) "
+                "GROUP BY minute / ? ORDER BY 1",
+                (g, group_s, *ex_args, unit_id, from_minute, to_minute, g)).fetchall()
+
+    def read_points(self, unit_id, start_us, end_us):
+        with self._read() as db:
+            return db.execute(
+                "SELECT gps_utc_us, freq_hz, amplitude_v, boot_id FROM readings WHERE unit_id=? "
+                "AND gps_utc_us >= ? AND gps_utc_us < ? ORDER BY gps_utc_us, id",
+                (unit_id, start_us, end_us)).fetchall()
+
+    def excluded_aggregate_minutes(self, unit_id, from_minute, to_minute, exclude, limit) -> List[AggRow]:
+        ex, ex_args = exclude.sql()
+        with self._read() as db:
+            rows = db.execute(
+                "SELECT unit_id, minute, n, n_unlocked, freq_mean, freq_min, freq_max, freq_std, "
+                "rocof_max_abs, amp_mean FROM readings_1min WHERE unit_id=? AND minute>=? AND minute<=? "
+                f"AND n > 0 AND {ex} ORDER BY minute LIMIT ?",
+                (unit_id, from_minute, to_minute, *ex_args, limit)).fetchall()
         return [AggRow(*r) for r in rows]
 
     def health(self) -> dict:

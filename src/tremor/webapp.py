@@ -31,6 +31,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_file
 
+from .history import DEFAULT_POINTS, MAX_POINTS, MIN_POINTS, RawDayCache, build_overview
 from .ingest import PayloadError, parse_payload
 from .retention import RetentionConfig, RetentionEngine, day_to_date
 from .rocof import rocof_from_window
@@ -629,6 +630,17 @@ def create_app(
     def index():
         return render_template("index.html")
 
+    raw_day_cache = RawDayCache()
+
+    @app.get("/history")
+    def history_page():
+        try:
+            unit_ids = [u.unit_id for u in store.unit_states()]
+        except StoreError as exc:
+            log.error("/history: storage unavailable: %s", exc)
+            unit_ids = []
+        return render_template("history.html", units=unit_ids)
+
     @app.get("/api/units")
     def api_units():
         out = state.snapshot()                                  # synthetic feeds only
@@ -741,6 +753,48 @@ def create_app(
                     readings=[_row_json(r) for r in page.rows])
         if include_unlocked:
             body["unlocked"] = [_row_json(r) for r in page.unlocked]
+        return jsonify(body)
+
+    @app.get("/api/history/overview")
+    def api_history_overview():
+        """Everything the /history page draws, downsampled server-side (see history.py). Shares
+        /api/history's rate limit. ``from`` omitted = from the unit's first data; ``to`` omitted
+        = now. ``points`` caps the frequency chart's buckets."""
+        limited = _rate_limited(history_limiter)
+        if limited is not None:
+            return limited
+        unit = request.args.get("unit", "")
+        if not unit:
+            return jsonify(error="unit is required"), 400
+        try:
+            points = int(request.args.get("points", DEFAULT_POINTS))
+            if not MIN_POINTS <= points <= MAX_POINTS:
+                raise ValueError(f"points must be between {MIN_POINTS} and {MAX_POINTS}")
+            to_us = _parse_time_us(request.args["to"]) if "to" in request.args else None
+            from_us = _parse_time_us(request.args["from"]) if "from" in request.args else None
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        now = clock()
+        try:
+            states = {u.unit_id: u for u in store.unit_states()}
+            if unit not in states:
+                return jsonify(error=f"unknown unit {unit!r}"), 404
+            # first data: GPS time can precede receipt by up to ingest.MAX_AGE_S (1 h); the oldest
+            # aggregate is checked too, in case readings were ever imported from before first_seen
+            starts = [states[unit].first_seen - 3600]
+            oldest_agg = store.aggregates(unit, 0, 2 ** 62, 1)
+            if oldest_agg:
+                starts.append(oldest_agg[0].minute * 60)
+            data_start_us = int(min(starts) * US)
+            to_us = min(int(now * US) if to_us is None else to_us, int((now + 60) * US))
+            from_us = data_start_us if from_us is None else from_us
+            if from_us >= to_us:
+                return jsonify(error="from must be before to"), 400
+            body = build_overview(store, unit, from_us, to_us, now, points=points, cache=raw_day_cache,
+                                  data_start_us=data_start_us)
+        except StoreError as exc:
+            log.error("/api/history/overview: storage unavailable: %s", exc)
+            return jsonify(error="storage unavailable"), 503
         return jsonify(body)
 
     @app.get("/api/health")

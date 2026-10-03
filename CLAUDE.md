@@ -24,6 +24,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # first-time setup
 .venv/bin/pytest -q                                          # run all tests
 PYTHONPATH=src python scripts/replay_unit1.py --hours 2       # end-to-end: real Flask server + simulated Unit 1 traffic
 python scripts/measure_db_latency.py --dir ~/tremor_data      # run ON PythonAnywhere: SQLite commit latency vs the device's 4 s deadline
+python scripts/bench_history.py --dir ~/tremor_data         # run ON PythonAnywhere: /history server time on a scratch month of data
 .venv/bin/pytest tests/test_frequency.py -v                  # one file
 .venv/bin/pytest tests/test_frequency.py::test_estimate_frequency_hand_built  # one test
 .venv/bin/pytest -k "noise"                                  # by keyword
@@ -238,11 +239,38 @@ header; tokens live only in the environment (the PythonAnywhere WSGI file) and, 
   token was missing or wrong; comparison is constant-time; misconfiguration raises at startup.
 - **`/api/export`:** disabled unless `TREMOR_EXPORT_TOKEN` is set; header-only (never in the URL); rate limited
   (`TREMOR_EXPORT_RATE`, default 10/60 s per client). `/api/history` and `/api/health` stay public;
-  `/api/history` is rate limited per client (`TREMOR_HISTORY_RATE`, default 30/60 s). Behind a proxy set
+  `/api/history` and `/api/history/overview` share one rate limit per client (`TREMOR_HISTORY_RATE`, default
+  30/60 s). Behind a proxy set
   `TREMOR_CLIENT_IP_HEADER` (e.g. `X-Real-IP`); `/api/health` shows `your_address_as_seen` so you can check.
 - Request bodies over 512 KB are refused before parsing.
 - **Client:** `INGEST_TOKEN` in `wifi_config.py` (optional) is sent by `wifi_unit_client.py` via
   `timeout_post(extra_headers=...)` and never printed.
+
+### History page (`history.py`, `templates/history.html`)
+
+`/history` (public, linked from the dashboard) shows everything stored for a unit: frequency mean with a
+min-max band, max |RoCoF| per minute, hourly coverage (good / excluded / missing) and a per-UTC-day table.
+The page makes ONE request, `GET /api/history/overview?unit=&from=&to=&points=`, which `history.build_overview`
+answers already downsampled (`points` caps the frequency buckets, 100-2000; coverage <= 800 bars). It does not
+page through `/api/history` (that endpoint has `resolution=raw|1min|auto`, where `auto` = raw within
+`raw_days`, and is capped at 10 000 rows per call -- far too many calls for a month of 1 s readings).
+
+- **Sources, per UTC day:** ranges <= 6 h use raw readings while they are stored (a pruned day falls back to
+  aggregates); longer ranges use `readings_1min`, summed in SQL (`store.rollup_aggregates`). A day the
+  retention engine has not aggregated yet (today; yesterday until ~1 h after midnight UTC plus the next few
+  ingests) is computed from raw readings on the fly, cached per hour (`RawDayCache`: closed hours 1 h, the
+  current hour and the 15 min after it 30 s), so a warm month view re-reads only the current hour.
+- **Exclusions** (never in any statistic; listed as periods and shown red): amplitude < 0.1 V, frequency outside
+  47-52 Hz (wider than any real NEM excursion, so genuine events survive), and `history.KNOWN_BAD` boots
+  (398474c3bef237a1, by boot_id in raw rows and by its 03:47-03:53Z span in aggregates). An aggregate cannot be
+  split, so a minute whose min/max is out of band or whose mean amplitude is low is excluded whole. RoCoF from
+  raw readings is fitted over good readings only (`timeline.rocof_series`, unchanged); stored aggregates were
+  fitted over every locked reading.
+- **Coverage** = seconds with a good GPS-timed reading (a minute counts at most 60), against the elapsed part of
+  the range. Unlocked readings count as missing.
+- **Speed matters:** a free PythonAnywhere account has one web worker, so a slow history request delays the
+  Pico's ingest POST (4 s deadline). Locally a cold month (30 days of aggregates + 26 h raw) takes ~0.35 s, warm
+  ~0.08 s; `scripts/bench_history.py` measures the same on the server's filesystem.
 
 ### Standalone Unit 1 (flashed 2026-09-26; `main.py`, `boot_support.py`, `wdt_support.py`, `RECOVERY.md`)
 

@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TREMOR — History</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #111417;
+    --card-bg: #1b1f24;
+    --card-border: #2a2f36;
+    --text: #e8eaed;
+    --muted: #8a919b;
+    --accent: #4da3ff;
+    --accent-rocof: #ff9f4d;
+    --good: #4dd68a;
+    --excluded: #ff6b6b;
+    --offline: #4a4f57;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  a { color: var(--accent); }
+  h1 { font-size: 1.3rem; font-weight: 600; margin: 0 0 4px 0; }
+  h2 { font-size: 0.95rem; font-weight: 600; margin: 0 0 10px 0; }
+  .subtitle { color: var(--muted); font-size: 0.9rem; margin: 0 0 20px 0; }
+  .controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 16px; font-size: 0.85rem;
+  }
+  .controls label { color: var(--muted); }
+  select, input, button {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--card-border); border-radius: 6px; padding: 5px 9px;
+  }
+  button { cursor: pointer; }
+  button.active { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .sep { width: 1px; align-self: stretch; background: var(--card-border); }
+  .status { color: var(--muted); font-size: 0.8rem; margin: 0 0 16px 0; min-height: 1.2em; }
+  .status.error { color: var(--excluded); }
+  .card {
+    background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px;
+    padding: 16px 20px; margin-bottom: 16px;
+  }
+  .chart-note { color: var(--muted); font-size: 0.75rem; margin-top: 6px; }
+  .chart-container { position: relative; height: 260px; }
+  .chart-container.short { height: 180px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  th, td { padding: 5px 8px; text-align: right; border-bottom: 1px solid var(--card-border); }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  .table-wrap { overflow-x: auto; }
+  .pill { font-size: 0.7rem; padding: 1px 6px; border-radius: 4px; background: rgba(255,255,255,0.06); color: var(--muted); }
+  .pill.ex { background: rgba(255,107,107,0.15); color: var(--excluded); }
+  ul.periods { margin: 6px 0 0 0; padding-left: 18px; font-size: 0.8rem; color: var(--muted); }
+  .empty { color: var(--muted); font-size: 0.9rem; padding: 20px 0; text-align: center; }
+  @media (max-width: 600px) {
+    body { padding: 16px; }
+    .sep { display: none; }
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <h1>TREMOR — History</h1>
+  <p class="subtitle">Everything stored on the server, summarised · <a href="/">← live dashboard</a></p>
+
+  <div class="controls">
+    <label for="unit">Unit</label>
+    <select id="unit"></select>
+    <span class="sep"></span>
+    <button data-range="24h">Last 24 h</button>
+    <button data-range="7d">7 days</button>
+    <button data-range="30d">30 days</button>
+    <button data-range="all">All</button>
+    <span class="sep"></span>
+    <label for="from">From</label><input type="datetime-local" id="from">
+    <label for="to">To</label><input type="datetime-local" id="to">
+    <button id="apply">Apply</button>
+  </div>
+  <p class="status" id="status"></p>
+
+  <div id="content" hidden>
+    <div class="card">
+      <h2>Frequency</h2>
+      <div class="chart-container"><canvas id="freqChart"></canvas></div>
+      <div class="chart-note" id="freqNote"></div>
+    </div>
+    <div class="card">
+      <h2>RoCoF</h2>
+      <div class="chart-container short"><canvas id="rocofChart"></canvas></div>
+      <div class="chart-note" id="rocofNote"></div>
+    </div>
+    <div class="card">
+      <h2>Data coverage</h2>
+      <div class="chart-container short"><canvas id="covChart"></canvas></div>
+      <div class="chart-note" id="covNote"></div>
+    </div>
+    <div class="card">
+      <h2>Daily summary <span class="pill">UTC days</span></h2>
+      <div class="table-wrap"><table id="daily"></table></div>
+    </div>
+    <div class="card">
+      <h2>Excluded data</h2>
+      <div class="chart-note" id="exRules"></div>
+      <ul class="periods" id="exList"></ul>
+    </div>
+  </div>
+  <div class="empty" id="noUnits" hidden>No unit has sent any data yet.</div>
+
+<script>
+const UNITS = {{ units|tojson }};
+const PRESETS = { '24h': 86400, '7d': 7 * 86400, '30d': 30 * 86400 };
+const REASONS = {
+  known_bad_boot: 'known-bad boot',
+  low_amplitude: 'amplitude < 0.1 V',
+  freq_out_of_band: 'frequency outside 47–52 Hz',
+};
+const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+Chart.defaults.color = '#8a919b';
+Chart.defaults.borderColor = 'rgba(255, 255, 255, 0.08)';
+
+// Excluded periods as red shading behind the data -- the same inline-plugin approach as the
+// live dashboard's gap shading, rather than an extra annotation library.
+Chart.register({
+  id: 'excludedShading',
+  beforeDatasetsDraw(chart) {
+    const spans = chart.config.options.plugins.excludedShading?.spans || [];
+    const { ctx, chartArea, scales } = chart;
+    if (!spans.length || !chartArea) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(255, 107, 107, 0.16)';
+    for (const [a, b] of spans) {
+      const l = Math.max(chartArea.left, scales.x.getPixelForValue(a));
+      const r = Math.min(chartArea.right, scales.x.getPixelForValue(b));
+      if (r > l) ctx.fillRect(l, chartArea.top, Math.max(1, r - l), chartArea.bottom - chartArea.top);
+    }
+    ctx.restore();
+  },
+});
+
+const $ = (id) => document.getElementById(id);
+const unitSel = $('unit');
+const statusEl = $('status');
+let currentRange = '24h';
+let loading = false;
+let span_s = 86400;
+let tickStep = 3600;
+const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+
+// Ticks on round local times (whole hours, local midnight, ...) rather than wherever a linear
+// axis happens to put them.
+function niceTicks(scale) {
+  const min = scale.min, max = scale.max;
+  const target = Math.max(4, Math.floor((scale.width || 600) / 110));
+  tickStep = TICK_STEPS.find((s) => (max - min) / s <= target) || 604800 * Math.ceil((max - min) / 604800 / target);
+  const off = -new Date(min * 1000).getTimezoneOffset() * 60;
+  const ticks = [];
+  for (let t = Math.ceil((min + off) / tickStep) * tickStep - off; t <= max; t += tickStep) ticks.push({ value: t });
+  scale.ticks = ticks;
+}
+
+function fmtTick(s) {
+  const d = new Date(s * 1000);
+  if (tickStep >= 86400) return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' });
+  const hm = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
+  if (span_s <= 86400 && d.getHours() !== 0) return hm;
+  return [d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' }), hm];
+}
+function fmtFull(s) {
+  return new Date(s * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium', hour12: false });
+}
+function fmtDur(s) {
+  if (s % 86400 === 0) return `${s / 86400} d`;
+  if (s % 3600 === 0) return `${s / 3600} h`;
+  if (s % 60 === 0) return `${s / 60} min`;
+  return `${s} s`;
+}
+function toLocalInput(s) {
+  const d = new Date(s * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function timeScale() {
+  return {
+    type: 'linear',
+    afterBuildTicks: niceTicks,
+    ticks: { maxRotation: 0, autoSkip: false, callback: (v) => fmtTick(v) },
+  };
+}
+const tooltipTitle = (items) => items.length ? fmtFull(items[0].parsed.x) : '';
+
+function makeLine(canvas, datasets, yTitle) {
+  return new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false, parsing: false, normalized: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { filter: (i) => i.text !== '' } },
+        tooltip: { callbacks: { title: tooltipTitle } },
+        excludedShading: { spans: [] },
+      },
+      scales: { x: timeScale(), y: { title: { display: true, text: yTitle } } },
+    },
+  });
+}
+
+const freqChart = makeLine($('freqChart'), [
+  { label: 'max', data: [], borderWidth: 0, pointRadius: 0, fill: '+1',
+    backgroundColor: 'rgba(77, 163, 255, 0.22)', spanGaps: false },
+  { label: 'min–max', data: [], borderWidth: 0, pointRadius: 0, borderColor: 'rgba(77, 163, 255, 0.22)',
+    backgroundColor: 'rgba(77, 163, 255, 0.22)', spanGaps: false },
+  { label: 'mean', data: [], borderColor: '#4da3ff', backgroundColor: '#4da3ff', borderWidth: 1.5,
+    pointRadius: 0, spanGaps: false },
+], 'Frequency (Hz)');
+freqChart.options.plugins.legend.labels.filter = (i) => i.text !== 'max';
+
+const rocofChart = makeLine($('rocofChart'), [
+  { label: 'max |RoCoF|', data: [], borderColor: '#ff9f4d', backgroundColor: 'rgba(255, 159, 77, 0.18)',
+    borderWidth: 1.2, pointRadius: 0, fill: 'origin', spanGaps: false },
+], '|RoCoF| (Hz/s)');
+rocofChart.options.scales.y.beginAtZero = true;
+
+const covChart = new Chart($('covChart').getContext('2d'), {
+  type: 'bar',
+  data: { datasets: [
+    { label: 'good', data: [], backgroundColor: 'rgba(77, 214, 138, 0.75)' },
+    { label: 'excluded', data: [], backgroundColor: 'rgba(255, 107, 107, 0.75)' },
+    { label: 'missing', data: [], backgroundColor: 'rgba(138, 145, 155, 0.25)' },
+  ] },
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+    plugins: { tooltip: { callbacks: { title: tooltipTitle, label: (i) => `${i.dataset.label}: ${i.parsed.y.toFixed(1)} %` } } },
+    datasets: { bar: { barPercentage: 1.0, categoryPercentage: 1.0 } },
+    scales: {
+      x: { ...timeScale(), stacked: true, offset: false },
+      y: { stacked: true, min: 0, max: 100, title: { display: true, text: '% of bucket' } },
+    },
+  },
+});
+
+// A line break wherever consecutive buckets are further apart than one bucket: Chart.js only
+// breaks a line at an explicit null, it never infers a gap from the x spacing.
+function withGaps(ts, ys, bucket) {
+  const out = [];
+  for (let i = 0; i < ts.length; i++) {
+    if (i > 0 && ts[i] - ts[i - 1] > bucket * 1.5) out.push({ x: ts[i - 1] + bucket, y: null });
+    out.push({ x: ts[i], y: ys[i] });
+  }
+  return out;
+}
+
+function rangeFromState() {
+  const now = Date.now() / 1000;
+  if (currentRange === 'all') return { from: null, to: null };
+  if (currentRange === 'custom') {
+    const f = Date.parse($('from').value) / 1000, t = Date.parse($('to').value) / 1000;
+    return { from: f, to: t };
+  }
+  return { from: now - PRESETS[currentRange], to: null };
+}
+
+function setStatus(text, isError = false) {
+  statusEl.textContent = text;
+  statusEl.className = 'status' + (isError ? ' error' : '');
+}
+
+function syncUrl() {
+  const q = new URLSearchParams({ unit: unitSel.value, range: currentRange });
+  if (currentRange === 'custom') { q.set('from', $('from').value); q.set('to', $('to').value); }
+  history.replaceState(null, '', '?' + q.toString());
+}
+
+async function load() {
+  if (loading || !unitSel.value) return;
+  const { from, to } = rangeFromState();
+  if (currentRange === 'custom' && !(from < to)) { setStatus('Pick a "from" before the "to".', true); return; }
+  document.querySelectorAll('button[data-range]').forEach((b) => b.classList.toggle('active', b.dataset.range === currentRange));
+  syncUrl();
+  const q = new URLSearchParams({ unit: unitSel.value });
+  if (from != null) q.set('from', from.toFixed(3));
+  if (to != null) q.set('to', to.toFixed(3));
+  q.set('points', String(Math.max(200, Math.min(1500, Math.round($('freqChart').clientWidth || 1000)))));
+  loading = true;
+  document.querySelectorAll('.controls button').forEach((b) => (b.disabled = true));
+  setStatus('Loading…');
+  try {
+    const res = await fetch('/api/history/overview?' + q.toString());
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 429) { setStatus(`Too many requests — try again in ${Math.ceil(body.retry_after_s || 5)} s.`, true); return; }
+    if (!res.ok) { setStatus(`Could not load history: ${body.error || res.status}`, true); return; }
+    render(body);
+  } catch (e) {
+    setStatus('Could not reach the server.', true);
+  } finally {
+    loading = false;
+    document.querySelectorAll('.controls button').forEach((b) => (b.disabled = false));
+  }
+}
+
+function render(d) {
+  const x0 = d.from_us / 1e6, x1 = Math.min(d.to_us, d.now_us) / 1e6;
+  span_s = Math.max(1, x1 - x0);
+  if (currentRange !== 'custom') { $('from').value = toLocalInput(x0); $('to').value = toLocalInput(x1); }
+  const spans = d.excluded.periods.map((p) => [p.start_us / 1e6, p.end_us / 1e6]);
+
+  const f = d.freq;
+  freqChart.data.datasets[0].data = withGaps(f.t, f.max, f.bucket_s);
+  freqChart.data.datasets[1].data = withGaps(f.t, f.min, f.bucket_s);
+  freqChart.data.datasets[2].data = withGaps(f.t, f.mean, f.bucket_s);
+  const r = d.rocof;
+  rocofChart.data.datasets[0].data = withGaps(r.t, r.max_abs, r.bucket_s);
+  const c = d.coverage;
+  covChart.data.datasets[0].data = c.t.map((t, i) => ({ x: t + c.bucket_s / 2, y: c.good_pct[i] }));
+  covChart.data.datasets[1].data = c.t.map((t, i) => ({ x: t + c.bucket_s / 2, y: c.excluded_pct[i] }));
+  covChart.data.datasets[2].data = c.t.map((t, i) => ({ x: t + c.bucket_s / 2,
+    y: Math.max(0, 100 - c.good_pct[i] - c.excluded_pct[i]) }));
+  for (const ch of [freqChart, rocofChart, covChart]) {
+    ch.options.scales.x.min = x0;
+    ch.options.scales.x.max = x1;
+    if (ch.options.plugins.excludedShading) ch.options.plugins.excludedShading.spans = spans;
+    ch.update();
+  }
+
+  const srcText = (s) => s === 'raw' ? 'raw readings' : '1-minute aggregates';
+  const srcs = [...new Set(d.sources.map((s) => s.source))];
+  const fromText = f.source === 'raw' ? 'raw readings'
+    : srcs.length > 1 ? 'per-minute statistics (stored 1-minute aggregates; raw readings for days not aggregated yet)'
+    : srcs[0] === 'raw' ? 'per-minute statistics of the raw readings' : 'stored 1-minute aggregates';
+  $('freqNote').textContent = `Mean with min–max band per ${fmtDur(f.bucket_s)} bucket, from ${fromText}. ` +
+    `Red shading = excluded data. Times in ${TZ}.`;
+  $('rocofNote').textContent = `Largest |RoCoF| per ${fmtDur(r.bucket_s)}.`;
+  $('covNote').textContent = `Share of each ${fmtDur(c.bucket_s)} with a good GPS-timed reading per second; ` +
+    'excluded = readings left out by the rules below; missing = nothing received (or no GPS lock).';
+
+  renderDaily(d.daily);
+  renderExcluded(d);
+  $('content').hidden = false;
+  const nEx = d.excluded.periods.length;
+  setStatus(`${unitSel.value} · ${fmtFull(x0)} → ${fmtFull(x1)} · ` +
+    `${srcs.map(srcText).join(' + ')} · ${nEx} excluded period${nEx === 1 ? '' : 's'} · server ${d.elapsed_ms} ms`);
+}
+
+function renderDaily(days) {
+  const t = $('daily');
+  t.replaceChildren();
+  const head = t.createTHead().insertRow();
+  for (const h of ['Day', 'Source', 'Mean (Hz)', 'Std (mHz)', 'Min (Hz)', 'Max (Hz)', 'Max |RoCoF| (Hz/s)', 'Coverage', 'Excluded']) {
+    const th = document.createElement('th'); th.textContent = h; head.appendChild(th);
+  }
+  const body = t.createTBody();
+  const fx = (v, n) => v == null ? '—' : v.toFixed(n);
+  for (const d of [...days].reverse()) {
+    const tr = body.insertRow();
+    for (const v of [d.day, d.source === '1min' ? '1-min' : (d.source || '—'), fx(d.mean, 4),
+                     d.std == null ? '—' : (d.std * 1000).toFixed(1), fx(d.min, 3), fx(d.max, 3),
+                     fx(d.rocof_max_abs, 3), `${d.coverage_pct.toFixed(1)} %`,
+                     !d.excluded_pct ? '—' : d.excluded_pct < 0.1 ? '< 0.1 %' : `${d.excluded_pct.toFixed(1)} %`]) {
+      const td = tr.insertCell(); td.textContent = v;
+    }
+  }
+  if (!days.length) {
+    const td = body.insertRow().insertCell(); td.colSpan = 9; td.className = 'empty'; td.textContent = 'No data in this range.';
+  }
+}
+
+function renderExcluded(d) {
+  const r = d.excluded.rules;
+  $('exRules').textContent = `Left out of every chart and statistic: readings with amplitude < ${r.amplitude_below_v} V, ` +
+    `frequency outside ${r.freq_band_hz[0]}–${r.freq_band_hz[1]} Hz, and known-bad boots (${r.known_bad_boots.join(', ')}). ` +
+    'From 1-minute aggregates a whole minute is left out, since its readings can no longer be told apart.';
+  const ul = $('exList');
+  ul.replaceChildren();
+  const notes = Object.fromEntries(d.known_bad.map((k) => [k.start_us, k]));
+  for (const p of d.excluded.periods) {
+    const li = document.createElement('li');
+    const dur = Math.round((p.end_us - p.start_us) / 1e6);
+    const kb = notes[p.start_us];
+    li.textContent = `${fmtFull(p.start_us / 1e6)} · ${fmtDur(dur)} · ` +
+      p.reasons.map((x) => REASONS[x] || x).join(', ') +
+      (p.n ? ` · ${p.n} reading${p.n === 1 ? '' : 's'}` : '') + (kb ? ` · boot ${kb.boot_id}: ${kb.note}` : '');
+    ul.appendChild(li);
+  }
+  if (d.excluded.truncated) {
+    const li = document.createElement('li'); li.textContent = '… more periods not listed; narrow the range to see them.'; ul.appendChild(li);
+  }
+  if (!d.excluded.periods.length) {
+    const li = document.createElement('li'); li.textContent = 'None in this range.'; ul.appendChild(li);
+  }
+}
+
+// --- wiring
+if (!UNITS.length) {
+  $('noUnits').hidden = false;
+  document.querySelector('.controls').hidden = true;
+} else {
+  for (const u of UNITS) { const o = document.createElement('option'); o.value = o.textContent = u; unitSel.appendChild(o); }
+  const q = new URLSearchParams(location.search);
+  if (UNITS.includes(q.get('unit'))) unitSel.value = q.get('unit');
+  const r = q.get('range');
+  if (r === 'custom' && q.get('from') && q.get('to')) {
+    currentRange = 'custom'; $('from').value = q.get('from'); $('to').value = q.get('to');
+  } else if (r in PRESETS || r === 'all') {
+    currentRange = r;
+  }
+  document.querySelectorAll('button[data-range]').forEach((b) =>
+    b.addEventListener('click', () => { currentRange = b.dataset.range; load(); }));
+  $('apply').addEventListener('click', () => { currentRange = 'custom'; load(); });
+  unitSel.addEventListener('change', load);
+  load();
+}
+</script>
+</body>
+</html>
