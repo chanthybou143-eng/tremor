@@ -28,7 +28,7 @@ import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .ingest import (
     FLAG_TIME_IMPLAUSIBLE,
@@ -120,21 +120,33 @@ class DayState:
 
 
 @dataclass(frozen=True)
-class AggExclusion:
-    """Which 1-minute aggregates the history overview leaves out (see history.py). A minute is
-    all-or-nothing: its stored statistics can no longer be split into good and bad readings."""
+class Exclusion:
+    """Which readings the history overview leaves out (see history.py). For 1-minute aggregates a
+    minute is all-or-nothing: its stored statistics can no longer be split into good and bad
+    readings."""
     freq_lo: float
     freq_hi: float
     amp_min: float
     bad_minutes: Tuple[Tuple[int, int], ...] = ()     # inclusive [first, last] minute ranges
+    bad_boots: Tuple[str, ...] = ()
 
-    def sql(self) -> Tuple[str, list]:
+    def agg_sql(self) -> Tuple[str, list]:
+        """True for an excluded readings_1min row."""
         parts = ["freq_min < ?", "freq_max > ?", "(amp_mean IS NOT NULL AND amp_mean < ?)"]
         args: list = [self.freq_lo, self.freq_hi, self.amp_min]
         for a, b in self.bad_minutes:
             parts.append("(minute >= ? AND minute <= ?)")
             args += [a, b]
         return "(" + " OR ".join(parts) + ")", args
+
+    def raw_good_sql(self) -> Tuple[str, list]:
+        """True for a raw reading that is NOT excluded."""
+        sql = "freq_hz >= ? AND freq_hz <= ? AND (amplitude_v IS NULL OR amplitude_v >= ?)"
+        args: list = [self.freq_lo, self.freq_hi, self.amp_min]
+        if self.bad_boots:
+            sql += f" AND (boot_id IS NULL OR boot_id NOT IN ({','.join('?' * len(self.bad_boots))}))"
+            args += list(self.bad_boots)
+        return sql, args
 
 
 @dataclass(frozen=True)
@@ -172,12 +184,27 @@ class ReadingStore(ABC):
 
     @abstractmethod
     def rollup_aggregates(self, unit_id: str, from_minute: int, to_minute: int, group_s: int,
-                          exclude: "AggExclusion") -> List[tuple]:
+                          exclude: "Exclusion") -> List[tuple]:
         """1-minute aggregates in [from_minute, to_minute] summed into ``group_s``-second buckets
         (aligned to the epoch; ``group_s`` is a multiple of 60) for the history overview. A minute
         matching ``exclude`` is counted as excluded, never mixed into the statistics. One row per
         non-empty bucket: (bucket_start_s, n_good, n_excluded, secs_good, secs_excluded,
         sum(f - 50), sum((f - 50)^2), freq_min, freq_max, rocof_max_abs)."""
+
+    @abstractmethod
+    def raw_histogram(self, unit_id: str, chunks: Sequence[Tuple[int, int]], bins_per_hz: int,
+                      exclude: "Exclusion", deadline: Optional[float] = None) -> List[List[Tuple[int, int, int]]]:
+        """For each [start_us, end_us) chunk, in order: good locked readings counted per (UTC hour,
+        frequency bin), bin = floor(freq_hz * bins_per_hz). One connection, one statement per chunk
+        (callers keep chunks to a few hours: a read holds the shared lock an ingest commit has to
+        wait for, released between statements). Stops before a chunk once ``time.perf_counter()``
+        is past ``deadline``; returns results for the chunks it did."""
+
+    @abstractmethod
+    def aggregate_mean_histogram(self, unit_id: str, from_minute: int, to_minute: int, bins_per_hz: int,
+                                 exclude: "Exclusion") -> List[Tuple[int, int]]:
+        """(bin of freq_mean, readings) over non-excluded 1-minute aggregates: the distribution of
+        1-minute MEANS, weighted by readings -- all that is left once raw readings are pruned."""
 
     @abstractmethod
     def read_points(self, unit_id: str, start_us: int, end_us: int) -> List[Tuple[int, float, Optional[float], Optional[str]]]:
@@ -186,7 +213,7 @@ class ReadingStore(ABC):
 
     @abstractmethod
     def excluded_aggregate_minutes(self, unit_id: str, from_minute: int, to_minute: int,
-                                   exclude: "AggExclusion", limit: int) -> List[AggRow]: ...
+                                   exclude: "Exclusion", limit: int) -> List[AggRow]: ...
 
     # --- retention primitives (see retention.py) ----------------------------
     @abstractmethod
@@ -328,15 +355,26 @@ def _row(t) -> Row:
 
 
 class SqliteReadingStore(ReadingStore):
+    # Diagnostics hook (scripts/bench_history.py): called with (name, seconds) for each statement of
+    # a multi-statement read, i.e. how long each one held the shared lock.
+    statement_timer = None
+
     def __init__(self, path: str, synchronous: str = "FULL", busy_timeout_s: float = 30.0,
-                 read_timeout_s: float = 5.0):
+                 read_timeout_s: float = 5.0, read_only: bool = False):
+        """``read_only`` opens an existing database with mode=ro (no schema setup, no pragmas that
+        write) -- for tools that read the live database next to the running server."""
         if synchronous.upper() not in ("FULL", "NORMAL", "EXTRA", "OFF"):
             raise ValueError("synchronous must be FULL, NORMAL, EXTRA or OFF")
         self.path = path
         self._sync = synchronous.upper()
         self._timeout = busy_timeout_s
         self._read_timeout = read_timeout_s
+        self._read_only = read_only
         self._count_cache: Tuple[float, int] = (0.0, 0)
+        if read_only:
+            if not os.path.isfile(path):
+                raise StoreError(f"cannot open {path} read-only: no such file")
+            return
         d = os.path.dirname(os.path.abspath(path))
         os.makedirs(d, exist_ok=True)
         try:
@@ -352,11 +390,16 @@ class SqliteReadingStore(ReadingStore):
     # -- connection handling: one short-lived connection per call ------------
     @contextmanager
     def _conn(self, timeout: Optional[float] = None) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=self._timeout if timeout is None else timeout,
-                             isolation_level=None)
+        t = self._timeout if timeout is None else timeout
+        if self._read_only:
+            db = sqlite3.connect(f"file:{os.path.abspath(self.path)}?mode=ro", uri=True, timeout=t,
+                                 isolation_level=None)
+        else:
+            db = sqlite3.connect(self.path, timeout=t, isolation_level=None)
         try:
-            db.execute("PRAGMA journal_mode = DELETE")     # explicitly NOT WAL: NFS-backed disk
-            db.execute(f"PRAGMA synchronous = {self._sync}")
+            if not self._read_only:
+                db.execute("PRAGMA journal_mode = DELETE")     # explicitly NOT WAL: NFS-backed disk
+                db.execute(f"PRAGMA synchronous = {self._sync}")
             yield db
         finally:
             db.close()
@@ -490,7 +533,7 @@ class SqliteReadingStore(ReadingStore):
     def rollup_aggregates(self, unit_id, from_minute, to_minute, group_s, exclude) -> List[tuple]:
         if group_s % 60:
             raise ValueError("group_s must be a whole number of minutes")
-        ex, ex_args = exclude.sql()
+        ex, ex_args = exclude.agg_sql()
         g = group_s // 60
         with self._read() as db:
             return db.execute(
@@ -507,6 +550,29 @@ class SqliteReadingStore(ReadingStore):
                 "GROUP BY minute / ? ORDER BY 1",
                 (g, group_s, *ex_args, unit_id, from_minute, to_minute, g)).fetchall()
 
+    def raw_histogram(self, unit_id, chunks, bins_per_hz, exclude, deadline=None):
+        good, args = exclude.raw_good_sql()
+        sql = ("SELECT gps_utc_us / 3600000000, CAST(freq_hz * ? + 1e-9 AS INTEGER), count(*) FROM readings "
+               f"WHERE unit_id=? AND gps_utc_us >= ? AND gps_utc_us < ? AND {good} GROUP BY 1, 2")
+        out: List[List[Tuple[int, int, int]]] = []
+        with self._read() as db:
+            for start_us, end_us in chunks:
+                if deadline is not None and time.perf_counter() > deadline:
+                    break
+                t = time.perf_counter()
+                out.append(db.execute(sql, (bins_per_hz, unit_id, start_us, end_us, *args)).fetchall())
+                if self.statement_timer is not None:
+                    self.statement_timer("raw_histogram", time.perf_counter() - t)
+        return out
+
+    def aggregate_mean_histogram(self, unit_id, from_minute, to_minute, bins_per_hz, exclude):
+        ex, args = exclude.agg_sql()
+        with self._read() as db:
+            return db.execute(
+                "SELECT CAST(freq_mean * ? + 1e-9 AS INTEGER), SUM(n) FROM readings_1min "
+                f"WHERE unit_id=? AND minute>=? AND minute<=? AND n > 0 AND NOT {ex} GROUP BY 1",
+                (bins_per_hz, unit_id, from_minute, to_minute, *args)).fetchall()
+
     def read_points(self, unit_id, start_us, end_us):
         with self._read() as db:
             return db.execute(
@@ -515,7 +581,7 @@ class SqliteReadingStore(ReadingStore):
                 (unit_id, start_us, end_us)).fetchall()
 
     def excluded_aggregate_minutes(self, unit_id, from_minute, to_minute, exclude, limit) -> List[AggRow]:
-        ex, ex_args = exclude.sql()
+        ex, ex_args = exclude.agg_sql()
         with self._read() as db:
             rows = db.execute(
                 "SELECT unit_id, minute, n, n_unlocked, freq_mean, freq_min, freq_max, freq_std, "

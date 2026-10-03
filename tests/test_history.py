@@ -403,3 +403,159 @@ def test_a_month_with_a_day_of_raw_readings_is_fast(tmp_path):
         assert j["freq"]["t"]
     # generous for a slow CI box; the real check is the PythonAnywhere benchmark in the runbook
     assert max(timings.values()) < 2.0, timings
+
+
+# --- the 2026-09-26 dip (unit-1, 06:44-06:58 UTC, low ~49.88-49.90 Hz) ------------------------------
+
+DIP_START, DIP_LOW, DIP_END = utc(2026, 9, 26, 6, 44), utc(2026, 9, 26, 6, 51), utc(2026, 9, 26, 6, 58)
+
+
+def dip(t: float) -> float:
+    """50 Hz, down to 49.885 Hz at 06:51, back by 06:58 -- the shape of the real event."""
+    if DIP_START <= t <= DIP_LOW:
+        return 50.0 - 0.115 * (t - DIP_START) / (DIP_LOW - DIP_START)
+    if DIP_LOW < t <= DIP_END:
+        return 49.885 + 0.115 * (t - DIP_LOW) / (DIP_END - DIP_LOW)
+    return 50.0
+
+
+def test_the_26_sep_dip_shows_in_the_raw_and_in_the_aggregate_views(tmp_path):
+    clock = FakeClock(utc(2026, 9, 26, 6))
+    app = make_app(tmp_path, clock)
+    client = app.test_client()
+    try:
+        post_series(client, clock, utc(2026, 9, 26, 6), 2 * 3600, freq=dip)
+        clock.t = utc(2026, 9, 27, 2)
+        app.config["TREMOR_RETENTION"].run_until_idle()          # 26 Sep is now aggregated
+
+        def check(j, source):
+            assert {s["source"] for s in j["sources"]} == {source}
+            lows = [(t, lo) for t, lo in zip(j["freq"]["t"], j["freq"]["min"]) if lo < 49.95]
+            assert lows, "dip missing"
+            assert 49.88 <= min(lo for _t, lo in lows) <= 49.90
+            assert all(DIP_START - 300 <= t <= DIP_END for t, _lo in lows)
+            day = next(d for d in j["daily"] if d["day"] == "2026-09-26")
+            assert 49.88 <= day["min"] <= 49.90
+            assert not any(p["start_us"] < DIP_END * US and p["end_us"] > DIP_START * US
+                           for p in j["excluded"]["periods"])        # a real event: never excluded
+            h = j["histogram"]["raw"]
+            assert h["lo_hz"] == pytest.approx(49.885) and h["counts"][0] > 0
+
+        check(overview(client, **{"from": utc(2026, 9, 26, 6, 30), "to": utc(2026, 9, 26, 7, 15)}), "raw")
+        check(overview(client, **{"from": utc(2026, 9, 25), "to": utc(2026, 9, 27)}), "1min")
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+# --- frequency distribution --------------------------------------------------------------------------
+
+def test_the_histogram_counts_good_readings_per_5_mhz_bin(ctx):
+    client, clock, _ = ctx
+    fs = [50.0 + 0.001 * (i % 23) for i in range(1200)]
+    post_series(client, clock, DAY0, 1200, freq=lambda t: fs[int(round(t - DAY0))])
+    post_series(client, clock, DAY0 + 1200, 60, seq0=1200, freq=lambda t: 49.0, amp=0.02)    # excluded
+    clock.t = DAY0 + 1300
+    h = overview(client, **{"from": DAY0, "to": DAY0 + 1260})["histogram"]
+    want: dict = {}
+    for f in fs:
+        k = int(f * 200 + 1e-9)
+        want[k] = want.get(k, 0) + 1
+    assert h["bin_hz"] == 0.005 and h["raw"]["n"] == 1200 and h["complete"] and h["minute_means"] is None
+    assert h["raw"]["lo_hz"] == 50.0 and h["raw"]["counts"] == [want[k] for k in sorted(want)]
+
+
+def test_python_and_sql_binning_agree(four_days):
+    """Short range: binned in Python from the raw pass. Long range over aggregated days whose raw
+    readings are still stored: binned in SQL. Same readings, same bins."""
+    client, _clock, app = four_days
+    store = app.config["TREMOR_STORE"]
+    day = int(utc(2026, 9, 21) * US)
+    py = build_overview(store, "unit-1", day, day + 6 * 3600 * US, NOW)["histogram"]
+    sql = build_overview(store, "unit-1", day, day + 86400 * US, NOW)["histogram"]     # > 6 h: aggregates
+    assert py["whole_hours"] is False and sql["whole_hours"] is True
+    assert py["raw"] == sql["raw"] and py["raw"]["n"] == 6 * 3600
+
+
+def test_days_with_pruned_raw_readings_give_a_separate_distribution_of_minute_means(tmp_path):
+    store = open_store(str(tmp_path / "r.db"))
+    d0 = int(DAY0 // 86400)
+    store.save_aggregates([AggRow("unit-1", d0 * 1440 + m, 60, 0, 50.0 + 0.001 * (m % 10), 49.9, 50.1, 0.02,
+                                  0.01, 0.74) for m in range(1440)])
+    store.save_day_state(DayState("unit-1", d0, export_done=True, agg_done=True, verified_at=DAY0,
+                                  pruned_rows=86400, pruned_done=True))
+    h = build_overview(store, "unit-1", d0 * 86400 * US, (d0 + 1) * 86400 * US, NOW)["histogram"]
+    assert h["raw"] is None
+    assert h["minute_means"]["lo_hz"] == 50.0 and h["minute_means"]["n"] == 1440 * 60
+    assert h["minute_means"]["counts"] == [720 * 60, 720 * 60]           # 50.000-50.004 | 50.005-50.009
+    assert h["minute_means_ranges"] == [dict(from_us=d0 * 86400 * US, to_us=(d0 + 1) * 86400 * US)]
+
+
+def test_raw_histogram_work_is_budgeted_and_finished_by_later_requests(four_days):
+    client, _clock, app = four_days
+    store = app.config["TREMOR_STORE"]
+    cache = RawDayCache()
+    frm, to = int(DAY0 * US), int(utc(2026, 9, 23) * US)          # three aggregated days, raw still stored
+    j = build_overview(store, "unit-1", frm, to, NOW, cache=cache, hist_budget_s=0.0)
+    assert j["histogram"]["complete"] is False and j["histogram"]["pending_hours"] == 72
+    j = build_overview(store, "unit-1", frm, to, NOW, cache=cache)
+    assert j["histogram"]["complete"] is True and j["histogram"]["raw"]["n"] == 3 * 6 * 3600
+
+
+def test_no_single_raw_read_spans_more_than_six_hours(four_days):
+    client, _clock, app = four_days
+    store = app.config["TREMOR_STORE"]
+    spans = []
+    real_points, real_hist = store.read_points, store.raw_histogram
+    store.read_points = lambda u, a, b: spans.append(b - a) or real_points(u, a, b)
+    store.raw_histogram = lambda u, chunks, *r, **k: spans.extend(b - a for a, b in chunks) or real_hist(u, chunks, *r, **k)
+    build_overview(store, "unit-1", int(DAY0 * US), int(NOW * US), NOW)
+    assert spans and max(spans) <= 6 * 3600 * US + 10 * US
+
+
+# --- server-wide overview cache ----------------------------------------------------------------------
+
+def test_long_ranges_are_cached_server_wide_until_ttl_or_new_aggregates(four_days, monkeypatch):
+    client, clock, app = four_days
+    cache = app.config["TREMOR_OVERVIEW_CACHE"]
+    q = {"from": NOW - 8 * 86400}
+    first = overview(client, **q)
+    assert first["cache"] == {"hit": False, "age_s": 0.0}
+    second = overview(client, **{"from": NOW - 8 * 86400 + 30, "to": NOW + 30})    # same 5-minute slots
+    assert second["cache"]["hit"] is True and second["freq"] == first["freq"]
+    # short ranges are never cached
+    assert overview(client, **{"from": NOW - 3600, "to": NOW})["cache"]["hit"] is False
+    assert overview(client, **{"from": NOW - 3600, "to": NOW})["cache"]["hit"] is False
+    # TTL
+    real_mono = cache._mono
+    cache._mono = lambda: real_mono() + 301
+    assert overview(client, **{"from": NOW - 8 * 86400, "to": NOW})["cache"]["hit"] is False
+    cache._mono = real_mono
+    assert overview(client, **{"from": NOW - 8 * 86400, "to": NOW})["cache"]["hit"] is True
+    # a new day aggregated by retention -> stale
+    clock.t = utc(2026, 9, 24, 2)
+    app.config["TREMOR_RETENTION"].run_until_idle()
+    again = overview(client, **{"from": NOW - 8 * 86400, "to": NOW})
+    assert again["cache"]["hit"] is False and again["daily"][-1]["source"] == "1min"
+
+
+def test_an_incomplete_histogram_is_not_cached(four_days, monkeypatch):
+    client, _clock, app = four_days
+    import tremor.history as history
+    monkeypatch.setattr(history, "HIST_RAW_BUDGET_S", 0.0)
+    q = {"from": NOW - 8 * 86400, "to": NOW}
+    assert overview(client, **q)["histogram"]["complete"] is False
+    assert overview(client, **q)["cache"]["hit"] is False
+
+
+# --- read-only store (bench against the live database) ------------------------------------------------
+
+def test_a_read_only_store_reads_but_never_writes(four_days_db, tmp_path):
+    ro = open_store(str(four_days_db), read_only=True)
+    j = build_overview(ro, "unit-1", int(DAY0 * US), int(NOW * US), NOW)
+    assert j["daily"][0]["n"] == 6 * 3600
+    from tremor.store import StoreError
+    with pytest.raises(StoreError):
+        ro.save_day_state(DayState("unit-1", 1))
+    with pytest.raises(StoreError):
+        open_store(str(tmp_path / "missing.db"), read_only=True)
+    assert not (tmp_path / "missing.db").exists()

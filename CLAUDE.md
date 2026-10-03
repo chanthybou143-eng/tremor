@@ -24,7 +24,7 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"   # first-time setup
 .venv/bin/pytest -q                                          # run all tests
 PYTHONPATH=src python scripts/replay_unit1.py --hours 2       # end-to-end: real Flask server + simulated Unit 1 traffic
 python scripts/measure_db_latency.py --dir ~/tremor_data      # run ON PythonAnywhere: SQLite commit latency vs the device's 4 s deadline
-python scripts/bench_history.py --dir ~/tremor_data         # run ON PythonAnywhere: /history server time on a scratch month of data
+python scripts/bench_history.py --db ~/tremor_data/readings.db   # run ON PythonAnywhere: /history server time on a copy of the real DB (--live: read-only)
 .venv/bin/pytest tests/test_frequency.py -v                  # one file
 .venv/bin/pytest tests/test_frequency.py::test_estimate_frequency_hand_built  # one test
 .venv/bin/pytest -k "noise"                                  # by keyword
@@ -233,7 +233,8 @@ header; tokens live only in the environment (the PythonAnywhere WSGI file) and, 
 
 - **`TREMOR_INGEST_AUTH`:** `off` (default when no tokens are set) / `optional` (a missing token is accepted, logged
   once per 10 min per unit and counted; a *wrong* token is rejected with 401) / `required`. Legacy Unit 1 cannot
-  send a token, so the rollout is `optional` now and `required` after the reflash; `/api/health` →
+  send a token, so the rollout was `optional` until the reflash. **The server has run `required` since
+  2026-09-27.** `/api/health` →
   `ingest_auth` (`missing_accepted`, `units_seen_without_token`) shows when it is safe to flip.
 - **`TREMOR_INGEST_TOKENS`:** `unit-1=<token>,unit-2=<token>` (each >= 16 chars). A 401 never says whether the
   token was missing or wrong; comparison is constant-time; misconfiguration raises at startup.
@@ -249,7 +250,8 @@ header; tokens live only in the environment (the PythonAnywhere WSGI file) and, 
 ### History page (`history.py`, `templates/history.html`)
 
 `/history` (public, linked from the dashboard) shows everything stored for a unit: frequency mean with a
-min-max band, max |RoCoF| per minute, hourly coverage (good / excluded / missing) and a per-UTC-day table.
+min-max band, a frequency distribution (5 mHz bins), max |RoCoF| per minute, hourly coverage (good / excluded /
+missing) and a per-UTC-day table.
 The page makes ONE request, `GET /api/history/overview?unit=&from=&to=&points=`, which `history.build_overview`
 answers already downsampled (`points` caps the frequency buckets, 100-2000; coverage <= 800 bars). It does not
 page through `/api/history` (that endpoint has `resolution=raw|1min|auto`, where `auto` = raw within
@@ -266,11 +268,27 @@ page through `/api/history` (that endpoint has `resolution=raw|1min|auto`, where
   split, so a minute whose min/max is out of band or whose mean amplitude is low is excluded whole. RoCoF from
   raw readings is fitted over good readings only (`timeline.rocof_series`, unchanged); stored aggregates were
   fitted over every locked reading.
+- **Frequency distribution:** per good reading wherever raw readings still exist (the last `raw_days`): binned in
+  Python in the raw pass (short ranges, today), else in SQL per UTC hour (`store.raw_histogram`, cached 6 h).
+  Long ranges count whole hours at their two ends. Raw SQL work is capped per request (`HIST_RAW_BUDGET_S`,
+  0.5 s); hours past the cap are reported as `pending_hours` and filled in by later requests. Days whose raw
+  rows are pruned only have aggregates, so they give a separate `minute_means` histogram -- the distribution of
+  1-minute MEANS, weighted by readings, which is narrower than a per-reading one; the page shows it as its own
+  grey series, never merged into the per-reading one.
+- **Short reads:** every raw read covers at most 6 h (`RAW_READ_CHUNK_H`) -- under the rollback journal a read
+  holds the shared lock an ingest COMMIT waits for. Histogram chunks share one connection, one statement each.
+- **Server-wide cache** (`OverviewCache`): whole responses for ranges >= 7 days, keyed by unit, `points` and
+  from/to in 5-minute slots, TTL 5 min, dropped as soon as the unit's retention day states change
+  (`day_state_signature`: a day aggregated, verified or pruned -- also by a console `retention run`). A response
+  with an unfinished histogram is never cached. Responses carry `cache: {hit, age_s}`.
 - **Coverage** = seconds with a good GPS-timed reading (a minute counts at most 60), against the elapsed part of
   the range. Unlocked readings count as missing.
 - **Speed matters:** a free PythonAnywhere account has one web worker, so a slow history request delays the
-  Pico's ingest POST (4 s deadline). Locally a cold month (30 days of aggregates + 26 h raw) takes ~0.35 s, warm
-  ~0.08 s; `scripts/bench_history.py` measures the same on the server's filesystem.
+  Pico's ingest POST (4 s deadline). Locally, on a 141 MB database (30 days of aggregates, 14 days of raw at
+  1/s), a cold month takes ~0.6 s (0.5 s of it the histogram budget), warm ~0.08 s, longest statement ~65 ms.
+  `scripts/bench_history.py --db` measures the same against a copy of the real database (online backup in
+  ~1 MB steps; refuses to copy above 75% of the disk quota) or, with `--live`, the real file opened read-only
+  (`open_store(..., read_only=True)`); it reports the longest single statement too.
 
 ### Standalone Unit 1 (flashed 2026-09-26; `main.py`, `boot_support.py`, `wdt_support.py`, `RECOVERY.md`)
 
@@ -398,9 +416,9 @@ unplugged, measured exactly on the device).
 * Optional: precompile the client with `mpy-cross` (boot compiles ~52 KB of source each time).
 * `http_keepalive.py` is on the flash but unused; leave it or remove it in a maintenance session.
 
-### Switching the server to `TREMOR_INGEST_AUTH=required`
+### Switching the server to `TREMOR_INGEST_AUTH=required` (done 2026-09-27)
 
-Do it only when all hold after >= 24 h of standalone running: `ingest_auth.missing_accepted` has not risen
+Kept for reference (and for unit-2's rollout). It was done only when all hold after >= 24 h of standalone running: `ingest_auth.missing_accepted` has not risen
 since the standalone unit's first POST, `rejected_wrong` is 0, `units_seen_without_token` is empty, and
 `authenticated` keeps rising at ~2 per minute. Roll back by setting `optional` again and reloading.
 

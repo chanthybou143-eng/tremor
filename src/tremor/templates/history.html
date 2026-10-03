@@ -95,6 +95,11 @@
       <div class="chart-note" id="freqNote"></div>
     </div>
     <div class="card">
+      <h2>Frequency distribution</h2>
+      <div class="chart-container short"><canvas id="histChart"></canvas></div>
+      <div class="chart-note" id="histNote"></div>
+    </div>
+    <div class="card">
       <h2>RoCoF</h2>
       <div class="chart-container short"><canvas id="rocofChart"></canvas></div>
       <div class="chart-note" id="rocofNote"></div>
@@ -251,6 +256,35 @@ const covChart = new Chart($('covChart').getContext('2d'), {
   },
 });
 
+const histChart = new Chart($('histChart').getContext('2d'), {
+  type: 'bar',
+  data: { datasets: [
+    { label: 'readings', data: [], backgroundColor: 'rgba(77, 163, 255, 0.75)' },
+    { label: '1-minute means (raw pruned)', data: [], backgroundColor: 'rgba(138, 145, 155, 0.55)' },
+  ] },
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
+    plugins: {
+      legend: { labels: { filter: (i, data) => data.datasets[i.datasetIndex].data.length > 0 } },
+      tooltip: { callbacks: {
+        title: (items) => items.length ? `${(items[0].parsed.x - 0.0025).toFixed(3)}–${(items[0].parsed.x + 0.0025).toFixed(3)} Hz` : '',
+        label: (i) => `${i.dataset.label}: ${i.parsed.y.toFixed(2)} %`,
+      } },
+    },
+    datasets: { bar: { barPercentage: 1.0, categoryPercentage: 1.0, grouped: false } },
+    scales: {
+      x: { type: 'linear', offset: false, title: { display: true, text: 'Frequency (Hz), 5 mHz bins' },
+           ticks: { callback: (v) => Number(v).toFixed(2) } },
+      y: { beginAtZero: true, title: { display: true, text: '% of readings' } },
+    },
+  },
+});
+
+function histPoints(h, binHz) {
+  if (!h) return [];
+  return h.counts.map((c, i) => ({ x: h.lo_hz + (i + 0.5) * binHz, y: 100 * c / h.n }));
+}
+
 // A line break wherever consecutive buckets are further apart than one bucket: Chart.js only
 // breaks a line at an explicit null, it never infers a gap from the x spacing.
 function withGaps(ts, ys, bucket) {
@@ -345,12 +379,26 @@ function render(d) {
   $('covNote').textContent = `Share of each ${fmtDur(c.bucket_s)} with a good GPS-timed reading per second; ` +
     'excluded = readings left out by the rules below; missing = nothing received (or no GPS lock).';
 
+  const h = d.histogram;
+  histChart.data.datasets[0].data = histPoints(h.raw, h.bin_hz);
+  histChart.data.datasets[1].data = histPoints(h.minute_means, h.bin_hz);
+  histChart.update();
+  const hn = [];
+  if (h.raw) hn.push(`${h.raw.n.toLocaleString()} good readings`);
+  if (h.whole_hours && h.raw) hn.push('counted per whole UTC hour at the two ends of the range');
+  if (h.minute_means) hn.push(`grey: ${h.minute_means.n.toLocaleString()} readings whose raw values are pruned, ` +
+    'shown as the distribution of their 1-minute means (narrower than a per-reading distribution; not comparable bar for bar)');
+  if (!h.complete) hn.push(`${h.pending_hours} h not counted yet — reload in a minute to fill them in`);
+  if (!h.raw && !h.minute_means) hn.push('no data');
+  $('histNote').textContent = hn.join(' · ') + '.';
+
   renderDaily(d.daily);
   renderExcluded(d);
   $('content').hidden = false;
   const nEx = d.excluded.periods.length;
   setStatus(`${unitSel.value} · ${fmtFull(x0)} → ${fmtFull(x1)} · ` +
-    `${srcs.map(srcText).join(' + ')} · ${nEx} excluded period${nEx === 1 ? '' : 's'} · server ${d.elapsed_ms} ms`);
+    `${srcs.map(srcText).join(' + ')} · ${nEx} excluded period${nEx === 1 ? '' : 's'} · ` +
+    (d.cache && d.cache.hit ? `cached ${Math.round(d.cache.age_s)} s ago` : `server ${d.elapsed_ms} ms`));
 }
 
 function renderDaily(days) {

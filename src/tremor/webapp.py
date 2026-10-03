@@ -31,7 +31,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from .history import DEFAULT_POINTS, MAX_POINTS, MIN_POINTS, RawDayCache, build_overview
+from .history import (DEFAULT_POINTS, MAX_POINTS, MIN_POINTS, OVERVIEW_CACHE_MIN_SPAN_S, OverviewCache,
+                      RawDayCache, build_overview, day_state_signature)
 from .ingest import PayloadError, parse_payload
 from .retention import RetentionConfig, RetentionEngine, day_to_date
 from .rocof import rocof_from_window
@@ -631,6 +632,7 @@ def create_app(
         return render_template("index.html")
 
     raw_day_cache = RawDayCache()
+    overview_cache = OverviewCache()
 
     @app.get("/history")
     def history_page():
@@ -759,7 +761,8 @@ def create_app(
     def api_history_overview():
         """Everything the /history page draws, downsampled server-side (see history.py). Shares
         /api/history's rate limit. ``from`` omitted = from the unit's first data; ``to`` omitted
-        = now. ``points`` caps the frequency chart's buckets."""
+        = now. ``points`` caps the frequency chart's buckets. Ranges of 7 days or more are served
+        from a server-wide cache (history.OverviewCache) when possible."""
         limited = _rate_limited(history_limiter)
         if limited is not None:
             return limited
@@ -790,8 +793,20 @@ def create_app(
             from_us = data_start_us if from_us is None else from_us
             if from_us >= to_us:
                 return jsonify(error="from must be before to"), 400
+            day_states = store.day_states(unit)
+            cacheable = to_us - from_us >= OVERVIEW_CACHE_MIN_SPAN_S * US
+            if cacheable:
+                key = OverviewCache.key(unit, from_us, to_us, points)
+                sig = day_state_signature(day_states)
+                hit = overview_cache.get(key, sig)
+                if hit is not None:
+                    body, age = hit
+                    return jsonify(dict(body, cache=dict(hit=True, age_s=round(age, 1))))
             body = build_overview(store, unit, from_us, to_us, now, points=points, cache=raw_day_cache,
-                                  data_start_us=data_start_us)
+                                  data_start_us=data_start_us, states=day_states)
+            if cacheable and body["histogram"]["complete"]:
+                overview_cache.put(key, sig, body)
+            body = dict(body, cache=dict(hit=False, age_s=0.0))
         except StoreError as exc:
             log.error("/api/history/overview: storage unavailable: %s", exc)
             return jsonify(error="storage unavailable"), 503
@@ -870,6 +885,7 @@ def create_app(
     app.config["TREMOR_STORE"] = store
     app.config["TREMOR_RETENTION"] = engine
     app.config["TREMOR_INGEST_AUTH"] = auth
+    app.config["TREMOR_OVERVIEW_CACHE"] = overview_cache
     app.config["TREMOR_SHUTDOWN"] = shutdown
     return app
 

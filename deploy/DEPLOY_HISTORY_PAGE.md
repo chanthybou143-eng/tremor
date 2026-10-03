@@ -1,56 +1,78 @@
-# Deploying the history page (`history-page` branch)
+# Deploying the history page
 
-Adds `/history` and `/api/history/overview`. Read-only: no schema change, no new environment variables, no
-change to ingest, retention, the live dashboard's data or the Pico. The only server-side code paths touched are
-two new read-only store queries and the new endpoint. Replace `<username>` (from
-`https://<username>.pythonanywhere.com`).
+Adds `/history` and `/api/history/overview` (see CLAUDE.md, "History page"). Read-only: no schema change, no
+new environment variables, no change to ingest, retention, the live dashboard's data or the Pico. Server-side
+code touched: new read-only store queries, an optional read-only mode of the store (used only by the
+benchmark), and the new endpoint. Replace `<username>` (from `https://<username>.pythonanywhere.com`).
 
-Before you start: the server is on `master` at `f8c6e77`, and the branch has been merged into `master` and pushed
-(the deploy pulls `master`, as the server tracks it since 2026-10-03).
+Starting point: `~/tremor` is on `master` at `f8c6e77`; the history page is merged into `master` and pushed.
 
-**Reloading resets the in-memory ingest-auth counters and rate-limit buckets** (`/api/health` →
-`ingest_auth`). If you are in the middle of the >= 24 h observation before `TREMOR_INGEST_AUTH=required`,
-either finish it first or restart that observation after the reload.
+Reloading is safe: the server has run `TREMOR_INGEST_AUTH=required` since 2026-09-27, so the in-memory
+auth counters and rate-limit buckets a reload resets no longer gate anything.
 
-## 1. Benchmark on PythonAnywhere first (no change to the live app)
+Use the same Python version as the web app (Web tab) for every command below, e.g. `python3.10`.
 
-Uses a separate checkout so `~/tremor` is untouched until the numbers are known. Bash console:
+## 1. Benchmark against the real data (the live app is untouched)
+
+A separate checkout, so `~/tremor` does not change until the numbers are known. Bash console:
 
 ```bash
 cd ~/tremor && git fetch origin
 git worktree add ~/tremor-bench origin/master          # detached checkout of the new code
-cd ~/tremor-bench && python scripts/bench_history.py --dir ~/tremor_data
+cd ~/tremor-bench && python3.10 scripts/bench_history.py --db ~/tremor_data/readings.db
 ```
 
-It builds a scratch `history_probe.db` (~17 MB, deleted afterwards) next to the real database -- same network
-filesystem, never the real file -- and times each preset range cold and warm. Expect a table like the local run:
+What it does, in order:
+
+1. Prints the database size and the account's disk use (every file under your home directory, against
+   512 MB), and what the use would be with a copy.
+2. **If the copy would take use above 75%, it does not copy** and exits telling you to use `--live` (go to 1b).
+3. Otherwise copies the database next to the real one (`~/tremor_data/history_bench_copy.db`, same network
+   filesystem) with SQLite's online backup in ~1 MB steps: ingest keeps committing meanwhile, and a step that
+   races a commit is redone (`restarts` in the output). It then runs an integrity check on the copy.
+4. Times every preset range (1 h, 6 h, 24 h, 7 days, 30 days, all) for each unit, cold and warm, on the copy;
+   deletes the copy at the end, even on Ctrl-C. If the console is killed instead:
+   `rm -f ~/tremor_data/history_bench_copy.db ~/tremor_data/history_bench_copy.db-journal`.
+
+**1b. Only if it refused to copy:** benchmark the live file read-only instead (`mode=ro`: it cannot write).
+Each raw read covers at most 6 hours so no statement holds the lock long, but run it at a quiet moment:
+
+```bash
+cd ~/tremor-bench && python3.10 scripts/bench_history.py --db ~/tremor_data/readings.db --live
+```
+
+Reading the output:
 
 ```
-range       cold ms  warm ms     KB
-last 24 h       257        6     51
-30 days         352       82     80     <- local Mac; PythonAnywhere will be several times slower
-VERDICT: OK
+range       cold ms  warm ms    KB  longest stmt ms  stmts  sources / histogram
+30 days         594       78    74               65    124  1min+raw / raw
+...
+slowest cold view: 603 ms (the Pico's whole-request deadline is 4000 ms)
+VERDICT: OK                        <- local Mac, 141 MB database; PythonAnywhere will be slower
 ```
 
-- **OK** (every cold request < 1 s): go on.
-- **WARN** (< 2 s): acceptable but note it; a history view can then hold up one ingest POST for that long.
-- **FAIL**: stop and send me the output -- do not deploy.
+- **VERDICT OK** (every cold view < 1 s): go on. **WARN** (< 2 s): acceptable, but tell me the numbers.
+  **FAIL**: stop and send me the whole output -- do not deploy.
+- **longest stmt ms** is the longest single SQL statement: how long an ingest COMMIT could have to wait behind
+  a history view. Anything near 1000 ms: stop and send me the output.
+- `(N h pending: budget reached)` on long ranges is expected on a cold cache: the histogram's raw-reading work
+  is capped at 0.5 s per request and later requests fill in the rest.
 
 Then remove the bench checkout: `cd ~ && git -C ~/tremor worktree remove ~/tremor-bench`.
 
-(The benchmark uses CPU seconds from the free account's daily console allowance; one run is small.)
+(A run uses some of the free account's daily console CPU allowance; one run is small.)
 
 ## 2. Update `~/tremor`
 
 ```bash
 cd ~/tremor
 git status --short                   # expect: clean
-git rev-parse HEAD                   # expect: f8c6e778d8ae44c97877712c4b655af8b9db190b (write it down for rollback)
+git rev-parse HEAD                   # expect: f8c6e778d8ae44c97877712c4b655af8b9db190b (rollback point)
 git merge --ff-only origin/master
-git rev-parse HEAD                   # expect: the new master commit
+git rev-parse HEAD                   # expect: the master commit you were given
 git diff --stat f8c6e77 HEAD -- src/ deploy/   # expect only: history.py, store.py, webapp.py,
                                                # templates/history.html, templates/index.html, this file
-python -c "import sys; sys.path.insert(0,'src'); import tremor.webapp"   # prints nothing
+python3.10 -c "import sys; sys.path.insert(0,'src'); import tremor.webapp"   # prints nothing
 ```
 
 ## 3. Reload and check
@@ -59,20 +81,24 @@ Web tab → **Reload**. Open the **error log**: no new tracebacks.
 
 ```bash
 S=https://<username>.pythonanywhere.com
-curl -s -o /dev/null -w "%{http_code}\n" $S/history                                       # 200
-curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" "$S/api/history/overview?unit=unit-1"   # 200, all data
-curl -s "$S/api/history/overview?unit=unit-1&from=$(( $(date +%s) - 86400 ))" | python -c \
-  "import sys,json; j=json.load(sys.stdin); print(j['sources'], j['elapsed_ms'], 'ms', len(j['excluded']['periods']), 'excluded')"
+curl -s -o /dev/null -w "%{http_code}\n" $S/history                                    # 200
+F=$(( $(date +%s) - 8 * 86400 ))
+for i in 1 2; do curl -s "$S/api/history/overview?unit=unit-1&from=$F" | python3.10 -c \
+  "import sys,json; j=json.load(sys.stdin); h=j['histogram']; print(j['elapsed_ms'], 'ms', j['cache'], \
+   'hist complete' if h['complete'] else f\"{h['pending_hours']} h pending\")"; done
 ```
 
-- `elapsed_ms` is the server's own time for that request; it should be in line with the benchmark.
-- In a browser: open `/`, click **history →**, try each preset. Expect the 2026-09-26 known-bad boot listed under
-  *Excluded data* (its rows are gone, so 0 readings), and any plugpack-unplugged readings that reached the server
-  (the 2026-09-26 toggle tests) as excluded periods -- low amplitude or an impossible frequency. If an unplugged
-  stretch is NOT excluded, note its time: its readings had amplitude >= 0.1 V and an in-band frequency, and the
-  rules need another look.
-- **The Pico is unaffected:** `curl -s $S/api/health | python -m json.tool | grep -A3 '"units"'` --
-  `seconds_since_last_reading` stays under ~60 s, and the readings count keeps rising over a few minutes.
+- The first line: server time in line with the benchmark. The second: `{'hit': True, ...}` (served from the
+  server-wide cache) -- unless the histogram was still pending, in which case run the loop again.
+- **In a browser** (this is the only check of the page's JavaScript): open `/`, click **history →**, try each
+  preset. All five cards must draw (frequency, distribution, RoCoF, coverage, daily table). Expect:
+  - the 2026-09-26 dip (06:44-06:58 UTC, ~49.88-49.90 Hz) in the 7-day frequency chart and in the
+    distribution's lowest bins, not shaded red;
+  - the known-bad boot 398474c3bef237a1 (2026-09-26 03:47-03:53 UTC) under *Excluded data*, 0 readings;
+  - plugpack-unplugged readings (the 2026-09-26 toggle tests) as excluded periods. If an unplugged stretch is
+    NOT excluded, note its time: its readings had amplitude >= 0.1 V and an in-band frequency.
+- **The Pico is unaffected:** `curl -s $S/api/health | python3.10 -m json.tool | grep -A3 '"units"'` --
+  `seconds_since_last_reading` stays under ~60 s and `readings_total` keeps rising over a few minutes.
 
 ## Rollback
 
