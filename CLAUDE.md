@@ -251,7 +251,7 @@ header; tokens live only in the environment (the PythonAnywhere WSGI file) and, 
 
 `/history` (public, linked from the dashboard) shows everything stored for a unit: frequency mean with a
 min-max band, a frequency distribution (5 mHz bins), max |RoCoF| per minute, hourly coverage (good / excluded /
-missing) and a per-UTC-day table.
+missing) and a per-day table (Adelaide days, or UTC days).
 The page makes ONE request, `GET /api/history/overview?unit=&from=&to=&points=`, which `history.build_overview`
 answers already downsampled (`points` caps the frequency buckets, 100-2000; coverage <= 800 bars). It does not
 page through `/api/history` (that endpoint has `resolution=raw|1min|auto`, where `auto` = raw within
@@ -281,6 +281,18 @@ page through `/api/history` (that endpoint has `resolution=raw|1min|auto`, where
   from/to in 5-minute slots, TTL 5 min, dropped as soon as the unit's retention day states change
   (`day_state_signature`: a day aggregated, verified or pruned -- also by a console `retention run`). A response
   with an unfinished histogram is never cached. Responses carry `cache: {hit, age_s}`.
+- **Time zones:** storage, the API and every timestamp in it are UTC; the charts plot UTC seconds, so a
+  daylight-saving changeover can never show as a gap or an overlap. The page shows every time in
+  `Australia/Adelaide` through `Intl.DateTimeFormat` (`static/tz.js`; never a fixed +9:30), with ACST/ACDT on the
+  axis title, the ticks and tooltips, and UTC in every tooltip. The overview takes `tz` (IANA name, default UTC):
+  it aligns buckets to whole local hours and, with `days=local` (default; the page's "Adelaide days"), cuts the
+  daily table at local midnights found with `zoneinfo` -- a changeover day is 23 h (first Sunday of October) or
+  25 h (first Sunday of April) and its coverage is measured against that real length; `days=utc` gives UTC days.
+  Base buckets divide 15 min so they nest in local hours and days. Custom from/to are Adelaide wall time,
+  converted by tz.js with the "compatible" rule (JS Temporal, RFC 5545): a skipped time (02:00-02:59 on
+  4 Oct 2026) moves forward by the gap (02:30 -> 03:30 ACDT); a repeated time (02:00-02:59 on 4 Apr 2027)
+  means the earlier, daylight-time instant. The page says which happened. `tests/test_tz_js.py` runs tz.js
+  under Node (skipped without Node).
 - **Coverage** = seconds with a good GPS-timed reading (a minute counts at most 60), against the elapsed part of
   the range. Unlocked readings count as missing.
 - **Speed matters:** a free PythonAnywhere account has one web worker, so a slow history request delays the

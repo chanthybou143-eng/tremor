@@ -42,7 +42,7 @@ tremor-web-dashboard = "tremor.webapp:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tremor = ["templates/*.html"]
+tremor = ["templates/*.html", "static/*.js"]
 
 [tool.pytest.ini_options]
 # Without this, pytest's default discovery walks the whole repo and tries

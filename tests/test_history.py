@@ -559,3 +559,114 @@ def test_a_read_only_store_reads_but_never_writes(four_days_db, tmp_path):
     with pytest.raises(StoreError):
         open_store(str(tmp_path / "missing.db"), read_only=True)
     assert not (tmp_path / "missing.db").exists()
+
+
+# --- time zones: Adelaide days and the 2026-27 daylight-saving changeovers ------------------------
+# Clocks go forward at 02:00 ACST on Sun 4 Oct 2026 (2026-10-03 16:30 UTC) and back at 03:00 ACDT on
+# Sun 4 Apr 2027 (2027-04-03 16:30 UTC). Storage and API timestamps stay UTC throughout.
+
+ADL = "Australia/Adelaide"
+
+
+def changeover_app(tmp_path, start, hours, settle_at):
+    """``hours`` of 1/s readings from ``start`` (UTC), then retention run at ``settle_at``."""
+    clock = FakeClock(start)
+    app = make_app(tmp_path, clock)
+    client = app.test_client()
+    post_series(client, clock, start, int(hours * 3600), freq=lambda t: 50.0 + 0.01 * math.sin(t / 600))
+    clock.t = settle_at
+    app.config["TREMOR_RETENTION"].run_until_idle()
+    return app, client, clock
+
+
+def offset_at(t: float) -> int:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return int(datetime.fromtimestamp(t, ZoneInfo(ADL)).utcoffset().total_seconds())
+
+
+def assert_contiguous(ts, step):
+    assert ts == sorted(set(ts)), "buckets out of order or repeated"
+    assert all(b - a == step for a, b in zip(ts, ts[1:])), "a gap or an overlap in the buckets"
+
+
+def test_a_range_across_the_october_changeover(tmp_path):
+    start = utc(2026, 10, 3, 12)                                      # 21:30 ACST Sat 3 Oct
+    app, client, _clock = changeover_app(tmp_path, start, 30, utc(2026, 10, 5, 2))
+    try:
+        q = {"from": start, "to": start + 30 * 3600, "tz": ADL}
+        j = overview(client, **q)
+        assert j["tz"] == ADL and j["daily_tz"] == ADL
+        assert {s["source"] for s in j["sources"]} == {"1min"}       # both UTC days aggregated by now
+        day = {d["day"]: d for d in j["daily"]}
+        sun = day["2026-10-04"]
+        assert sun["length_h"] == 23 and sun["tz_abbr"] == "ACST/ACDT"
+        assert sun["start_us"] == int(utc(2026, 10, 3, 14, 30) * US) and sun["end_us"] == int(utc(2026, 10, 4, 13, 30) * US)
+        assert sun["expected_s"] == 23 * 3600 and sun["n"] == 23 * 3600 and sun["coverage_pct"] == 100.0
+        assert day["2026-10-03"]["tz_abbr"] == "ACST" and day["2026-10-05"]["tz_abbr"] == "ACDT"
+        # no false gap / overlap at the changeover; coverage bars on whole LOCAL hours either side
+        assert_contiguous(j["freq"]["t"], j["freq"]["bucket_s"])
+        cov = j["coverage"]
+        assert cov["bucket_s"] == 3600
+        assert_contiguous(cov["t"], 3600)
+        assert all((t + offset_at(t)) % 3600 == 0 for t in cov["t"])
+        assert all(g == 100.0 for g in cov["good_pct"][1:-1])
+        # the same data in UTC days: 24 h days
+        u = overview(client, days="utc", **q)
+        assert u["daily_tz"] == "UTC" and {d["length_h"] for d in u["daily"]} == {24}
+        assert sum(d["n"] for d in u["daily"]) == sum(d["n"] for d in j["daily"]) == 30 * 3600
+        # a short (raw) range across the missing hour: also contiguous
+        r = overview(client, **{"from": utc(2026, 10, 3, 15), "to": utc(2026, 10, 3, 19), "tz": ADL})
+        assert r["freq"]["source"] == "raw"
+        assert_contiguous(r["freq"]["t"], r["freq"]["bucket_s"])
+        assert [t for t in r["coverage"]["t"]] == [int(utc(2026, 10, 3, 14, 30)) + 3600 * i for i in range(5)]
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_a_range_across_the_april_changeover(tmp_path):
+    start = utc(2027, 4, 3, 12)                                       # 22:30 ACDT Sat 3 Apr
+    app, client, _clock = changeover_app(tmp_path, start, 30, utc(2027, 4, 4, 18) + 60)
+    try:
+        j = overview(client, **{"from": start, "to": start + 30 * 3600, "tz": ADL})
+        assert {s["source"] for s in j["sources"]} == {"1min", "raw"}  # 3 Apr UTC aggregated, 4 Apr not yet
+        day = {d["day"]: d for d in j["daily"]}
+        sun = day["2027-04-04"]
+        assert sun["length_h"] == 25 and sun["tz_abbr"] == "ACDT/ACST" and sun["source"] == "1min+raw"
+        assert sun["start_us"] == int(utc(2027, 4, 3, 13, 30) * US) and sun["end_us"] == int(utc(2027, 4, 4, 14, 30) * US)
+        assert sun["expected_s"] == 25 * 3600 and sun["n"] == 25 * 3600 and sun["coverage_pct"] == 100.0
+        assert_contiguous(j["freq"]["t"], j["freq"]["bucket_s"])
+        assert_contiguous(j["coverage"]["t"], 3600)
+        assert all((t + offset_at(t)) % 3600 == 0 for t in j["coverage"]["t"])
+    finally:
+        app.config["TREMOR_SHUTDOWN"]()
+
+
+def test_the_server_names_the_same_local_times_as_the_page():
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    z = ZoneInfo(ADL)
+    a = datetime(2026, 9, 26, 6, 50, 32, tzinfo=timezone.utc).astimezone(z)
+    b = datetime(2026, 10, 10, 6, 50, 32, tzinfo=timezone.utc).astimezone(z)
+    assert (a.strftime("%H:%M:%S"), a.tzname()) == ("16:20:32", "ACST")
+    assert (b.strftime("%H:%M:%S"), b.tzname()) == ("17:20:32", "ACDT")
+
+
+def test_tz_and_days_are_validated_and_default_to_utc(four_days):
+    client, *_ = four_days
+    get = lambda **q: client.get("/api/history/overview", query_string=dict(unit="unit-1", **q))
+    assert get(tz="Mars/Olympus_Mons").status_code == 400
+    assert get(tz="../../etc/passwd").status_code == 400
+    assert get(days="weekly").status_code == 400
+    j = get(**{"from": DAY0, "to": NOW}).get_json()
+    assert j["tz"] == "UTC" and j["daily_tz"] == "UTC" and j["daily"][0]["day"] == "2026-09-20"
+    j = get(**{"from": DAY0, "to": NOW, "tz": ADL}).get_json()
+    assert j["daily"][0]["day"] == "2026-09-20" and j["daily"][0]["start_us"] == int(utc(2026, 9, 19, 14, 30) * US)
+
+
+def test_the_history_page_loads_the_time_zone_helpers(four_days):
+    client, *_ = four_days
+    html = client.get("/history").get_data(as_text=True)
+    assert "/static/tz.js" in html and "Australia/Adelaide" in html
+    r = client.get("/static/tz.js")
+    assert r.status_code == 200 and b"parseLocalInput" in r.data

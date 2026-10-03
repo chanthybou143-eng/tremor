@@ -6,7 +6,13 @@ server-side, so the payload stays small however long the range is:
   * frequency: mean with a min-max band per bucket (at most ``points`` buckets)
   * RoCoF: max |RoCoF| per minute (or per bucket, once a bucket is longer than a minute)
   * coverage per hour (coarser for very long ranges): good / excluded / missing
-  * a daily table per UTC day: mean, std, min, max, % coverage
+  * a daily table per LOCAL day of ``tz`` (or per UTC day): mean, std, min, max, % coverage
+
+Time zones: everything stored and every timestamp in the response is UTC. ``tz`` (an IANA name,
+e.g. "Australia/Adelaide") only decides where buckets start (whole local hours / days) and how the
+daily table is cut: local days are found with zoneinfo, so a daylight-saving changeover day is
+23 h or 25 h long and its coverage is measured against that real length. Buckets are contiguous
+in UTC, so a changeover never shows as a gap or an overlap.
 
 Where the numbers come from, per UTC day:
 
@@ -35,10 +41,9 @@ import threading
 from bisect import bisect_left
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from .retention import day_to_date
 from .store import DAY_US, MINUTE_US, US, AggRow, DayState, Exclusion, ReadingStore
 from .timeline import rocof_series
 
@@ -366,10 +371,36 @@ def _hist_json(h: Dict[int, int]) -> Optional[dict]:
                 n=sum(h.values()))
 
 
-def _group(base: Dict[int, _Acc], width: int) -> Dict[int, _Acc]:
+def _local_midnight(tz: tzinfo, d: date) -> int:
+    return int(datetime(d.year, d.month, d.day, tzinfo=tz).timestamp())
+
+
+def local_days(tz: tzinfo, lo_s: float, hi_s: float) -> List[Tuple[date, int, int]]:
+    """(local date, start, end) in UTC seconds for every local day of ``tz`` touching [lo_s, hi_s).
+    A daylight-saving changeover day comes out 23 h or 25 h long."""
+    out = []
+    d = datetime.fromtimestamp(lo_s, tz).date()
+    while True:
+        start, end = _local_midnight(tz, d), _local_midnight(tz, d + timedelta(days=1))
+        if start >= hi_s:
+            return out
+        out.append((d, start, end))
+        d += timedelta(days=1)
+
+
+def _align_shift(tz: tzinfo, at_s: float, width: int, g: int) -> int:
+    """Offset (s) that makes ``width``-second buckets start on whole local hours / local midnight
+    (as of ``at_s``). It is a multiple of ``g``, so the base buckets still nest; 0 for a zone whose
+    offset is not whole quarter hours."""
+    off = int(datetime.fromtimestamp(at_s, tz).utcoffset().total_seconds())
+    shift = off % width
+    return shift if shift % g == 0 else 0
+
+
+def _group(base: Dict[int, _Acc], width: int, shift: int = 0) -> Dict[int, _Acc]:
     out: Dict[int, _Acc] = {}
     for k in sorted(base):
-        g = (k // width) * width
+        g = (k - shift) // width * width + shift
         a = out.get(g)
         if a is None:
             a = out[g] = _Acc()
@@ -386,11 +417,13 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
                    data_start_us: Optional[int] = None,
                    known_bad: Sequence[KnownBad] = KNOWN_BAD,
                    states: Optional[Dict[int, DayState]] = None,
-                   hist_budget_s: Optional[float] = None) -> dict:
+                   hist_budget_s: Optional[float] = None,
+                   tz: tzinfo = timezone.utc, local_days_table: bool = True) -> dict:
     """Everything the history page draws for [from_us, to_us). ``data_start_us`` (the unit's
     first data) clips an earlier ``from_us`` so a "30 days" view of a week-old unit does not
     list weeks of empty days. ``states`` (the unit's retention day states) may be passed in when
-    the caller already read them."""
+    the caller already read them. ``tz`` aligns buckets to its local hours and, with
+    ``local_days_table``, cuts the daily table at its local midnights (else at UTC midnights)."""
     t_start = time.perf_counter()
     cache = cache if cache is not None else RawDayCache()
     hist_budget_s = HIST_RAW_BUDGET_S if hist_budget_s is None else hist_budget_s
@@ -422,7 +455,9 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
     w_freq = nice_width(span_s / points, 1 if fine_path else 60)
     w_rocof = max(60, w_freq)
     w_cov = nice_width(span_s / MAX_COVERAGE_BARS, 3600)
-    g = math.gcd(math.gcd(w_rocof, w_cov), 86400)
+    # base buckets divide 15 min, so they nest inside local hours and local days of any zone
+    # whose offset is whole quarter hours (all of them today), DST or not
+    g = math.gcd(math.gcd(w_rocof, w_cov), 900)
 
     base: Dict[int, _Acc] = {}
     periods: List[_Period] = []
@@ -557,11 +592,15 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
             from_us = max(from_us, min(min(ks) * US, to_us))
 
     # --- frequency: mean with a min-max band
+    at_s = min(to_us, now_us) / US
+    sh_freq = _align_shift(tz, at_s, w_freq, math.gcd(g, w_freq) if fine_path else g)
+    sh_rocof = _align_shift(tz, at_s, w_rocof, g)
+    sh_cov = _align_shift(tz, at_s, w_cov, g)
     ft, fmean, fmin, fmax, fn = [], [], [], [], []
     if fine_path:
         buckets: Dict[int, _Acc] = {}
         for us, f in fine:
-            k = (us // US // w_freq) * w_freq
+            k = (us // US - sh_freq) // w_freq * w_freq + sh_freq
             acc = buckets.get(k)
             if acc is None:
                 acc = buckets[k] = _Acc()
@@ -572,7 +611,7 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
             acc.fmax = _mx(acc.fmax, f)
         freq_groups = buckets
     else:
-        freq_groups = _group(base, w_freq)
+        freq_groups = _group(base, w_freq, sh_freq)
     for k in sorted(freq_groups):
         acc = freq_groups[k]
         if acc.n:
@@ -584,17 +623,17 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
 
     # --- RoCoF: max |RoCoF| per bucket (per minute unless the range is long)
     rt, rmax = [], []
-    for k, acc in sorted(_group(base, w_rocof).items()):
+    for k, acc in sorted(_group(base, w_rocof, sh_rocof).items()):
         if acc.n and acc.rmax is not None:
             rt.append(k)
             rmax.append(round(acc.rmax, 5))
 
     # --- coverage and daily table, measured against the part of the range that has happened
     end_us = min(to_us, now_us)
-    cov = _group(base, w_cov)
+    cov = _group(base, w_cov, sh_cov)
     ct, cgood, cex, cexp = [], [], [], []
     if end_us > from_us:
-        k = (from_us // US // w_cov) * w_cov
+        k = (from_us // US - sh_cov) // w_cov * w_cov + sh_cov
         while k * US < end_us and len(ct) <= MAX_COVERAGE_BARS + 2:
             exp = (min(end_us, (k + w_cov) * US) - max(from_us, k * US)) / US
             if exp > 0:
@@ -605,18 +644,30 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
                 cex.append(round(min(100.0, 100.0 * acc.secs_ex / exp), 2))
             k += w_cov
 
-    seg_src = {d: src for d, _a, _b, src, _r in segs}
-    days = _group(base, 86400)
+    day_tz = tz if local_days_table else timezone.utc
     daily = []
     if end_us > from_us:
-        for d in range(from_us // DAY_US, (end_us - 1) // DAY_US + 1):
-            exp = (min(end_us, (d + 1) * DAY_US) - max(from_us, d * DAY_US)) / US
+        bounds = local_days(day_tz, from_us / US, end_us / US)
+        starts = [st for _d, st, _e in bounds]
+        per_day: List[_Acc] = [_Acc() for _ in bounds]
+        for k, acc in base.items():
+            i = bisect_left(starts, k + 1) - 1          # the day whose start is <= k
+            if 0 <= i < len(bounds) and k < bounds[i][2]:
+                per_day[i].add(acc)
+        for (d, st, en), acc in zip(bounds, per_day):
+            exp = (min(end_us, en * US) - max(from_us, st * US)) / US
             if exp <= 0:
                 continue
-            acc = days.get(d * 86400) or _Acc()
+            srcs = sorted({src for _d, a, b, src, _r in segs if a < en * US and b > st * US})
+            names = []
+            for t in (st, en - 1):
+                n = datetime.fromtimestamp(t, day_tz).tzname()
+                if n not in names:
+                    names.append(n)
             has = acc.n > 0
             daily.append(dict(
-                day=day_to_date(d).isoformat(), source=seg_src.get(d), n=acc.n, n_excluded=acc.n_ex,
+                day=d.isoformat(), start_us=st * US, end_us=en * US, length_h=round((en - st) / 3600, 2),
+                tz_abbr="/".join(names), source="+".join(srcs) or None, n=acc.n, n_excluded=acc.n_ex,
                 mean=round(acc.mean(), 6) if has else None, std=round(acc.std(), 6) if has else None,
                 min=_r(acc.fmin, 6), max=_r(acc.fmax, 6), rocof_max_abs=_r(acc.rmax, 5),
                 coverage_pct=round(min(100.0, 100.0 * acc.secs / exp), 2),
@@ -640,7 +691,8 @@ def build_overview(store: ReadingStore, unit_id: str, from_us: int, to_us: int, 
 
     return dict(
         unit=unit_id, from_us=from_us, to_us=to_us, requested_from_us=requested_from, now_us=now_us,
-        points=points, sources=sources,
+        points=points, sources=sources, tz=str(tz) if tz is not timezone.utc else "UTC",
+        daily_tz="UTC" if day_tz is timezone.utc else str(day_tz),
         freq=dict(bucket_s=w_freq, source="raw" if fine_path else "1min", t=ft, mean=fmean, min=fmin, max=fmax, n=fn),
         rocof=dict(bucket_s=w_rocof, t=rt, max_abs=rmax),
         coverage=dict(bucket_s=w_cov, t=ct, good_pct=cgood, excluded_pct=cex, expected_s=cexp),

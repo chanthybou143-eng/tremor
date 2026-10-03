@@ -62,12 +62,18 @@
   .pill.ex { background: rgba(255,107,107,0.15); color: var(--excluded); }
   ul.periods { margin: 6px 0 0 0; padding-left: 18px; font-size: 0.8rem; color: var(--muted); }
   .empty { color: var(--muted); font-size: 0.9rem; padding: 20px 0; text-align: center; }
+  .input-note { flex-basis: 100%; color: var(--muted); font-size: 0.75rem; }
+  .input-note:empty { display: none; }
+  .day-note { color: var(--muted); font-size: 0.7rem; margin-left: 4px; }
+  h2 .toggle { float: right; font-size: 0.75rem; font-weight: 400; }
+  h2 .toggle button { padding: 2px 8px; }
   @media (max-width: 600px) {
     body { padding: 16px; }
     .sep { display: none; }
   }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="{{ url_for('static', filename='tz.js') }}"></script>
 </head>
 <body>
   <h1>TREMOR — History</h1>
@@ -85,6 +91,7 @@
     <label for="from">From</label><input type="datetime-local" id="from">
     <label for="to">To</label><input type="datetime-local" id="to">
     <button id="apply">Apply</button>
+    <span class="input-note" id="inputNote"></span>
   </div>
   <p class="status" id="status"></p>
 
@@ -110,7 +117,9 @@
       <div class="chart-note" id="covNote"></div>
     </div>
     <div class="card">
-      <h2>Daily summary <span class="pill">UTC days</span></h2>
+      <h2>Daily summary <span class="pill" id="dayPill">Adelaide days</span>
+        <span class="toggle"><button id="daysLocal" class="active">Adelaide days</button>
+        <button id="daysUtc">UTC days</button></span></h2>
       <div class="table-wrap"><table id="daily"></table></div>
     </div>
     <div class="card">
@@ -129,7 +138,10 @@ const REASONS = {
   low_amplitude: 'amplitude < 0.1 V',
   freq_out_of_band: 'frequency outside 47–52 Hz',
 };
-const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+// Every time on this page is shown in Adelaide local time, via the IANA zone (tz.js) -- never a
+// fixed offset, so ACST/ACDT switch by themselves. The API and the charts' x values are UTC.
+const TZ = 'Australia/Adelaide';
+const TZT = window.TremorTZ;
 
 Chart.defaults.color = '#8a919b';
 Chart.defaults.borderColor = 'rgba(255, 255, 255, 0.08)';
@@ -160,50 +172,34 @@ let currentRange = '24h';
 let loading = false;
 let span_s = 86400;
 let tickStep = 3600;
-const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];
+let dayMode = 'local';                 // daily table: Adelaide days or UTC days
 
-// Ticks on round local times (whole hours, local midnight, ...) rather than wherever a linear
-// axis happens to put them.
+// Ticks on round Adelaide times (whole hours, local midnight, ...), stepped in local wall time so
+// a changeover day keeps its ticks on local midnight.
 function niceTicks(scale) {
-  const min = scale.min, max = scale.max;
   const target = Math.max(4, Math.floor((scale.width || 600) / 110));
-  tickStep = TICK_STEPS.find((s) => (max - min) / s <= target) || 604800 * Math.ceil((max - min) / 604800 / target);
-  const off = -new Date(min * 1000).getTimezoneOffset() * 60;
-  const ticks = [];
-  for (let t = Math.ceil((min + off) / tickStep) * tickStep - off; t <= max; t += tickStep) ticks.push({ value: t });
-  scale.ticks = ticks;
+  const r = TZT.ticks(TZ, scale.min, scale.max, target);
+  tickStep = r.step;
+  scale.ticks = r.ticks.map((value) => ({ value }));
 }
-
-function fmtTick(s) {
-  const d = new Date(s * 1000);
-  if (tickStep >= 86400) return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' });
-  const hm = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false });
-  if (span_s <= 86400 && d.getHours() !== 0) return hm;
-  return [d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' }), hm];
-}
-function fmtFull(s) {
-  return new Date(s * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium', hour12: false });
-}
+const fmtTick = (s) => TZT.tickLabel(TZ, s, tickStep, span_s);
+const fmtFull = (s) => TZT.fmtLocal(TZ, s);
+// tooltips: Adelaide time (with ACST/ACDT) and UTC
+const tooltipTitle = (items) => items.length ? [fmtFull(items[0].parsed.x), TZT.fmtUtc(items[0].parsed.x)] : '';
 function fmtDur(s) {
   if (s % 86400 === 0) return `${s / 86400} d`;
   if (s % 3600 === 0) return `${s / 3600} h`;
   if (s % 60 === 0) return `${s / 60} min`;
   return `${s} s`;
 }
-function toLocalInput(s) {
-  const d = new Date(s * 1000);
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
 function timeScale() {
   return {
     type: 'linear',
     afterBuildTicks: niceTicks,
     ticks: { maxRotation: 0, autoSkip: false, callback: (v) => fmtTick(v) },
+    title: { display: true, text: 'Adelaide time' },
   };
 }
-const tooltipTitle = (items) => items.length ? fmtFull(items[0].parsed.x) : '';
 
 function makeLine(canvas, datasets, yTitle) {
   return new Chart(canvas.getContext('2d'), {
@@ -247,7 +243,10 @@ const covChart = new Chart($('covChart').getContext('2d'), {
   ] },
   options: {
     responsive: true, maintainAspectRatio: false, animation: false, parsing: false,
-    plugins: { tooltip: { callbacks: { title: tooltipTitle, label: (i) => `${i.dataset.label}: ${i.parsed.y.toFixed(1)} %` } } },
+    plugins: { tooltip: { callbacks: {
+      // bars sit at the middle of their bucket; title them with the bucket's start
+      title: (items) => items.length ? [`from ${fmtFull(items[0].parsed.x - covHalf)}`, TZT.fmtUtc(items[0].parsed.x - covHalf)] : '',
+      label: (i) => `${i.dataset.label}: ${i.parsed.y.toFixed(1)} %` } } },
     datasets: { bar: { barPercentage: 1.0, categoryPercentage: 1.0 } },
     scales: {
       x: { ...timeScale(), stacked: true, offset: false },
@@ -274,7 +273,7 @@ const histChart = new Chart($('histChart').getContext('2d'), {
     datasets: { bar: { barPercentage: 1.0, categoryPercentage: 1.0, grouped: false } },
     scales: {
       x: { type: 'linear', offset: false, title: { display: true, text: 'Frequency (Hz), 5 mHz bins' },
-           ticks: { callback: (v) => Number(v).toFixed(2) } },
+           ticks: { callback: (v) => Number(v).toFixed(3) } },
       y: { beginAtZero: true, title: { display: true, text: '% of readings' } },
     },
   },
@@ -284,6 +283,8 @@ function histPoints(h, binHz) {
   if (!h) return [];
   return h.counts.map((c, i) => ({ x: h.lo_hz + (i + 0.5) * binHz, y: 100 * c / h.n }));
 }
+
+let covHalf = 1800;
 
 // A line break wherever consecutive buckets are further apart than one bucket: Chart.js only
 // breaks a line at an explicit null, it never infers a gap from the x spacing.
@@ -300,8 +301,8 @@ function rangeFromState() {
   const now = Date.now() / 1000;
   if (currentRange === 'all') return { from: null, to: null };
   if (currentRange === 'custom') {
-    const f = Date.parse($('from').value) / 1000, t = Date.parse($('to').value) / 1000;
-    return { from: f, to: t };
+    const f = TZT.parseLocalInput(TZ, $('from').value), t = TZT.parseLocalInput(TZ, $('to').value);
+    return { from: f && f.utc, to: t && t.utc, fromKind: f && f.kind, toKind: t && t.kind };
   }
   return { from: now - PRESETS[currentRange], to: null };
 }
@@ -314,18 +315,27 @@ function setStatus(text, isError = false) {
 function syncUrl() {
   const q = new URLSearchParams({ unit: unitSel.value, range: currentRange });
   if (currentRange === 'custom') { q.set('from', $('from').value); q.set('to', $('to').value); }
+  if (dayMode === 'utc') q.set('days', 'utc');
   history.replaceState(null, '', '?' + q.toString());
 }
 
 async function load() {
   if (loading || !unitSel.value) return;
-  const { from, to } = rangeFromState();
+  const { from, to, fromKind, toKind } = rangeFromState();
   if (currentRange === 'custom' && !(from < to)) { setStatus('Pick a "from" before the "to".', true); return; }
+  // say how a custom Adelaide time was turned into UTC, especially on a changeover day
+  const kindNote = (label, s, kind) => `${label} ${fmtFull(s)} = ${TZT.fmtUtc(s, false)}` +
+    (kind === 'skipped' ? ' (that local time does not exist — clocks went forward; moved on by the gap)'
+      : kind === 'repeated' ? ' (that local time happens twice — clocks went back; using the first, daylight-time one)' : '');
+  $('inputNote').textContent = currentRange === 'custom'
+    ? `Times are Adelaide local. ${kindNote('From', from, fromKind)} · ${kindNote('to', to, toKind)}` : '';
   document.querySelectorAll('button[data-range]').forEach((b) => b.classList.toggle('active', b.dataset.range === currentRange));
   syncUrl();
   const q = new URLSearchParams({ unit: unitSel.value });
   if (from != null) q.set('from', from.toFixed(3));
   if (to != null) q.set('to', to.toFixed(3));
+  q.set('tz', TZ);
+  q.set('days', dayMode);
   q.set('points', String(Math.max(200, Math.min(1500, Math.round($('freqChart').clientWidth || 1000)))));
   loading = true;
   document.querySelectorAll('.controls button').forEach((b) => (b.disabled = true));
@@ -347,7 +357,9 @@ async function load() {
 function render(d) {
   const x0 = d.from_us / 1e6, x1 = Math.min(d.to_us, d.now_us) / 1e6;
   span_s = Math.max(1, x1 - x0);
-  if (currentRange !== 'custom') { $('from').value = toLocalInput(x0); $('to').value = toLocalInput(x1); }
+  if (currentRange !== 'custom') { $('from').value = TZT.toLocalInput(TZ, x0); $('to').value = TZT.toLocalInput(TZ, x1); }
+  covHalf = d.coverage.bucket_s / 2;
+  const axisTitle = `Adelaide time (${TZT.abbrRange(TZ, x0, x1)})`;
   const spans = d.excluded.periods.map((p) => [p.start_us / 1e6, p.end_us / 1e6]);
 
   const f = d.freq;
@@ -364,6 +376,7 @@ function render(d) {
   for (const ch of [freqChart, rocofChart, covChart]) {
     ch.options.scales.x.min = x0;
     ch.options.scales.x.max = x1;
+    ch.options.scales.x.title.text = axisTitle;
     if (ch.options.plugins.excludedShading) ch.options.plugins.excludedShading.spans = spans;
     ch.update();
   }
@@ -374,7 +387,7 @@ function render(d) {
     : srcs.length > 1 ? 'per-minute statistics (stored 1-minute aggregates; raw readings for days not aggregated yet)'
     : srcs[0] === 'raw' ? 'per-minute statistics of the raw readings' : 'stored 1-minute aggregates';
   $('freqNote').textContent = `Mean with min–max band per ${fmtDur(f.bucket_s)} bucket, from ${fromText}. ` +
-    `Red shading = excluded data. Times in ${TZ}.`;
+    'Red shading = excluded data. Times are Adelaide local (ACST/ACDT); tooltips also give UTC.';
   $('rocofNote').textContent = `Largest |RoCoF| per ${fmtDur(r.bucket_s)}.`;
   $('covNote').textContent = `Share of each ${fmtDur(c.bucket_s)} with a good GPS-timed reading per second; ` +
     'excluded = readings left out by the rules below; missing = nothing received (or no GPS lock).';
@@ -392,7 +405,7 @@ function render(d) {
   if (!h.raw && !h.minute_means) hn.push('no data');
   $('histNote').textContent = hn.join(' · ') + '.';
 
-  renderDaily(d.daily);
+  renderDaily(d.daily, d.daily_tz);
   renderExcluded(d);
   $('content').hidden = false;
   const nEx = d.excluded.periods.length;
@@ -401,7 +414,11 @@ function render(d) {
     (d.cache && d.cache.hit ? `cached ${Math.round(d.cache.age_s)} s ago` : `server ${d.elapsed_ms} ms`));
 }
 
-function renderDaily(days) {
+function renderDaily(days, dailyTz) {
+  const local = dailyTz !== 'UTC';
+  $('dayPill').textContent = local ? 'Adelaide days' : 'UTC days';
+  $('daysLocal').classList.toggle('active', local);
+  $('daysUtc').classList.toggle('active', !local);
   const t = $('daily');
   t.replaceChildren();
   const head = t.createTHead().insertRow();
@@ -412,7 +429,14 @@ function renderDaily(days) {
   const fx = (v, n) => v == null ? '—' : v.toFixed(n);
   for (const d of [...days].reverse()) {
     const tr = body.insertRow();
-    for (const v of [d.day, d.source === '1min' ? '1-min' : (d.source || '—'), fx(d.mean, 4),
+    // the day, its zone (ACST/ACDT, both on a changeover day) and its real length if not 24 h
+    const dayCell = tr.insertCell();
+    dayCell.textContent = d.day;
+    const note = document.createElement('span');
+    note.className = 'day-note';
+    note.textContent = (local ? d.tz_abbr : 'UTC') + (d.length_h !== 24 ? ` · ${d.length_h} h day` : '');
+    dayCell.appendChild(note);
+    for (const v of [(d.source || '—').replace('1min', '1-min'), fx(d.mean, 4),
                      d.std == null ? '—' : (d.std * 1000).toFixed(1), fx(d.min, 3), fx(d.max, 3),
                      fx(d.rocof_max_abs, 3), `${d.coverage_pct.toFixed(1)} %`,
                      !d.excluded_pct ? '—' : d.excluded_pct < 0.1 ? '< 0.1 %' : `${d.excluded_pct.toFixed(1)} %`]) {
@@ -466,6 +490,9 @@ if (!UNITS.length) {
   document.querySelectorAll('button[data-range]').forEach((b) =>
     b.addEventListener('click', () => { currentRange = b.dataset.range; load(); }));
   $('apply').addEventListener('click', () => { currentRange = 'custom'; load(); });
+  if (q.get('days') === 'utc') dayMode = 'utc';
+  $('daysLocal').addEventListener('click', () => { dayMode = 'local'; load(); });
+  $('daysUtc').addEventListener('click', () => { dayMode = 'utc'; load(); });
   unitSel.addEventListener('change', load);
   load();
 }

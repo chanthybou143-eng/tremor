@@ -27,6 +27,13 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+try:                                   # Python 3.9+; only the history page's local-time view needs it,
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError     # so its absence must never stop ingest
+except ImportError:                    # pragma: no cover
+    ZoneInfo = None
+
+    class ZoneInfoNotFoundError(KeyError):
+        pass
 from typing import Deque, Dict, List, Optional, Tuple
 
 from flask import Flask, jsonify, render_template, request, send_file
@@ -761,8 +768,11 @@ def create_app(
     def api_history_overview():
         """Everything the /history page draws, downsampled server-side (see history.py). Shares
         /api/history's rate limit. ``from`` omitted = from the unit's first data; ``to`` omitted
-        = now. ``points`` caps the frequency chart's buckets. Ranges of 7 days or more are served
-        from a server-wide cache (history.OverviewCache) when possible."""
+        = now. ``points`` caps the frequency chart's buckets. ``tz`` (IANA name, default UTC)
+        aligns buckets to its local hours and, with ``days=local`` (default), cuts the daily table
+        at its local midnights; ``days=utc`` cuts at UTC midnights. Every timestamp stays UTC.
+        Ranges of 7 days or more are served from a server-wide cache (history.OverviewCache)
+        when possible."""
         limited = _rate_limited(history_limiter)
         if limited is not None:
             return limited
@@ -775,6 +785,18 @@ def create_app(
                 raise ValueError(f"points must be between {MIN_POINTS} and {MAX_POINTS}")
             to_us = _parse_time_us(request.args["to"]) if "to" in request.args else None
             from_us = _parse_time_us(request.args["from"]) if "from" in request.args else None
+            tz_name = request.args.get("tz", "UTC")
+            if len(tz_name) > 64 or not re.fullmatch(r"[A-Za-z0-9_+\-/]+", tz_name):
+                raise ValueError("tz must be an IANA time zone name, e.g. Australia/Adelaide")
+            if tz_name != "UTC" and ZoneInfo is None:
+                raise ValueError("time zones are not available on this server (needs Python 3.9+)")
+            try:
+                tz = timezone.utc if tz_name == "UTC" else ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError, OSError):
+                raise ValueError(f"unknown time zone {tz_name!r}") from None
+            days_mode = request.args.get("days", "local")
+            if days_mode not in ("local", "utc"):
+                raise ValueError("days must be local or utc")
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
         now = clock()
@@ -796,14 +818,15 @@ def create_app(
             day_states = store.day_states(unit)
             cacheable = to_us - from_us >= OVERVIEW_CACHE_MIN_SPAN_S * US
             if cacheable:
-                key = OverviewCache.key(unit, from_us, to_us, points)
+                key = OverviewCache.key(unit, from_us, to_us, points) + (tz_name, days_mode)
                 sig = day_state_signature(day_states)
                 hit = overview_cache.get(key, sig)
                 if hit is not None:
                     body, age = hit
                     return jsonify(dict(body, cache=dict(hit=True, age_s=round(age, 1))))
             body = build_overview(store, unit, from_us, to_us, now, points=points, cache=raw_day_cache,
-                                  data_start_us=data_start_us, states=day_states)
+                                  data_start_us=data_start_us, states=day_states, tz=tz,
+                                  local_days_table=days_mode == "local")
             if cacheable and body["histogram"]["complete"]:
                 overview_cache.put(key, sig, body)
             body = dict(body, cache=dict(hit=False, age_s=0.0))

@@ -36,6 +36,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -45,6 +46,7 @@ from tremor.ingest import parse_payload  # noqa: E402
 from tremor.store import DAY_US, US, AggRow, DayState, open_store  # noqa: E402
 
 DEADLINE_S = 4.0
+PAGE_TZ = ZoneInfo("Australia/Adelaide")      # what the page asks for (local hours / days)
 # single-statement store reads, timed per call; raw_histogram runs several statements on one
 # connection and reports each through store.statement_timer
 STORE_CALLS = ("day_states", "rollup_aggregates", "excluded_aggregate_minutes", "read_points",
@@ -165,13 +167,13 @@ def run_ranges(store, repeats: int, warm: bool) -> float:
                 cache = RawDayCache()
                 calls.clear()
                 t = time.perf_counter()
-                body = build_overview(store, u.unit_id, from_us, to_us, now, cache=cache, data_start_us=data_start_us)
+                body = build_overview(store, u.unit_id, from_us, to_us, now, cache=cache, data_start_us=data_start_us, tz=PAGE_TZ)
                 cold.append(time.perf_counter() - t)
                 longest = max([longest] + [c[0] for c in calls])
                 n_stmt = len(calls)
                 if warm:
                     t = time.perf_counter()
-                    build_overview(store, u.unit_id, from_us, to_us, now, cache=cache, data_start_us=data_start_us)
+                    build_overview(store, u.unit_id, from_us, to_us, now, cache=cache, data_start_us=data_start_us, tz=PAGE_TZ)
                     warm_ms.append((time.perf_counter() - t) * 1000)
             worst_cold = max(worst_cold, max(cold))
             h = body["histogram"]
