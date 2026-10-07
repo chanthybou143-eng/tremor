@@ -198,8 +198,12 @@ seconds-of-day value belongs to. A reading with no usable GPS time is stored wit
   arithmetic (`pps_time_sync.PPSTimeSync.ticks_to_gps`), so it is exact and carries the device's own date. The
   old float `gps_utc_s` is **not** sent in v2 by default (`SEND_LEGACY_FLOAT = False` in `wifi_unit_client.py`;
   flip it to `True` at flash time only if a rolled-back pre-v2 server must keep reading times). Measured for a
-  60-reading POST body: v1 5,855 B, v2 6,776 B (+16%), v2 with the float 8,396 B (+43%). A time more than 1 h old
-  or 5 s in the future relative to receipt is flagged implausible, never trusted.
+  60-reading POST body: v1 5,855 B, v2 6,776 B (+16%), v2 with the float 8,396 B (+43%). A time more than
+  `MAX_AGE_S` (6 h; was 1 h until fw-resilience) old or 5 s in the future relative to receipt is flagged
+  implausible, never trusted. An optional batch-level `telemetry` object (per-POST device health,
+  `TELEMETRY_FIELDS`) is parsed best effort -- bad values dropped, never a 400 -- into the `telemetry` table
+  (added with CREATE IF NOT EXISTS, no `SCHEMA_VERSION` bump, so older code still opens the DB); the latest per
+  unit is in `/api/health` → `units[].telemetry`.
 - **`store.py`** is a small `ReadingStore` interface with one implementation, `SqliteReadingStore` (stdlib
   sqlite3, default rollback journal -- *not* WAL, PythonAnywhere's disk is NFS; one short-lived connection per
   call). Dedupe is `INSERT OR IGNORE` against partial unique indexes: v2 on `(unit_id, boot_id, seq)`, legacy on
@@ -214,7 +218,9 @@ seconds-of-day value belongs to. A reading with no usable GPS time is stored wit
   aggregates, checksum intact). Raw rows within +/-5 min of |RoCoF| > 0.1 Hz/s or freq outside 49.85-50.15 Hz
   are kept permanently (`events`). A day that fails verification is marked `attention` and is never pruned. It
   runs opportunistically from the ingest path in small resumable chunks (no scheduler needed) and via
-  `python -m tremor.retention`.
+  `python -m tremor.retention`. A UTC day is processed `settle_s` = `MAX_AGE_S` + 30 min after it ends, so a
+  reading the server still accepts can never arrive for a day that was already exported (that would fail the
+  pre-prune verification and leave the late rows out of the aggregates).
 - **API:** `/api/units` (window from the DB; adds `gps_utc`, `unlocked_count`, `duplicates_ignored`),
   `/api/history?unit=&from=&to=&limit=` (hard limit 10,000; `resolution=raw|1min|auto`), `/api/health` (DB size,
   quota use with a warning at 80%, days needing attention), `/api/export/<unit>/<YYYY-MM-DD>`.
@@ -366,11 +372,38 @@ Fixes (all in `http_client.py`, `wdt_support.py`, `wifi_unit_client.py`):
   re-resolves and succeeds. SNI always uses the real hostname.
 * **Bounded watchdog guard** (`WatchdogGuard`, `POST_WDT_GUARD_MS = 25000`, 0 disables): a 1 s Timer feeds the
   watchdog only inside a POST window, so a slow stall costs some overflowed ADC samples instead of a reboot that
-  discards the RAM buffer (up to ~10 min of readings). The 25 s cap is enforced by the timer itself, not by
+  discards the RAM buffer (up to ~60 min of readings since fw-resilience). The 25 s cap is enforced by the timer itself, not by
   the POST code: with no `stop()` and no main-thread feeds it expired at 25.0 s and the watchdog then reset
   the board (verified on the device). Every stall the bare 8 s watchdog would not have survived is logged as
   `# WDT_GUARD_EXTENDED stage=... stalled_ms=...`; the cap expiring logs `# WDT_GUARD_EXPIRED`. STATUS carries
   `dns_*`, `guard_windows/feeds/expired/ext/longest_stall_ms`.
+
+### Uplink resilience (branch `fw-resilience`, 2026-10; not yet flashed)
+
+Afternoon uplink drops (0.3-1.5 Mbps) lost data: the 600-reading buffer overflowed (6 Oct: ~1h40m lost).
+
+* **Backlog:** `wifi_ingest.IngestBuffer` is one bytearray ring of 16-byte records (`"<ffIHH"`, seq implicit,
+  every field a MicroPython small int), 3600 readings = 60 min = 57,600 B. A failed POST removes nothing; a
+  reading evicted while its POST is in flight counts as dropped only if that POST fails.
+* **Schedule** (`wifi_ingest.next_post_interval_s`): 30 s normally; 10 s right after a success while more than
+  one 60-reading batch waits (a full backlog drains in ~12-15 min); 60/120 s backoff after a failure; Wi-Fi down
+  is not an attempt. `tests/test_backoff_buffer_simulation.py` reads the client's constants via AST.
+* **No reset from a slow uplink:** `http_client.SocketAborter` -- 10 s into a POST the guard timer shortens the
+  live socket's timeout to 5 ms (lwIP's wait loops re-read it every pass), so the POST fails cleanly. Never
+  `close()` from the timer: `lwip_tcp_send`'s ERR_MEM retry loop would use the freed pcb. Worst case ~20 s
+  (that ERR_MEM loop ignores the timeout for up to 10 s), otherwise ~11 s; `tests/test_post_abort.py`.
+  POSTs over 15 s log `# SLOW_POST`.
+* **Wi-Fi** (`wifi_support.WifiSupervisor`): `WLAN.PM_NONE` (read back via `config("pm")`), connect every 5 s
+  but a join in progress is left 20 s, full link reset (disconnect, active False/True) after 120 s down.
+* **Hard ADC timer:** a soft timer callback does not run during CPU-bound C code (TLS crypto, gc), so samples
+  were silently never taken: POST-locked 2-5 s gaps, plus ~40% of readings 1.01-1.5 s apart (holes inside the
+  chunk; ~90 s/h). Hard IRQ fixes both. The die-temperature read disables IRQs for its few µs (one shared,
+  multiplexed ADC).
+* **Telemetry** on every POST: rssi, die temp (`ADC.CORE_TEMP`), backlog, dropped/skipped-chunk/reconnect
+  totals, last POST ms, heap, uptime, ADC overflow, aborts, slow POSTs.
+* Bench: `scripts/bench_outage.py` / `bench_normal.py` (run from RAM via `mpremote mount . run ...`, nothing
+  written to flash) and `scripts/bench_gap_report.py` (server-side seq/gap/frequency report). Runbook:
+  `deploy/DEPLOY_FW_RESILIENCE.md`.
 
 ### PPS interval filter and anchor recovery (`pps_time_sync.py`)
 
