@@ -72,3 +72,35 @@ def test_the_client_never_prints_or_formats_the_credentials():
                         and all(isinstance(v, ast.Constant) and v.value is None for v in c.comparators)}
             names = {x.id for x in ast.walk(n) if isinstance(x, ast.Name)} - presence
             assert not names & {"WIFI_PASSWORD", "WIFI_SSID", "INGEST_TOKEN", "_AUTH_HEADERS", "wifi_config"}
+
+
+# --- hard ADC timer ----------------------------------------------------------------------------------------
+
+def _isr():
+    return next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_on_adc_timer")
+
+
+def test_the_adc_timer_is_hard_and_its_handler_cannot_allocate():
+    assert "callback=_on_adc_timer, hard=True)" in SRC
+    assert "micropython.alloc_emergency_exception_buf(" in SRC
+    isr = _isr()
+    banned = (ast.List, ast.Dict, ast.Set, ast.Tuple, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp,
+              ast.JoinedStr, ast.Lambda, ast.Try, ast.With, ast.FunctionDef, ast.BinOp)
+    for n in (x for stmt in isr.body for x in ast.walk(stmt)):
+        if isinstance(n, ast.BinOp):
+            assert isinstance(n.op, (ast.Add, ast.Mod)), "only small-int + and % in the ISR"
+            continue
+        assert not isinstance(n, banned), type(n).__name__
+        if isinstance(n, ast.Constant):
+            assert isinstance(n.value, int) or n.value is None
+        if isinstance(n, ast.Call):
+            assert ast.unparse(n.func) in ("time.ticks_us", "adc.read_u16"), ast.unparse(n.func)
+    # the only counter that grows without bound is capped below 2**30 (a MicroPython small int)
+    caps = [n for n in ast.walk(isr) if isinstance(n, ast.Compare) and ast.unparse(n.left) == "overflow_count"]
+    assert len(caps) == 1 and isinstance(caps[0].ops[0], ast.Lt) and caps[0].comparators[0].value < 2 ** 30
+
+
+def test_the_temperature_read_cannot_interleave_with_the_adc_interrupt():
+    fn = SRC[SRC.index("def _read_temp_raw():"):SRC.index("def _die_temp_c():")]
+    assert "machine.disable_irq()" in fn and "machine.enable_irq(irq)" in fn and "finally:" in fn
+    assert "_temp_adc.read_u16()" not in SRC.replace(fn, "")          # never read any other way

@@ -393,11 +393,24 @@ read_idx = 0
 overflow_count = 0
 
 
+# HARD timer (fw-resilience, 2026-10). A soft (scheduled) callback -- the old default -- cannot run
+# while the main thread is inside CPU-bound C code: the TLS handshake's crypto, json.dumps, gc.collect.
+# Those samples were never taken (so not even counted in overflow_count), the chunk spanning the hole
+# still closed after 1 s of ticks, and ~1 s of measurement vanished on many POSTs: server data for
+# 30 min showed 21 gaps of 2-5 s, all at multiples of the 30 s POST cadence. A hard callback runs in
+# the real interrupt, on time, whatever the main thread is doing -- the same reason the PPS handler is
+# already hard (pps_time_sync.py). It must not allocate: every value here is a small int (ticks_us is
+# 30-bit, read_u16 16-bit), stores go into preallocated arrays, and overflow_count is capped below
+# 2**30 so it can never become a heap-allocated long int.
+micropython.alloc_emergency_exception_buf(100)     # so an exception inside a hard IRQ can still be reported
+
+
 def _on_adc_timer(timer):
     global write_idx, overflow_count
     next_write_idx = (write_idx + 1) % RING_CAPACITY
     if next_write_idx == read_idx:
-        overflow_count += 1
+        if overflow_count < 0x3FFFFFFF:
+            overflow_count += 1
         return
     ring_ticks[write_idx] = time.ticks_us()
     ring_raw[write_idx] = adc.read_u16()
@@ -405,7 +418,7 @@ def _on_adc_timer(timer):
 
 
 adc_timer = Timer()
-adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer)
+adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer, hard=True)
 
 MAX_GPS_BUF_BYTES = 1024
 GPS_READ_CHUNK_BYTES = 128  # see adc_stream_gps.py for the throughput/latency
@@ -446,8 +459,12 @@ def _wifi_service():
 # Die temperature for telemetry: the RP2350's internal sensor via ADC.CORE_TEMP (the SDK's
 # ADC_TEMPERATURE_CHANNEL_NUM = NUM_ADC_CHANNELS - 1: channel 4 on the Pico 2 W's RP2350A, 8 on an
 # RP2350B -- the constant avoids hard-coding either; VERIFY ON DEVICE that it reads ~room temperature).
-# Datasheet conversion: T = 27 - (V - 0.706) / 0.001721. Median of three reads, so one read disturbed
-# by the ADC timer switching the shared ADC multiplexer mid-read cannot produce a wild value.
+# Datasheet conversion: T = 27 - (V - 0.706) / 0.001721.
+# The RP2350 has ONE ADC behind a multiplexer, shared with the mains channel the hard ADC timer reads
+# 1030 times a second. If that interrupt landed between this read's channel select and its result --
+# or during its conversion -- the ISR could store the TEMPERATURE conversion as a mains sample. So each
+# read runs with interrupts off (a few microseconds; the PPS edge interrupt is delayed by at most that,
+# and only if it coincides). Median of three reads as a second line of defence.
 try:
     _temp_adc = ADC(ADC.CORE_TEMP)
 except Exception as _exc:
@@ -455,11 +472,19 @@ except Exception as _exc:
     print("# DIE_TEMP unavailable type={}".format(type(_exc).__name__))
 
 
+def _read_temp_raw():
+    irq = machine.disable_irq()
+    try:
+        return _temp_adc.read_u16()
+    finally:
+        machine.enable_irq(irq)
+
+
 def _die_temp_c():
     if _temp_adc is None:
         return None
     try:
-        raw = sorted((_temp_adc.read_u16(), _temp_adc.read_u16(), _temp_adc.read_u16()))[1]
+        raw = sorted((_read_temp_raw(), _read_temp_raw(), _read_temp_raw()))[1]
     except Exception:
         return None
     return round(27.0 - (raw * ADC_VOLTAGE_SCALE - 0.706) / 0.001721, 1)
