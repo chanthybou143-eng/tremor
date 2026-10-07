@@ -76,6 +76,7 @@ from wifi_ingest import IngestBuffer, make_boot_id, next_post_interval_s
 from http_client import (POST_ABORT_MS, DnsCache, PostStageError, SocketAborter, classify_post_exception,
                          parse_https_url, read_rssi, timeout_post)
 from wdt_support import Breadcrumb, WatchdogGuard, ResetCounter
+from wifi_support import WifiSupervisor
 import wifi_config
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
 
@@ -413,30 +414,6 @@ gps_buf = b""
 
 
 wlan.active(True)
-_last_wifi_attempt_ticks = time.ticks_us()
-
-
-def _wifi_service():
-    """Call every loop pass -- never blocks. wlan.connect() itself is
-    asynchronous (the cyw43 driver negotiates in the background; MicroPython's
-    call returns immediately), so this only ever *starts* an attempt at most
-    once per WIFI_RETRY_INTERVAL_S and otherwise just checks isconnected() --
-    it never busy-waits, which matters given the ring buffer's ~497ms
-    headroom (see its comment above). NEEDS VERIFICATION ON HARDWARE: that
-    wlan.connect() on the Pico 2 W's cyw43 driver really is non-blocking in
-    the way ESP32 MicroPython ports document -- if it isn't, this call needs
-    to move off the main loop (e.g. a second thread via _thread) instead.
-    """
-    global _last_wifi_attempt_ticks
-    if wlan.isconnected():
-        return
-    now = time.ticks_us()
-    if time.ticks_diff(now, _last_wifi_attempt_ticks) >= WIFI_RETRY_INTERVAL_S * 1_000_000:
-        _last_wifi_attempt_ticks = now
-        try:
-            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-        except OSError:
-            pass  # e.g. "already connecting" -- next retry will catch a real failure
 
 
 def _feed_wdt():
@@ -444,6 +421,48 @@ def _feed_wdt():
         wdt.feed()
         if _wdt_guard is not None:
             _wdt_guard.note_main_feed()
+
+
+# Wi-Fi supervision (wifi_support.WifiSupervisor, host-tested): power saving OFF (WLAN.PM_NONE --
+# the driver default PM_PERFORMANCE sleeps the radio between beacons), a non-blocking connect at most
+# every WIFI_RETRY_INTERVAL_S (not restarting one still joining), and after WIFI_ESCALATE_AFTER_S
+# without a connection a full link reset: disconnect(), active(False), active(True), connect again.
+# wlan.connect() itself is asynchronous on cyw43 (it only starts the join). The credentials stay in
+# this closure; the supervisor only ever logs link status codes.
+WIFI_ESCALATE_AFTER_S = 120
+_wifi = WifiSupervisor(wlan, lambda: wlan.connect(WIFI_SSID, WIFI_PASSWORD), time.ticks_ms, time.ticks_diff,
+                       pm_value=getattr(network.WLAN, "PM_NONE", None), retry_ms=WIFI_RETRY_INTERVAL_S * 1000,
+                       escalate_after_ms=WIFI_ESCALATE_AFTER_S * 1000, log_fn=print, feed_fn=_feed_wdt)
+if _wifi.apply_pm() is None:
+    print("# WIFI_PM not applied (WLAN.PM_NONE {})".format(
+        "missing" if getattr(network.WLAN, "PM_NONE", None) is None else "rejected"))
+
+
+def _wifi_service():
+    """Call every loop pass; never blocks except during an escalation (see WifiSupervisor)."""
+    _wifi.service()
+
+
+# Die temperature for telemetry: the RP2350's internal sensor via ADC.CORE_TEMP (the SDK's
+# ADC_TEMPERATURE_CHANNEL_NUM = NUM_ADC_CHANNELS - 1: channel 4 on the Pico 2 W's RP2350A, 8 on an
+# RP2350B -- the constant avoids hard-coding either; VERIFY ON DEVICE that it reads ~room temperature).
+# Datasheet conversion: T = 27 - (V - 0.706) / 0.001721. Median of three reads, so one read disturbed
+# by the ADC timer switching the shared ADC multiplexer mid-read cannot produce a wild value.
+try:
+    _temp_adc = ADC(ADC.CORE_TEMP)
+except Exception as _exc:
+    _temp_adc = None
+    print("# DIE_TEMP unavailable type={}".format(type(_exc).__name__))
+
+
+def _die_temp_c():
+    if _temp_adc is None:
+        return None
+    try:
+        raw = sorted((_temp_adc.read_u16(), _temp_adc.read_u16(), _temp_adc.read_u16()))[1]
+    except Exception:
+        return None
+    return round(27.0 - (raw * ADC_VOLTAGE_SCALE - 0.706) / 0.001721, 1)
 
 
 # DNS: resolve once and reuse (http_client.DnsCache explains the IP-change behaviour); a
@@ -682,6 +701,26 @@ gc.collect()
 print("# BUFFER capacity={} storage_bytes={} heap_free={} heap_alloc={}".format(
     buffer.capacity, buffer.storage_bytes, gc.mem_free(), gc.mem_alloc()))
 
+def _telemetry():
+    """Per-POST device health, sent as the batch's "telemetry" object (tremor.ingest.TELEMETRY_FIELDS).
+    Best effort on both ends: a value that cannot be read is left out, the server drops bad ones."""
+    t = {"backlog": len(buffer), "dropped_total": buffer.dropped_count,
+         "skipped_chunks_total": skipped_chunk_count, "wifi_reconnects_total": _wifi.reconnects,
+         "last_post_ms": last_post_duration_ms, "heap_free": gc.mem_free(),
+         "uptime_s": time.ticks_diff(time.ticks_ms(), _boot_ms) // 1000 + _uptime_wraps_s,
+         "adc_overflow_total": overflow_count, "post_aborts_total": _post_aborter.aborts,
+         "slow_posts_total": very_slow_post_count}
+    rssi = read_rssi(wlan)
+    if isinstance(rssi, int):
+        t["rssi_dbm"] = rssi
+    temp = _die_temp_c()
+    if temp is not None:
+        t["die_temp_c"] = temp
+    return t
+
+
+_boot_ms = time.ticks_ms()
+_uptime_wraps_s = 0      # whole seconds folded in from _boot_ms every ~6 days (ticks_ms wraps at 2**30 ms)
 _last_consumed_ticks = t0
 sync.blocking_ended()   # nothing has read the GPS UART since boot (Wi-Fi connect etc.): the first sentences may be stale
 _elapsed_us_total = 0
@@ -724,6 +763,8 @@ peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in com
 post_attempts = 0  # a flush() actually attempted: buffer non-empty and Wi-Fi up
 post_successes = 0
 dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_summary.py
+skipped_chunk_count = 0  # chunks summarize_chunk rejected with ValueError (too few crossings): a second
+                          # with no reading and no seq -- part of the ~580-not-600 readings per 10 min
 longest_post_duration_s = 0.0  # wall-clock duration of the slowest _post_batch call so far,
                                 # success or failure -- see _post_batch for how it's measured
 last_post_duration_ms = 0  # duration of the MOST RECENT attempt specifically (not the max) --
@@ -850,7 +891,7 @@ while True:
                 since_last_post_us, overflow_count, exc,
             ))
         except ValueError:
-            pass  # too few crossings this chunk -- skip it, same as overnight_log.py
+            skipped_chunk_count += 1  # too few crossings this chunk -- skipped (no reading, no seq), counted
         _chunk_len = 0
 
     if uart.any():
@@ -887,7 +928,7 @@ while True:
                 outcome = "offline"     # nothing attempted; _wifi_service() is reconnecting
             else:
                 post_attempts += 1
-                if buffer.flush():
+                if buffer.flush(telemetry=_telemetry()):
                     post_successes += 1
                     _reset_counter.mark_healthy()  # first success after a boot ends the run of consecutive WDT resets
                     outcome = "ok"
@@ -899,6 +940,10 @@ while True:
 
     if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
         _last_status_ticks = now
+        _since_boot_ms = time.ticks_diff(time.ticks_ms(), _boot_ms)
+        if _since_boot_ms > 86_400_000:              # well before ticks_diff's ~6.2-day signed range ends
+            _uptime_wraps_s += _since_boot_ms // 1000
+            _boot_ms = time.ticks_add(_boot_ms, (_since_boot_ms // 1000) * 1000)
         s = sync.status
         gc.collect()  # so mem_free()/mem_alloc() reflect reclaimable garbage,
                        # not a snapshot mid-accumulation -- see module docstring
@@ -912,7 +957,8 @@ while True:
               "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={} "
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
               "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
-              "post_aborts={} slow_posts_15s={} "
+              "post_aborts={} slow_posts_15s={} skipped_chunks={} wifi_reconnects={} wifi_escalations={} "
+              "wifi_longest_down_ms={} wifi_status={} die_temp_c={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
               "sync_count={} sync_rejected={} no_edge={} reanchors={} sync_shadow={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
@@ -931,7 +977,8 @@ while True:
             _wdt_guard.expired if _wdt_guard is not None else 0,
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
-            _post_aborter.aborts, very_slow_post_count,
+            _post_aborter.aborts, very_slow_post_count, skipped_chunk_count, _wifi.reconnects, _wifi.escalations,
+            _wifi.longest_down_ms, wlan.status(), _die_temp_c(),
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
             s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"], s["shadow_ignored"],
         ))
