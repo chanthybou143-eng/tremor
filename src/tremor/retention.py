@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Dict, List, Optional
 
+from .ingest import MAX_AGE_S
 from .store import DAY_US, US, AggRow, DayState, ReadingStore, Row, StoreError, open_store
 from .timeline import rocof_series
 
@@ -57,7 +58,11 @@ EXPORT_HEADER = ["unit_id", "boot_id", "seq", "gps_utc_us", "gps_raw", "time_src
 class RetentionConfig:
     export_dir: str
     raw_days: int = 14
-    settle_s: float = 3600.0            # a UTC day is processed this long after it ends
+    # A UTC day is processed (exported, aggregated) this long after it ends. It must exceed
+    # ingest.MAX_AGE_S: the server still accepts a reading that old, and one arriving after its
+    # day was exported would break the export == database == aggregates check before pruning,
+    # leaving the day marked 'attention' and its late rows out of the permanent aggregates.
+    settle_s: float = MAX_AGE_S + 1800.0
     rocof_event_hz_s: float = 0.1
     freq_lo: float = 49.85
     freq_hi: float = 50.15

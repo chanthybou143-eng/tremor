@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from helpers import T0, US, v1_batch, v1_reading, v1_series, v2_batch, v2_reading, v2_series
-from tremor.ingest import FLAG_TIME_IMPLAUSIBLE, FLAG_UNLOCKED, parse_payload
+from tremor.ingest import FLAG_TIME_IMPLAUSIBLE, FLAG_UNLOCKED, MAX_AGE_S, parse_payload
 from tremor.store import SqliteReadingStore, StoreError, open_store
 
 BOOT = "9f3a51c07d2e4b18"
@@ -160,14 +160,15 @@ def test_unlocked_v2_readings_ARE_deduped_because_they_have_a_seq(store):
 
 
 def test_implausible_time_is_flagged_and_excluded_from_the_series(store):
-    old = v2_series("unit-1", BOOT, T0 - 7200, 2, seq0=0)               # claims to be 2 h old
+    stale = T0 - MAX_AGE_S - 3600
+    old = v2_series("unit-1", BOOT, stale, 2, seq0=0)                   # claims to be older than the horizon
     ok = v2_series("unit-1", BOOT, T0, 2, seq0=2)
     res = ingest(store, {**ok, "readings": old["readings"] + ok["readings"]}, T0 + 2)
     assert (res.inserted, res.implausible) == (4, 2)
     rows = all_rows(store)
     assert len(rows.rows) == 2 and all(r.gps_utc_us is not None for r in rows.rows)
     assert len(rows.unlocked) == 2 and all(r.flags & FLAG_TIME_IMPLAUSIBLE and r.gps_utc_us is None for r in rows.unlocked)
-    assert rows.unlocked[0].gps_raw == pytest.approx(T0 - 7200)         # raw claim kept for audit
+    assert rows.unlocked[0].gps_raw == pytest.approx(stale)             # raw claim kept for audit
     assert store.unit_states()[0].implausible_total == 2
 
 

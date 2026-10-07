@@ -8,6 +8,7 @@ from helpers import US, T0, float32_text, utc, v1_reading, v2_gps, v2_reading
 from tremor.ingest import (
     FLAG_TIME_IMPLAUSIBLE,
     FLAG_UNLOCKED,
+    MAX_AGE_S,
     MAX_READINGS_PER_BATCH,
     SRC_NONE,
     SRC_V1,
@@ -133,9 +134,12 @@ def test_v1_invalid_seconds_of_day_and_stale_values_are_flagged_not_trusted():
     assert reconstruct_v1_us(-1.0, T0) is None and reconstruct_v1_us(90000.0, T0) is None
     t = resolve_time(ParsedReading(None, 50.0, None, 90000.0, None), T0)
     assert t.flags == FLAG_TIME_IMPLAUSIBLE and t.gps_utc_us is None
-    # a reading 2 hours old is beyond the retry horizon
-    t = resolve_time(ParsedReading(None, 50.0, None, (T0 - 7200) % 86400, None), T0)
+    # a reading older than the retry horizon (MAX_AGE_S) is not trusted ...
+    t = resolve_time(ParsedReading(None, 50.0, None, (T0 - MAX_AGE_S - 3600) % 86400, None), T0)
     assert t.flags == FLAG_TIME_IMPLAUSIBLE and t.gps_utc_us is None
+    # ... but one 2 h old (a 60-minute device backlog plus an outage's backoff) still is
+    t = resolve_time(ParsedReading(None, 50.0, None, (T0 - 7200) % 86400, None), T0)
+    assert t.flags == 0 and t.gps_utc_us == int(round((T0 - 7200) * US))
 
 
 # --- v2 integer time ------------------------------------------------------------
@@ -166,8 +170,15 @@ def test_v2_bad_or_implausible_time_is_flagged_and_never_replaced_by_receipt_tim
     for triple in bad:
         t = resolve_time(ParsedReading(0, 50.0, None, None, triple), T0)
         assert t.flags == FLAG_TIME_IMPLAUSIBLE and t.gps_utc_us is None
-    old = resolve_time(ParsedReading(0, 50.0, None, None, tuple(v2_gps(int((T0 - 7200) * US)))), T0)
-    assert old.flags == FLAG_TIME_IMPLAUSIBLE and old.gps_utc_us is None and old.gps_raw == pytest.approx(T0 - 7200)
+    stale = T0 - MAX_AGE_S - 1
+    old = resolve_time(ParsedReading(0, 50.0, None, None, tuple(v2_gps(int(stale * US)))), T0)
+    assert old.flags == FLAG_TIME_IMPLAUSIBLE and old.gps_utc_us is None and old.gps_raw == pytest.approx(stale)
+    late = resolve_time(ParsedReading(0, 50.0, None, None, tuple(v2_gps(int((T0 - MAX_AGE_S + 1) * US)))), T0)
+    assert late.flags == 0 and late.gps_utc_us == int((T0 - MAX_AGE_S + 1) * US)
+
+
+def test_the_age_horizon_covers_the_devices_60_minute_backlog_with_room_for_outage_backoff():
+    assert MAX_AGE_S >= 3 * 3600
 
 
 def test_a_reading_with_no_gps_at_all_is_unlocked_and_gets_no_time():

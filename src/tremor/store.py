@@ -33,6 +33,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 from .ingest import (
     FLAG_TIME_IMPLAUSIBLE,
     FLAG_UNLOCKED,
+    TELEMETRY_FIELDS,
     US,
     ParsedBatch,
     resolve_time,
@@ -259,7 +260,12 @@ class ReadingStore(ABC):
         kept event interval; returns how many were deleted."""
 
     @abstractmethod
-    def prune_ingests(self, older_than_received_at: float) -> int: ...
+    def prune_ingests(self, older_than_received_at: float) -> int:
+        """Drops ``ingests`` and ``telemetry`` rows received before the cutoff."""
+
+    @abstractmethod
+    def latest_telemetry(self) -> Dict[str, dict]:
+        """unit_id -> the newest telemetry row (ingest.TELEMETRY_FIELDS plus boot_id/received_at)."""
 
     @abstractmethod
     def close(self) -> None: ...
@@ -309,6 +315,31 @@ CREATE TABLE IF NOT EXISTS ingests (
   n_inserted INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS ix_ingests_received ON ingests(received_at);
+
+-- Per-POST device health (ingest.TELEMETRY_FIELDS). Added without a SCHEMA_VERSION bump on purpose:
+-- CREATE ... IF NOT EXISTS is all an existing database needs, and older server code (which refuses a
+-- newer user_version) still starts against it -- it just never reads this table.
+CREATE TABLE IF NOT EXISTS telemetry (
+  id INTEGER PRIMARY KEY,
+  ingest_id INTEGER,
+  unit_id TEXT NOT NULL,
+  boot_id TEXT,
+  received_at REAL NOT NULL,
+  rssi_dbm INTEGER,
+  die_temp_c REAL,
+  backlog INTEGER,
+  dropped_total INTEGER,
+  skipped_chunks_total INTEGER,
+  wifi_reconnects_total INTEGER,
+  last_post_ms INTEGER,
+  heap_free INTEGER,
+  uptime_s INTEGER,
+  adc_overflow_total INTEGER,
+  post_aborts_total INTEGER,
+  slow_posts_total INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_telemetry_unit ON telemetry(unit_id, id);
+CREATE INDEX IF NOT EXISTS ix_telemetry_received ON telemetry(received_at);
 
 CREATE TABLE IF NOT EXISTS retention_days (
   unit_id TEXT NOT NULL,
@@ -461,6 +492,12 @@ class SqliteReadingStore(ReadingStore):
             n = len(batch.readings)
             dups = n - inserted
             db.execute("UPDATE ingests SET n_inserted=? WHERE id=?", (inserted, ingest_id))
+            if batch.telemetry:
+                cols = [c for c in TELEMETRY_FIELDS if c in batch.telemetry]
+                db.execute(
+                    f"INSERT INTO telemetry(ingest_id, unit_id, boot_id, received_at, {', '.join(cols)}) "
+                    f"VALUES (?,?,?,?{',?' * len(cols)})",
+                    (ingest_id, batch.unit_id, batch.boot_id, received_at, *(batch.telemetry[c] for c in cols)))
             db.execute(
                 "INSERT INTO units(unit_id, first_seen, last_received_at, last_gps_us, last_gps_locked, "
                 "last_boot_id, readings_total, unlocked_total, duplicates_total, implausible_total) "
@@ -769,9 +806,27 @@ class SqliteReadingStore(ReadingStore):
 
     def prune_ingests(self, older_than_received_at: float) -> int:
         with self._write() as db:
-            return db.execute("DELETE FROM ingests WHERE received_at < ? AND id IN "
-                              "(SELECT id FROM ingests WHERE received_at < ? LIMIT 5000)",
-                              (older_than_received_at, older_than_received_at)).rowcount
+            n = db.execute("DELETE FROM ingests WHERE received_at < ? AND id IN "
+                           "(SELECT id FROM ingests WHERE received_at < ? LIMIT 5000)",
+                           (older_than_received_at, older_than_received_at)).rowcount
+            n += db.execute("DELETE FROM telemetry WHERE received_at < ? AND id IN "
+                            "(SELECT id FROM telemetry WHERE received_at < ? LIMIT 5000)",
+                            (older_than_received_at, older_than_received_at)).rowcount
+            return n
+
+    def latest_telemetry(self) -> Dict[str, dict]:
+        with self._read() as db:
+            cur = db.execute(
+                "SELECT t.* FROM telemetry t JOIN "
+                "(SELECT unit_id, MAX(id) AS id FROM telemetry GROUP BY unit_id) m ON t.id = m.id")
+            names = [d[0] for d in cur.description]
+            out = {}
+            for r in cur.fetchall():
+                rec = dict(zip(names, r))
+                for k in ("id", "ingest_id"):
+                    rec.pop(k)
+                out[rec.pop("unit_id")] = rec
+        return out
 
 
 def open_store(path: str, **kw) -> ReadingStore:

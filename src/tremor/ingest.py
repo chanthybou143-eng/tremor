@@ -29,16 +29,18 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 US = 1_000_000
 SECONDS_PER_DAY = 86400
 
 MAX_READINGS_PER_BATCH = 1000
-# A reading can't be from the future (beyond a small clock-skew allowance) and
-# a retry buffer holds ~10 minutes; anything further than this from the batch's
-# receipt time is treated as a bad timestamp, not trusted.
-MAX_AGE_S = 3600.0
+# A reading can't be from the future (beyond a small clock-skew allowance), and
+# the device's retry buffer holds ~60 minutes, plus backoff while the uplink is
+# down; anything further than this from the batch's receipt time is treated as a
+# bad timestamp, not trusted. retention.RetentionConfig.settle_s must stay above
+# this, or a late reading lands in a day that was already exported.
+MAX_AGE_S = 6 * 3600.0
 FUTURE_SKEW_S = 5.0
 # days since 1970-01-01: 2001-09-09 .. 2149-06-06 -- sanity range for v2 dates.
 DAY_MIN, DAY_MAX = 11_500, 60_000
@@ -69,6 +71,7 @@ class ParsedBatch:
     unit_id: str
     boot_id: Optional[str]                    # None => legacy v1 batch
     readings: Tuple[ParsedReading, ...]
+    telemetry: Optional[Dict[str, Union[int, float]]] = None    # see parse_telemetry
 
     @property
     def mode(self) -> int:
@@ -146,7 +149,47 @@ def parse_payload(payload) -> ParsedBatch:
                 raise PayloadError("gps must be [days, second_of_day, microsecond] integers")
             gps = (gps[0], gps[1], gps[2])
         out.append(ParsedReading(seq=seq if v2 else None, freq_hz=freq, amplitude_v=amp, sod=sod, gps=gps))
-    return ParsedBatch(unit_id=unit_id, boot_id=boot_id, readings=tuple(out))
+    return ParsedBatch(unit_id=unit_id, boot_id=boot_id, readings=tuple(out),
+                       telemetry=parse_telemetry(payload.get("telemetry")))
+
+
+# Optional per-POST device health, sent as a batch-level "telemetry" object: name -> (kind, lo, hi).
+# Best effort by design: a missing, malformed or out-of-range value is dropped -- never a 400,
+# because a telemetry bug must not stop readings being stored. Unknown names are ignored.
+TELEMETRY_FIELDS = {
+    "rssi_dbm": (int, -127, 0),
+    "die_temp_c": (float, -40.0, 125.0),
+    "backlog": (int, 0, 10_000_000),
+    "dropped_total": (int, 0, 2**53),
+    "skipped_chunks_total": (int, 0, 2**53),
+    "wifi_reconnects_total": (int, 0, 2**53),
+    "last_post_ms": (int, 0, 10_000_000),
+    "heap_free": (int, 0, 2**32),
+    "uptime_s": (int, 0, 2**53),
+    "adc_overflow_total": (int, 0, 2**53),
+    "post_aborts_total": (int, 0, 2**53),
+    "slow_posts_total": (int, 0, 2**53),
+}
+
+
+def parse_telemetry(obj) -> Optional[Dict[str, Union[int, float]]]:
+    if not isinstance(obj, dict):
+        return None
+    out: Dict[str, Union[int, float]] = {}
+    for name, (kind, lo, hi) in TELEMETRY_FIELDS.items():
+        v = obj.get(name)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        if kind is int:
+            if not _is_int(v):
+                continue
+        else:
+            v = float(v)
+            if not math.isfinite(v):
+                continue
+        if lo <= v <= hi:
+            out[name] = v
+    return out or None
 
 
 def reconstruct_v1_us(sod: float, received_at: float) -> Optional[int]:

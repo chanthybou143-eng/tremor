@@ -40,7 +40,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 
 from .history import (DEFAULT_POINTS, MAX_POINTS, MIN_POINTS, OVERVIEW_CACHE_MIN_SPAN_S, OverviewCache,
                       RawDayCache, build_overview, day_state_signature)
-from .ingest import PayloadError, parse_payload
+from .ingest import MAX_AGE_S, PayloadError, parse_payload
 from .retention import RetentionConfig, RetentionEngine, day_to_date
 from .rocof import rocof_from_window
 from .security import (TOKEN_HEADER, ExportAuth, IngestAuth, RateLimiter, client_ip, parse_rate)
@@ -556,6 +556,13 @@ class _TtlCache:
         return val
 
 
+def _telemetry_json(t: Optional[dict], now: float) -> Optional[dict]:
+    """The newest per-POST device telemetry for /api/health, or None if the unit never sent any."""
+    if t is None:
+        return None
+    return dict(t, seconds_since=round(now - t["received_at"], 1))
+
+
 def _row_json(r: Row) -> dict:
     return dict(
         t=r.gps_utc_us / US if r.gps_utc_us is not None else None,
@@ -804,9 +811,9 @@ def create_app(
             states = {u.unit_id: u for u in store.unit_states()}
             if unit not in states:
                 return jsonify(error=f"unknown unit {unit!r}"), 404
-            # first data: GPS time can precede receipt by up to ingest.MAX_AGE_S (1 h); the oldest
+            # first data: GPS time can precede receipt by up to ingest.MAX_AGE_S; the oldest
             # aggregate is checked too, in case readings were ever imported from before first_seen
-            starts = [states[unit].first_seen - 3600]
+            starts = [states[unit].first_seen - MAX_AGE_S]
             oldest_agg = store.aggregates(unit, 0, 2 ** 62, 1)
             if oldest_agg:
                 starts.append(oldest_agg[0].minute * 60)
@@ -840,6 +847,7 @@ def create_app(
         try:
             h = store.health()
             units = store.unit_states()
+            telemetry = store.latest_telemetry()
         except StoreError as exc:
             return jsonify(status="error", error=str(exc)), 503
         exports = size_cache.get("exports", 60.0, lambda: _dir_size(cfg.export_dir))
@@ -869,7 +877,8 @@ def create_app(
             units=[dict(unit_id=u.unit_id, last_received_at=u.last_received_at,
                         seconds_since_last_reading=now - u.last_received_at,
                         readings_total=u.readings_total, unlocked_total=u.unlocked_total,
-                        duplicates_total=u.duplicates_total, implausible_total=u.implausible_total)
+                        duplicates_total=u.duplicates_total, implausible_total=u.implausible_total,
+                        telemetry=_telemetry_json(telemetry.get(u.unit_id), now))
                    for u in units],
         )
 

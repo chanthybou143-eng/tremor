@@ -12,7 +12,8 @@ import time
 import pytest
 
 from helpers import FakeClock, US, utc, v2_series
-from tremor.history import (KNOWN_BAD, MAX_POINTS, RAW_MAX_SPAN_S, RawDayCache, build_overview, nice_width)
+from tremor.history import (KNOWN_BAD, MAX_POINTS, RAW_HOUR_SETTLE_S, RAW_MAX_SPAN_S, RawDayCache, build_overview,
+                            nice_width)
 from tremor.retention import RetentionConfig
 from tremor.store import AggRow, DayState, open_store
 from tremor.webapp import create_app
@@ -29,7 +30,10 @@ def wave(t: float) -> float:
 
 def make_app(tmp_path, clock, **kw):
     return create_app(simulated_units=[], db_path=str(tmp_path / "readings.db"), clock=clock,
-                      retention_config=RetentionConfig(export_dir=str(tmp_path / "exports"), raw_days=14), **kw)
+                      # settle_s pinned: these fixtures place "now" a few hours after midnight and test
+                      # the history views, not the (much longer) production settle delay
+                      retention_config=RetentionConfig(export_dir=str(tmp_path / "exports"), raw_days=14,
+                                                       settle_s=3600.0), **kw)
 
 
 def post_series(client, clock, start, n, seq0=0, boot=BOOT, freq=wave, amp=0.744, step=1.0):
@@ -368,8 +372,11 @@ def test_raw_hours_are_cached_but_the_open_hour_is_refreshed(four_days):
         post_series(client, clock, NOW, 120, seq0=10 ** 6)
         cache._mono = lambda: time.monotonic() + 31    # past the open hour's TTL only
         j = build_overview(store, "unit-1", long_from, int((NOW + 3600) * US), NOW + 125, cache=cache)
-        # the hour that ended at NOW is still inside its settle window, so it is re-read too
-        assert len(calls) == 1 and calls[0][1] == int((NOW - 3600) * US) - 10 * US
+        # every hour that ended less than RAW_HOUR_SETTLE_S ago is still open, so it is re-read too
+        # (75 min settle: the hours ending at NOW and at NOW - 1 h)
+        first_open = NOW - 3600 * math.ceil(RAW_HOUR_SETTLE_S / 3600)
+        assert first_open == NOW - 2 * 3600
+        assert len(calls) == 1 and calls[0][1] == int(first_open * US) - 10 * US
         assert j["daily"][-1]["n"] == 6 * 3600 + 120
     finally:
         store.read_points = real

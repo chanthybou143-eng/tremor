@@ -72,9 +72,10 @@ NOMINAL_HZ = 50.0                         # sums are taken around nominal (see s
 NICE_WIDTHS_S = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600,
                  43200, 86400, 172800, 604800)
 
-# Raw results are cached per hour. An hour can still gain readings for ~10 minutes after it ends
-# (the device's retry buffer), so it is "open" until RAW_HOUR_SETTLE_S past its end.
-RAW_HOUR_SETTLE_S = 15 * 60
+# Raw results are cached per hour. An hour can still gain readings for up to ~60 minutes after it
+# ends (the device's retry buffer, wifi_unit_client.MAX_BUFFERED_READINGS), so it is "open" until
+# RAW_HOUR_SETTLE_S past its end; anything later still shows up once the closed-hour entry expires.
+RAW_HOUR_SETTLE_S = 75 * 60
 RAW_CACHE_TTL_OPEN_S = 30.0
 RAW_CACHE_TTL_CLOSED_S = 3600.0
 RAW_CACHE_MAX = 1200                      # entries: ~2 days of raw-path hours + 14 days of histogram hours
