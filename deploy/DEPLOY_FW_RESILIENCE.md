@@ -70,28 +70,42 @@ it comes back in maintenance mode (LED steady on).
 **2.0 Maintenance mode:** unplug, fit the GP22 jumper (pin 29 to pin 28), plug in. LED steady on
 (RECOVERY.md).
 
-**2.1 Hard-ADC-timer A/B (30 min each).** Soft timer = commit `fccf4e0`; hard timer = branch head.
+**2.1 Hard-ADC-timer A/B (30 min each).** The same code twice, differing only in `hard=`: the soft run
+comes from a scratch worktree of the branch head with that one flag flipped (not committed).
 
 ```bash
 cd ~/tremor-merge
-git worktree add ../tremor-fw-soft fccf4e0
+git worktree add --detach ../tremor-fw-soft HEAD
+sed -i '' 's/callback=_on_adc_timer, hard=True)/callback=_on_adc_timer, hard=False)/' ../tremor-fw-soft/wifi_unit_client.py
+git -C ../tremor-fw-soft diff --stat          # expect: 1 file changed, 1 insertion, 1 deletion
 mpremote connect auto mount ../tremor-fw-soft run scripts/bench_normal.py | tee ~/bench_soft.log    # 30 min, Ctrl-C
 mpremote connect auto mount .                 run scripts/bench_normal.py | tee ~/bench_hard.log    # 30 min, Ctrl-C
 grep -m1 '# BOOT_ID' ~/bench_soft.log ~/bench_hard.log
 python3 scripts/bench_gap_report.py --boot <soft boot_id> --compare-boot <hard boot_id>
-git worktree remove ../tremor-fw-soft
+python3 scripts/bench_log_summary.py ~/bench_soft.log ~/bench_hard.log
+git worktree remove --force ../tremor-fw-soft
 ```
 
-Pass:
-- **Hard:** `time_gaps` about 0, and `gaps_locked_to_post_cadence` no longer close to all of them.
-  `readings_per_10min` ≥ ~595 (600 minus `skipped_chunks`). STATUS `overflow=0`.
-- **Soft** (for reference; it matches production): about 44 gaps/h, nearly all locked to the 30 s cadence,
-  and ~567 readings/10 min.
-- **Frequency unchanged:** `freq_step_median_mHz` (per-reading noise, comparable across runs) within ±15% of
-  the soft run, and `freq_glitches_gt_20mHz` no higher. The means differ by whatever the grid did between the
-  two half-hours. For an absolute check, compare each run with AEMO FPP SA1 (4 s) as on 2026-09-27: the offset
-  should stay ≈ −1.9 mHz.
-- No `# BOOT` line in the middle of a log (= no reset).
+Judged only on grid-independent metrics (the two half-hours see different grid frequencies; the mean
+is checked later against the AEMO weekly report):
+
+| Metric | Where | Pass (hard vs soft) |
+|---|---|---|
+| `time_gaps`, `missing_seconds_in_gaps`, `gaps_locked_to_post_cadence` | gap report | hard ≈ 0 (soft ≈ 40+/h, nearly all locked) |
+| `readings_per_10min` | gap report | hard ≥ ~595 (600 minus `skipped_chunks`) |
+| `freq_diff1s_std_mHz`, `freq_diff1s_mad_mHz` | gap report | hard within ±15 % of soft, not higher |
+| `freq_glitches_gt_20mHz` | gap report | hard ≤ soft |
+| `amplitude_mean_v`, `amplitude_std_mV` | gap report | means within ±1 %; std not higher |
+| `overflow` (= adc_overflow_total), `chunk_capacity_overflow`, `dup_timestamp_count` | log summary | hard 0 (or ≤ soft) |
+| `pps_spread_us_median / p95 / max`, `pps_windows_spread_gt_10us` | log summary | see below |
+| `boot_lines` | log summary | 1 per log (no reset) |
+
+PPS spread = max - min of the accepted 1 s PPS intervals per 10 s window, about twice the worst PPS
+timestamp latency in that window. The hard ADC handler runs at the same interrupt priority as the PPS pin
+interrupt, so a PPS edge arriving during one waits for it: expect the hard run's p95/max to rise by roughly
+2 x the handler's run time (estimated 10-20 µs, so 20-40 µs) in a small fraction of windows. Report the
+numbers; decide with them whether that is acceptable (it shifts the time tags of that second's readings by
+the same µs; it does not change frequency, which comes from the ADC sample clock).
 
 **2.2 Outage test (≥ 25 min).** Normal for 3 min, then every POST refused for 10 min, then normal again.
 
@@ -124,8 +138,9 @@ Expect, in order:
   (45 min) and rerun 2.2.
 - `# WIFI_PM requested=0xa11140 before=… after=0xa11140`. `before` is the driver default; PM_PERFORMANCE
   is `0xa11142`.
-- STATUS `die_temp_c=` plausible (ambient + a few °C). If it reads nonsense, `ADC.CORE_TEMP` is not channel 4
-  on this board: report it. Telemetry tolerates a missing value, so it is not a blocker.
+- STATUS `die_temp_c=` plausible (ambient + a few °C) from the second STATUS line on (the first sample is
+  taken mid-PPS-second within ~10 s of boot). If it reads nonsense, `ADC.CORE_TEMP` is not channel 4 on this
+  board: report it. Telemetry tolerates a missing value, so it is not a blocker.
 - `# POST_GUARD window_ms=25000 abort_ms=10000` and `# WDT_ARMED requested_ms=8000`.
 
 ## 3. Flash Unit 1

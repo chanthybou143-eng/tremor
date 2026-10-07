@@ -5,8 +5,11 @@
     python3 scripts/bench_gap_report.py --unit unit-1 --boot <A> --compare-boot <B>    # e.g. soft vs hard ADC timer
 
 Per run: every seq present exactly once? GPS-time gaps between consecutive seq (the "missing seconds"),
-whether those gaps are locked to the POST cadence, readings per 10 minutes, frequency statistics and
-single-reading glitches, and the unit's latest telemetry from /api/health (dropped_total etc.).
+whether those gaps are locked to the POST cadence, readings per 10 minutes, grid-independent noise
+metrics (std of successive 1 s frequency differences, amplitude spread), single-reading glitches, and
+the unit's latest telemetry from /api/health. Mean frequency is printed only as context (the grid moves
+it between runs). Device-side counters per run (ADC overflow, PPS interval spread, heap): see
+scripts/bench_log_summary.py.
 Exit status 1 if any seq is missing in a run (the outage bench test's pass criterion).
 """
 
@@ -86,22 +89,28 @@ def analyse(rows, cadence_s=POST_CADENCE_S):
         out["span_s"] = round(span, 1)
         out["readings_per_10min"] = round(len(timed) / span * 600, 1) if span > 0 else None
 
+    # Grid-independent: std of successive differences between CONSECUTIVE 1 s readings (seq + 1 and
+    # <= 1.5 s apart), i.e. per-reading measurement noise plus the grid's own 1 s wander -- comparable
+    # across runs taken at different times, unlike the mean (which the grid moves).
+    pairs = [(a, b) for a, b in zip(timed, timed[1:]) if b["seq"] == a["seq"] + 1 and b["t"] - a["t"] <= 1.5]
+    if len(pairs) >= 3:
+        d = [b["freq_hz"] - a["freq_hz"] for a, b in pairs]
+        out["freq_diff1s_std_mHz"] = round(statistics.pstdev(d) * 1000, 3)
+        out["freq_diff1s_mad_mHz"] = round(statistics.median(abs(x) for x in d) * 1000, 3)
     f = [r["freq_hz"] for r in timed]
     if len(f) >= 3:
-        out["freq_mean"] = round(statistics.fmean(f), 5)
-        out["freq_median"] = round(statistics.median(f), 5)
-        out["freq_std"] = round(statistics.pstdev(f), 5)
+        out["grid_freq_mean"] = round(statistics.fmean(f), 5)          # grid-dependent: context only
+        out["grid_freq_std"] = round(statistics.pstdev(f), 5)          # grid-dependent: context only
         glitches = 0
         for i in range(len(f)):
             win = f[max(0, i - 5):i] + f[i + 1:i + 6]
             if win and abs(f[i] - statistics.median(win)) > 0.02:
                 glitches += 1
         out["freq_glitches_gt_20mHz"] = glitches
-        diffs = [abs(b - a) for a, b in zip(f, f[1:])]
-        out["freq_step_median_mHz"] = round(statistics.median(diffs) * 1000, 3)
     amps = [r["amplitude_v"] for r in timed if r.get("amplitude_v") is not None]
-    if amps:
+    if len(amps) >= 2:
         out["amplitude_mean_v"] = round(statistics.fmean(amps), 4)
+        out["amplitude_std_mV"] = round(statistics.pstdev(amps) * 1000, 3)
     return out
 
 

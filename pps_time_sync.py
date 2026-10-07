@@ -97,6 +97,13 @@ class PPSTimeSync:
         self._cand_streak = 0           # ... and how many rejected candidates in a row have agreed with each other
 
         self._pps_period_us = None
+        # Spread of accepted 1 s PPS intervals since the last take_interval_window(): the GPS edge
+        # itself jitters by tens of ns and the crystal drifts by << 1 us per second, so (max - min) is
+        # in effect how late this ISR got to read ticks_us() -- i.e. PPS timestamp latency from other
+        # interrupts (e.g. the hard ADC timer, same NVIC priority). Updated AFTER the edge's
+        # timestamp is taken, so it cannot affect it.
+        self._iv_min = 2000000
+        self._iv_max = 0
         self._pending_edge_ticks = None  # most recent PPS edge not yet paired to a sentence
 
         self._anchor_ticks = None       # ticks_us() at the PPS edge that starts _anchor_utc_s
@@ -135,6 +142,10 @@ class PPSTimeSync:
                 self._accept(now, k > 1)
                 if k == 1:
                     self._pps_period_us = interval
+                    if interval < self._iv_min:
+                        self._iv_min = interval
+                    if interval > self._iv_max:
+                        self._iv_max = interval
                 return
         elif interval >= PPS_REANCHOR_US:
             self._accept(now, True)                 # nothing accepted for a long time: start over from this edge
@@ -148,6 +159,17 @@ class PPSTimeSync:
         self.pps_accepted += 1
         if resync:
             self.pps_resync += 1
+
+    @property
+    def last_edge_ticks(self):
+        """ticks_us() of the last ACCEPTED PPS edge, or None."""
+        return self._good_ticks
+
+    def take_interval_window(self):
+        """(min, max) accepted 1 s interval in us since the previous call (None, None if none), and reset."""
+        lo, hi = self._iv_min, self._iv_max
+        self._iv_min, self._iv_max = 2000000, 0
+        return (None, None) if hi == 0 else (lo, hi)
 
     def blocking_started(self):
         """The main loop is about to block for a long time (a POST): UART data will pile up unread."""

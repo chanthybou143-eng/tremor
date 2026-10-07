@@ -640,3 +640,22 @@ def test_the_client_reports_every_reanchor_and_tells_pps_time_sync_when_it_is_bl
     loop = src.index("\nwhile True:")
     assert "sync.blocking_ended()" in src[src.rindex("_last_consumed_ticks = t0"):loop]   # and once before the main loop
     assert "sync_shadow={}" in src and 's["shadow_ignored"]' in src
+
+
+# --- interval spread (PPS timestamp latency diagnostic) --------------------------------------------------
+
+def test_the_interval_window_reports_min_and_max_accepted_1s_intervals_and_resets(rig):
+    rig.edge(0)
+    for t in (1_000_000, 2_000_000, 3_000_017, 4_000_000):         # the 3 s edge stamped 17 us late
+        rig.edge(t)
+    lo, hi = rig.s.take_interval_window()
+    assert (lo, hi) == (999_983, 1_000_017)                        # spread 34 us = twice the latency
+    assert rig.s.take_interval_window() == (None, None)
+
+
+def test_missed_edges_and_glitches_do_not_enter_the_interval_window(rig):
+    rig.edge(0)
+    rig.edge(2_000_000)                                              # k = 2
+    rig.edge(2_400_000)                                              # glitch, rejected
+    assert rig.s.take_interval_window() == (None, None)
+    assert rig.s.last_edge_ticks == 2_000_000

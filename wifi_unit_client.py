@@ -404,9 +404,27 @@ overflow_count = 0
 # 2**30 so it can never become a heap-allocated long int.
 micropython.alloc_emergency_exception_buf(100)     # so an exception inside a hard IRQ can still be reported
 
+# Die temperature for telemetry: the RP2350's internal sensor via ADC.CORE_TEMP (the SDK's
+# ADC_TEMPERATURE_CHANNEL_NUM = NUM_ADC_CHANNELS - 1: channel 4 on the Pico 2 W's RP2350A, 8 on an
+# RP2350B -- the constant avoids hard-coding either; VERIFY ON DEVICE that it reads ~room temperature).
+# Datasheet conversion: T = 27 - (V - 0.706) / 0.001721.
+# The RP2350 has ONE ADC behind a multiplexer, shared with the mains channel. So the temperature is
+# read INSIDE the ADC timer handler, right after its mains sample, when the main loop asks for it
+# (_temp_req): every ADC access then happens in one context, nothing can interleave, and no
+# interrupt is ever disabled. The main loop only asks 0.3-0.7 s after the last accepted PPS edge
+# (_maybe_request_temp), so that one slightly longer handler run (~one extra conversion, a few us)
+# can never coincide with -- and delay the timestamp of -- a PPS edge.
+try:
+    _temp_adc = ADC(ADC.CORE_TEMP)
+except Exception as _exc:
+    _temp_adc = None
+    print("# DIE_TEMP unavailable type={}".format(type(_exc).__name__))
+_temp_req = 0
+_temp_raw = -1
+
 
 def _on_adc_timer(timer):
-    global write_idx, overflow_count
+    global write_idx, overflow_count, _temp_req, _temp_raw
     next_write_idx = (write_idx + 1) % RING_CAPACITY
     if next_write_idx == read_idx:
         if overflow_count < 0x3FFFFFFF:
@@ -415,6 +433,9 @@ def _on_adc_timer(timer):
     ring_ticks[write_idx] = time.ticks_us()
     ring_raw[write_idx] = adc.read_u16()
     write_idx = next_write_idx
+    if _temp_req:
+        _temp_raw = _temp_adc.read_u16()
+        _temp_req = 0
 
 
 adc_timer = Timer()
@@ -456,36 +477,32 @@ def _wifi_service():
     _wifi.service()
 
 
-# Die temperature for telemetry: the RP2350's internal sensor via ADC.CORE_TEMP (the SDK's
-# ADC_TEMPERATURE_CHANNEL_NUM = NUM_ADC_CHANNELS - 1: channel 4 on the Pico 2 W's RP2350A, 8 on an
-# RP2350B -- the constant avoids hard-coding either; VERIFY ON DEVICE that it reads ~room temperature).
-# Datasheet conversion: T = 27 - (V - 0.706) / 0.001721.
-# The RP2350 has ONE ADC behind a multiplexer, shared with the mains channel the hard ADC timer reads
-# 1030 times a second. If that interrupt landed between this read's channel select and its result --
-# or during its conversion -- the ISR could store the TEMPERATURE conversion as a mains sample. So each
-# read runs with interrupts off (a few microseconds; the PPS edge interrupt is delayed by at most that,
-# and only if it coincides). Median of three reads as a second line of defence.
-try:
-    _temp_adc = ADC(ADC.CORE_TEMP)
-except Exception as _exc:
-    _temp_adc = None
-    print("# DIE_TEMP unavailable type={}".format(type(_exc).__name__))
+TEMP_INTERVAL_MS = 10000
+_last_temp_req_ms = None
 
 
-def _read_temp_raw():
-    irq = machine.disable_irq()
-    try:
-        return _temp_adc.read_u16()
-    finally:
-        machine.enable_irq(irq)
+def _maybe_request_temp():
+    """Ask the ADC handler for a temperature sample at most every TEMP_INTERVAL_MS, and only in the
+    middle of a PPS second (0.3-0.7 s after the last accepted edge; any time if there is no PPS)."""
+    global _temp_req, _last_temp_req_ms
+    if _temp_adc is None or _temp_req:
+        return
+    now_ms = time.ticks_ms()
+    if _last_temp_req_ms is not None and time.ticks_diff(now_ms, _last_temp_req_ms) < TEMP_INTERVAL_MS:
+        return
+    edge = sync.last_edge_ticks
+    if edge is not None:
+        phase_us = time.ticks_diff(time.ticks_us(), edge) % 1000000
+        if not 300000 <= phase_us <= 700000:
+            return
+    _last_temp_req_ms = now_ms
+    _temp_req = 1
 
 
 def _die_temp_c():
-    if _temp_adc is None:
-        return None
-    try:
-        raw = sorted((_read_temp_raw(), _read_temp_raw(), _read_temp_raw()))[1]
-    except Exception:
+    """The latest temperature sample (read by the ADC handler), or None before the first one."""
+    raw = _temp_raw
+    if raw < 0:
         return None
     return round(27.0 - (raw * ADC_VOLTAGE_SCALE - 0.706) / 0.001721, 1)
 
@@ -937,6 +954,7 @@ while True:
                 gps_buf = gps_buf[-MAX_GPS_BUF_BYTES:]
 
     _wifi_service()
+    _maybe_request_temp()
 
     current_buffered = len(buffer)
     if current_buffered > peak_buffered:
@@ -970,6 +988,7 @@ while True:
             _uptime_wraps_s += _since_boot_ms // 1000
             _boot_ms = time.ticks_add(_boot_ms, (_since_boot_ms // 1000) * 1000)
         s = sync.status
+        _pps_iv = sync.take_interval_window()   # accepted 1 s PPS intervals in this STATUS window: max - min = timestamp jitter
         gc.collect()  # so mem_free()/mem_alloc() reflect reclaimable garbage,
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "
@@ -983,7 +1002,7 @@ while True:
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
               "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
               "post_aborts={} slow_posts_15s={} skipped_chunks={} wifi_reconnects={} wifi_escalations={} "
-              "wifi_longest_down_ms={} wifi_status={} die_temp_c={} "
+              "wifi_longest_down_ms={} wifi_status={} die_temp_c={} pps_iv_min_us={} pps_iv_max_us={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
               "sync_count={} sync_rejected={} no_edge={} reanchors={} sync_shadow={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
@@ -1003,7 +1022,7 @@ while True:
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
             _post_aborter.aborts, very_slow_post_count, skipped_chunk_count, _wifi.reconnects, _wifi.escalations,
-            _wifi.longest_down_ms, _wifi.status_code(), _die_temp_c(),
+            _wifi.longest_down_ms, _wifi.status_code(), _die_temp_c(), _pps_iv[0], _pps_iv[1],
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
             s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"], s["shadow_ignored"],
         ))

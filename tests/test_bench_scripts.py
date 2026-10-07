@@ -37,6 +37,7 @@ def test_missing_seq_is_reported_with_its_ranges():
 def test_a_clean_run_has_no_gaps_and_600_readings_per_10_minutes():
     a = analyse(rows([float(i) for i in range(3600)]))
     assert a["time_gaps"] == 0 and a["readings_per_10min"] == 600.2 and a["freq_glitches_gt_20mHz"] == 0
+    assert a["freq_diff1s_std_mHz"] == 0.0 and a["amplitude_std_mV"] == 0.0
 
 
 def test_single_reading_glitches_are_counted():
@@ -61,3 +62,16 @@ def test_the_bench_runner_never_prints_the_config_and_patches_before_importing_t
             assert "_exc)" not in ast.unparse(n) or "type(_exc).__name__" in ast.unparse(n)
     assert src.index("http_client.timeout_post = _bench_post") < src.index("import wifi_unit_client")
     assert 'sys.path[:] = ["/"]' in src and "sys.path[:] = _saved_path" in src
+
+
+def test_log_summary_takes_last_counters_and_the_pps_spread():
+    from bench_log_summary import summarise
+    lines = ["# BOOT reset_cause=WDT_RESET",
+             "# STATUS elapsed_s=10.0 overflow=0 heap_free=320000 pps_iv_min_us=999996 pps_iv_max_us=999998 die_temp_c=31.2",
+             "# STATUS elapsed_s=20.0 overflow=3 heap_free=310000 pps_iv_min_us=999980 pps_iv_max_us=1000015 die_temp_c=None",
+             "# STATUS elapsed_s=30.0 overflow=3 heap_free=315000 pps_iv_min_us=None pps_iv_max_us=None",
+             "# SLOW_POST duration_ms=16000 stage=send aborted=True t_ms=1"]
+    s = summarise(lines)
+    assert s["overflow"] == 3 and s["heap_free_min"] == 310000 and s["boot_lines"] == 1 and s["slow_post_lines"] == 1
+    assert s["pps_spread_windows"] == 2 and s["pps_spread_us_max"] == 35 and s["pps_windows_spread_gt_10us"] == 1
+    assert s["die_temp_c_last"] == 31.2

@@ -94,13 +94,28 @@ def test_the_adc_timer_is_hard_and_its_handler_cannot_allocate():
         if isinstance(n, ast.Constant):
             assert isinstance(n.value, int) or n.value is None
         if isinstance(n, ast.Call):
-            assert ast.unparse(n.func) in ("time.ticks_us", "adc.read_u16"), ast.unparse(n.func)
+            assert ast.unparse(n.func) in ("time.ticks_us", "adc.read_u16", "_temp_adc.read_u16"), ast.unparse(n.func)
     # the only counter that grows without bound is capped below 2**30 (a MicroPython small int)
     caps = [n for n in ast.walk(isr) if isinstance(n, ast.Compare) and ast.unparse(n.left) == "overflow_count"]
     assert len(caps) == 1 and isinstance(caps[0].ops[0], ast.Lt) and caps[0].comparators[0].value < 2 ** 30
 
 
-def test_the_temperature_read_cannot_interleave_with_the_adc_interrupt():
-    fn = SRC[SRC.index("def _read_temp_raw():"):SRC.index("def _die_temp_c():")]
-    assert "machine.disable_irq()" in fn and "machine.enable_irq(irq)" in fn and "finally:" in fn
-    assert "_temp_adc.read_u16()" not in SRC.replace(fn, "")          # never read any other way
+def test_the_temperature_is_read_only_inside_the_adc_handler_and_no_interrupt_is_ever_disabled():
+    # one multiplexed ADC: all access from one context, so nothing can interleave -- and nothing may
+    # delay the PPS edge interrupt, whose ticks_us() stamp is the unit's time reference
+    assert "disable_irq" not in SRC
+    isr_src = ast.unparse(_isr())
+    assert "_temp_raw = _temp_adc.read_u16()" in isr_src
+    assert isr_src.index("ring_raw[write_idx] = adc.read_u16()") < isr_src.index("_temp_adc.read_u16()")
+    assert SRC.count("_temp_adc.read_u16()") == 1
+    assert SRC.index("_temp_adc = ADC(ADC.CORE_TEMP)") < SRC.index("adc_timer.init(")
+
+
+def test_temperature_requests_are_made_only_mid_pps_second():
+    fn = SRC[SRC.index("def _maybe_request_temp():"):SRC.index("def _die_temp_c():")]
+    assert "sync.last_edge_ticks" in fn and "300000 <= phase_us <= 700000" in fn
+    assert "_maybe_request_temp()" in SRC[SRC.index("while True:"):]
+
+
+def test_status_reports_the_pps_interval_spread():
+    assert "pps_iv_min_us={} pps_iv_max_us={}" in SRC and "sync.take_interval_window()" in SRC
