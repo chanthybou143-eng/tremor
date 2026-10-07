@@ -1003,7 +1003,7 @@ while True:
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
             _post_aborter.aborts, very_slow_post_count, skipped_chunk_count, _wifi.reconnects, _wifi.escalations,
-            _wifi.longest_down_ms, wlan.status(), _die_temp_c(),
+            _wifi.longest_down_ms, _wifi.status_code(), _die_temp_c(),
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
             s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"], s["shadow_ignored"],
         ))

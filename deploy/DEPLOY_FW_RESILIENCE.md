@@ -10,6 +10,7 @@ Branch `fw-resilience`. Each step below needs your go-ahead. Do them in this ord
 | `66db40b` | Firmware: hard POST abort at 10 s, `# SLOW_POST` over 15 s |
 | `fccf4e0` | Firmware: Wi-Fi PM_NONE, reconnect escalation, telemetry, skipped-chunk counter |
 | `5fa2501` | Firmware: hard ADC timer (separate, for the A/B below) |
+| branch head | Firmware: STATUS reads the Wi-Fi status exception-safely |
 
 Device files that change: `wifi_unit_client.py`, `wifi_ingest.py`, `http_client.py`, `wdt_support.py`, and the
 new `wifi_support.py`. `main.py`, `boot_support.py`, `pps_time_sync.py`, `nmea_parser.py`, `chunk_summary.py`,

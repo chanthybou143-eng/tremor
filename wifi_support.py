@@ -83,6 +83,10 @@ class WifiSupervisor:
         except Exception:
             return None
 
+    def status_code(self):
+        """wlan.status() for a log line; None (never an exception) if the driver cannot say."""
+        return self._status()
+
     def _start_connect(self, now):
         self._last_attempt = now
         self.connect_calls += 1
