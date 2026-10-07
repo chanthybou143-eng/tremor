@@ -1,338 +1,219 @@
 """Buffers per-reading summaries and ships them to TREMOR's /api/ingest
 endpoint in batches, retrying on failure instead of dropping data.
 
-Deliberately isolated from network.WLAN/urequests (see wifi_unit_client.py
+Deliberately isolated from network.WLAN/sockets (see wifi_unit_client.py
 for that glue) so this buffering/eviction logic -- pure Python, only
-array/_thread beyond the stdlib -- runs and is testable under desktop
+struct/_thread beyond the stdlib -- runs and is testable under desktop
 CPython, same portability reasoning as freq_estimator.py. The actual HTTP
 POST is injected as a callable rather than imported directly, so tests can
 swap in a fake one without needing MicroPython's network stack.
 
-Genuinely concurrent as of the wifi_unit_client.py dual-core redesign:
-append() runs on core 0 (from the ADC-reduction path) while flush() runs
-on core 1 (from the WiFi thread), so IngestBuffer is no longer
-single-threaded and needs real locking -- see the class docstring below.
-_thread is used rather than threading specifically because it's the one
-threading-flavoured module both CPython and MicroPython provide under the
-same name with a compatible allocate_lock() API, so this file needs no
-platform branching to stay host-testable.
+Storage (fw-resilience, 2026-10): ONE preallocated bytearray of fixed
+16-byte records, used as a ring -- sized for ~60 minutes of readings
+(wifi_unit_client.MAX_BUFFERED_READINGS) so an afternoon uplink outage no
+longer overflows it. It is allocated once at boot and never resized: the
+same "no growing containers" rule as the earlier array.array version, which
+was itself the fix for a list-growth MemoryError crash loop (git history).
+The earlier version kept TWO parallel-array rings (29 bytes/slot each, so
+58 bytes per reading) and swapped between them so a slow POST's batch could
+never be overwritten; that is no longer needed, because flush() serializes
+its batch into the payload BEFORE the POST -- an append() that evicts an
+in-flight record during the POST only overwrites a slot whose contents are
+already copied out.
 
-Fixed-capacity storage, not a plain growing list: the previous
-implementation (self._buf = []; self._buf.append(...)) was the actual
-crash site in a 12.5-hour overnight soak of the array.array chunk-buffer
-fix -- 4 restarts, all at this file's old line 76 (self._buf.append),
-every one preceded by a run of failed POSTs that left the buffer growing
-by one reading per second with nothing draining it. That's the exact same
-bug class as the original chunk_summary.py crash this whole effort started
-from (MicroPython grows a list's backing array by doubling on overflow,
-needing a fresh contiguous block every transition, which can fail under
-heap fragmentation even with plenty nominally free) -- just in a buffer
-nobody had reason to suspect until it grew large enough, during a failure
-run, to hit one of those transitions itself.
+Record layout, little-endian ("<ffIHH"), chosen so every field read or
+written is a MicroPython small int (< 2**30: no heap allocation per reading):
+    f32  frequency_hz
+    f32  amplitude_v                 (meaningful only if _F_AMP)
+    u32  meta: microsecond (bits 0-19) | second_of_day bit 16 (bit 20) | _F_AMP | _F_SOD | _F_GPS
+    u16  days_since_1970             } _F_GPS: the integer GPS time
+    u16  second_of_day bits 0-15     }
+         (_F_SOD instead: these last 4 bytes hold the legacy float32 seconds-of-day)
+seq is NOT stored: drop-oldest only ever removes the oldest record, so the
+buffered readings always carry consecutive seq numbers, and the oldest's
+seq (_head_seq) is enough to number every one of them.
 """
 
 import _thread
-import array
+import struct
 
-FLOAT_TYPECODE = "f"  # NEEDS VERIFICATION ON HARDWARE, not assumed: matches
-                       # wifi_unit_client.py's FLOAT_TYPECODE and the same
-                       # check_float_precision.py result -- use 'd' here
-                       # too if that script prints "double".
+RECORD_BYTES = 16
+_REC = "<ffIHH"
+_US_MASK = 0xFFFFF                 # 20 bits: microsecond 0..999999
+_SEC_HI = 1 << 20                  # second_of_day bit 16 (seconds run to 86399, or 86400 in a leap second)
+_F_AMP = 1 << 21
+_F_SOD = 1 << 22
+_F_GPS = 1 << 23
 
 
-class _RingStorage:
-    """Fixed-capacity storage for one FIFO's worth of buffered readings --
-    preallocated once, filled/read by index, never resized. IngestBuffer
-    keeps two of these (see its own docstring for why) and swaps which one
-    is "active" instead of allocating a fresh one on every flush().
-
-    amplitude_v/gps_utc_s can legitimately be None (amplitude_v isn't in
-    practice, given summarize_chunk always returns a real float, but the
-    public append() signature never enforced that; gps_utc_s genuinely is
-    None before PPS sync) -- array('f', ...) can't hold None, so a
-    parallel has_amp/has_gps flag byte per slot records whether the float
-    slot is meaningful, same idea the task asked for GPS specifically,
-    applied to both for a uniform, simple scheme.
-    """
-
-    def __init__(self, capacity):
-        self.freq = array.array(FLOAT_TYPECODE, [0.0] * capacity)
-        self.amp = array.array(FLOAT_TYPECODE, [0.0] * capacity)
-        self.has_amp = bytearray(capacity)
-        self.gps = array.array(FLOAT_TYPECODE, [0.0] * capacity)
-        self.has_gps = bytearray(capacity)
-        # v2 payload fields (see IngestBuffer's boot_id). Integer typecodes only:
-        # seq is a per-boot reading counter; the gps triple is the device's
-        # full-precision integer UTC from PPSTimeSync.ticks_to_gps().
-        self.seq = array.array("I", [0] * capacity)
-        self.gday = array.array("H", [0] * capacity)      # days since 1970-01-01
-        self.gsec = array.array("I", [0] * capacity)      # second of day
-        self.gus = array.array("I", [0] * capacity)       # microsecond
-        self.has_gpsi = bytearray(capacity)
-        self.head = 0
-        self.count = 0
+def _pack_gps(gps):
+    """(days, second_of_day, microsecond) -> (meta, days, second bits 0-15), or None if a
+    field cannot be represented (it is then stored as "no time" and counted, never wrapped)."""
+    days, sec, usec = gps
+    if not (0 <= days <= 0xFFFF and 0 <= sec <= 0x1FFFF and 0 <= usec <= _US_MASK):
+        return None
+    return usec | (_SEC_HI if sec & 0x10000 else 0) | _F_GPS, days, sec & 0xFFFF
 
 
 class IngestBuffer:
-    """A bounded FIFO of pending (frequency_hz, amplitude_v, gps_utc_s)
-    readings for one unit, safe to append() from one core while flush()
-    runs concurrently on another.
+    """A bounded FIFO of pending (frequency_hz, amplitude_v, time) readings
+    for one unit.
 
-    append() during normal operation; flush() attempts to POST everything
-    currently buffered. A failed POST (post_fn returns falsy or raises)
-    puts the un-sent batch back for the next flush() call -- same
-    "retry, don't silently drop" philosophy as adc_stream_gps.py's ADC
-    ring buffer (which drops and *counts* an overflow rather than losing
-    data with no trace). Only a genuinely full buffer drops anything here,
-    and every drop is counted in dropped_count.
+    append() during normal operation; flush() POSTs the oldest
+    max_readings_per_post of them. A failed POST (post_fn returns falsy or
+    raises) leaves every record in place for the next flush(): nothing is
+    removed until the server has accepted it. Only a genuinely full buffer
+    drops anything -- always the oldest reading -- and every drop is counted
+    in dropped_count. A reading evicted while it is part of an in-flight
+    POST is counted only if that POST then fails (if it succeeds, the reading
+    was delivered).
 
-    Storage is two preallocated _RingStorage instances, swapped by
-    flipping self._active -- the same swap-not-copy trick the previous
-    plain-list implementation used (to_send = self._buf; self._buf = []),
-    just with both sides preallocated so neither append() nor flush()
-    allocates a new list/array. A single ring buffer can't do this safely:
-    resetting its own head/count to "empty" so append() could reuse freed
-    slots would let a fast append() overwrite data still being read out
-    for the slow, network-bound POST still in flight. With two buffers,
-    the moment flush() flips self._active, every new append() goes to the
-    *other*, already-empty one -- the buffer being sent is never touched
-    again until flush() itself either resets it (success) or merges its
-    leftover content back in (failure), both after the POST has returned.
+    boot_id=None -> the legacy (v1) wire format. A boot_id switches to v2:
+    every reading carries a per-boot sequence number and the integer GPS
+    time, and the batch carries the boot_id, so the server can drop retried
+    duplicates exactly. seq is assigned on append(), for EVERY reading
+    including ones later dropped, so a gap the server sees is exactly what
+    this device lost.
 
-    On failure, the un-sent batch is merged back in chronological order
-    (failed batch first/older, then whatever append() added during the
-    POST) with max_readings re-applied, dropping the oldest of the *failed*
-    batch first if the combined total overflows -- same policy as before.
-    The merge works by extending the buffer that received in-flight
-    appends *backward* into its own spare capacity (a ring buffer can
-    prepend by moving head back, no data movement) rather than needing a
-    third buffer.
+    send_legacy_float (v2 only): also send the old float32 "gps_utc_s",
+    derived from the integer time, so a rolled-back pre-v2 server can still
+    place the readings. Off by default -- ~24 bytes per reading.
 
-    flush()'s one remaining allocation: building the wire payload needs a
-    real list of dicts. An earlier version of this file preallocated a
-    max_readings-sized pool of dicts and mutated them in place -- removed
-    after it turned out to be a genuine bug, not just an optimization
-    that happened to be safe: any post_fn (or anything downstream of it)
-    that retains a *reference* to payload["readings"] past its own call
-    -- rather than fully, synchronously consuming it, e.g. a test
-    collecting sent readings for later inspection, exactly what
-    tests/test_wifi_ingest.py's own concurrency test does -- would later
-    see those same dict objects mutated by a *subsequent* flush(),
-    corrupting whatever it thought it had captured. Reproduced directly
-    (see commit history): with the shared pool, a 4-thread concurrent
-    append/flush stress test lost entire threads' worth of readings to
-    exactly this aliasing, replaced by duplicates of later data -- not a
-    locking bug (the ring-buffer locking was and is correct), and not a
-    timing flake either (it reproduced deterministically once a
-    downstream consumer retained references, and vanished once it copied
-    values out instead). The real client's own post_fn (urequests.post(
-    url, json=payload), which serializes to a request body synchronously
-    within that one call and never retains payload afterward) likely
-    never hit this in practice, but "likely fine given how the one
-    current caller happens to behave" isn't a safe contract for a
-    reusable buffer.
-
-    Fixed by building a fresh, small list of dicts every flush() instead
-    of reusing one: safe specifically *because* max_readings_per_post
-    bounds it to a small number (60 by default -- see
-    wifi_unit_client.py's MAX_READINGS_PER_POST) well below the size
-    where MicroPython's list-growth doubling becomes a fragmentation risk
-    (the crash pattern this whole effort exists to avoid needed
-    something in the hundreds of elements, not a few dozen). This
-    tradeoff only holds if a caller actually passes a small
-    max_readings_per_post; the default (None -> max_readings, i.e.
-    uncapped, for backward compatibility with callers that don't set
-    one) reintroduces that original risk for that specific call pattern
-    -- documented here rather than hidden, since the real deployment
-    always passes an explicit small cap and this is the one path that
-    doesn't.
-
-    len(buffer) is read unlocked (see __len__) -- a plain count read can't
-    observe a torn/corrupted state, only a slightly stale value, and
-    that's an acceptable tradeoff for a status readout, not something
-    worth a lock acquisition for.
-
-    max_readings default of 600 (~10 minutes at one reading/sec) is a
-    starting point, not a measured ceiling -- see the WiFi client's design
-    notes on Pico 2 W heap headroom under WiFi+TLS; retune once
-    gc.mem_free() has actually been checked on real hardware.
-
-    max_readings_per_post (default: max_readings, i.e. uncapped -- the
-    caller passes a real value, see wifi_unit_client.py's
-    MAX_READINGS_PER_POST) bounds how many readings a single flush()
-    call ever sends: at most the *oldest* max_readings_per_post of
-    whatever's currently buffered. A fully-buffered flush is otherwise a
-    single JSON body proportional to max_readings (48,635 bytes measured
-    at 600) -- one large contiguous allocation nobody had reason to bound
-    before the buffer itself could actually reach that size. Anything
-    left over after a capped send stays buffered for the next scheduled
-    flush() at the normal cadence -- this never triggers an extra POST of
-    its own, since an unscheduled extra network call would itself be one
-    more multi-second blocking stall.
+    Thread-safe (one lock around every state change), though the deployed
+    client is single-core. len() is read unlocked -- a status readout.
     """
 
     def __init__(self, unit_id, post_fn, max_readings=600, max_readings_per_post=None, boot_id=None,
                  send_legacy_float=False):
         self.unit_id = unit_id
-        # boot_id=None -> the legacy (v1) wire format, exactly as before. A
-        # boot_id (see make_boot_id) switches to v2: every reading carries a
-        # per-boot sequence number and the integer GPS time, and the batch
-        # carries the boot_id, so the server can drop retried duplicates exactly
-        # and never confuses readings from two different power-ups.
         self.boot_id = boot_id
-        # v2 only: also send the old float32 "gps_utc_s" next to the integer time. Off by
-        # default -- it is ~24 bytes per reading and a v2 server does not need it. Turn it on
-        # (wifi_unit_client.SEND_LEGACY_FLOAT) only if a rollback to a pre-v2 server has to
-        # keep working: that server reads nothing but gps_utc_s for the reading's time.
         self.send_legacy_float = send_legacy_float
-        self._next_seq = 0
         self._post_fn = post_fn
-        self._max_readings = max_readings
-        self._max_readings_per_post = (
-            max_readings if max_readings_per_post is None else max_readings_per_post
-        )
+        self._cap = max_readings
+        # None -> uncapped (everything buffered in one POST). The deployed client always passes a
+        # small cap: the payload is a fresh list of dicts, and one JSON body per flush().
+        self._per_post = max_readings if max_readings_per_post is None else max_readings_per_post
         self._lock = _thread.allocate_lock()
+        self._buf = bytearray(max_readings * RECORD_BYTES)
+        self._head = 0                   # slot index of the oldest record
+        self._count = 0
+        self._head_seq = 0               # seq of the oldest record; the next append gets _head_seq + _count
+        self._inflight_end = None        # seq just past the batch currently being POSTed, else None
+        self._inflight_evicted = 0
+        self._f32 = bytearray(4)         # scratch for rounding a derived legacy float to float32
         self.dropped_count = 0
-
-        self._storages = [_RingStorage(max_readings), _RingStorage(max_readings)]
-        self._active = 0
+        self.bad_time_count = 0          # GPS triples that could not be stored (stored as "no time")
 
     def __len__(self):
-        return self._storages[self._active].count  # unlocked -- see class docstring
+        return self._count
+
+    @property
+    def capacity(self):
+        return self._cap
+
+    @property
+    def storage_bytes(self):
+        return len(self._buf)
+
+    @property
+    def next_seq(self):
+        return self._head_seq + self._count
 
     def append(self, frequency_hz, amplitude_v, gps_utc_s=None, gps=None):
         """gps: optional (days_since_1970, second_of_day, microsecond) ints from
-        PPSTimeSync.ticks_to_gps(); only sent when a boot_id is set. seq is
-        assigned here, for EVERY reading including ones later dropped from a
-        full buffer, so a gap in the sequence the server sees is exactly the
-        readings this device lost."""
+        PPSTimeSync.ticks_to_gps() -- used in v2. gps_utc_s: the legacy float32
+        seconds-of-day -- stored only when there is no integer time (v1)."""
+        meta = days = seclo = 0
+        if gps is not None and self.boot_id is not None:
+            packed = _pack_gps(gps)
+            if packed is None:
+                self.bad_time_count += 1
+            else:
+                meta, days, seclo = packed
+        if amplitude_v is not None:
+            meta |= _F_AMP
         self._lock.acquire()
         try:
-            buf = self._storages[self._active]
-            idx = (buf.head + buf.count) % self._max_readings
-            if buf.count >= self._max_readings:
-                buf.head = (buf.head + 1) % self._max_readings  # drop oldest
-                self.dropped_count += 1
+            if self._count >= self._cap:
+                if self._inflight_end is not None and self._head_seq < self._inflight_end:
+                    self._inflight_evicted += 1      # counted only if its POST fails (see flush)
+                else:
+                    self.dropped_count += 1
+                self._head = (self._head + 1) % self._cap
+                self._head_seq += 1
+                self._count -= 1
+            off = ((self._head + self._count) % self._cap) * RECORD_BYTES
+            buf = self._buf
+            if not (meta & _F_GPS) and gps_utc_s is not None and (self.boot_id is None or self.send_legacy_float):
+                struct.pack_into("<ffIf", buf, off, frequency_hz, amplitude_v or 0.0, meta | _F_SOD, gps_utc_s)
             else:
-                buf.count += 1
-            buf.seq[idx] = self._next_seq
-            self._next_seq += 1
-            if gps is None:
-                buf.has_gpsi[idx] = 0
-            else:
-                buf.gday[idx] = gps[0]
-                buf.gsec[idx] = gps[1]
-                buf.gus[idx] = gps[2]
-                buf.has_gpsi[idx] = 1
-            buf.freq[idx] = frequency_hz
-            if amplitude_v is None:
-                buf.has_amp[idx] = 0
-            else:
-                buf.amp[idx] = amplitude_v
-                buf.has_amp[idx] = 1
-            if gps_utc_s is None:
-                buf.has_gps[idx] = 0
-            else:
-                buf.gps[idx] = gps_utc_s
-                buf.has_gps[idx] = 1
+                struct.pack_into(_REC, buf, off, frequency_hz, amplitude_v or 0.0, meta, days, seclo)
+            self._count += 1
         finally:
             self._lock.release()
 
-    def _build_payload(self, buf, n):
-        # A fresh list of n dicts every call, not a reused/mutated pool --
-        # see the class docstring for why reuse was a real aliasing bug,
-        # not just an optimization. Safe as a fresh allocation specifically
-        # because n is bounded small by max_readings_per_post; this is not
-        # safe to call with a large n (see the docstring's caveat about the
-        # uncapped default).
+    def _legacy_float(self, sec, usec):
+        sod = sec + usec / 1e6
+        struct.pack_into("<f", self._f32, 0, sod)
+        return struct.unpack_from("<f", self._f32, 0)[0]
+
+    def _build_payload(self, n, telemetry):
+        # A fresh list of n dicts every call, never a reused pool: a post_fn that keeps a reference
+        # to payload["readings"] must not see it change on a later flush() (a real aliasing bug in an
+        # earlier version -- see git history). Small because n <= max_readings_per_post.
         readings = []
         v2 = self.boot_id is not None
+        buf = self._buf
         for i in range(n):
-            idx = (buf.head + i) % self._max_readings
-            r = {
-                "frequency_hz": buf.freq[idx],
-                "amplitude_v": buf.amp[idx] if buf.has_amp[idx] else None,
-            }
+            off = ((self._head + i) % self._cap) * RECORD_BYTES
+            freq, amp, meta, days, seclo = struct.unpack_from(_REC, buf, off)
+            sec = seclo | (0x10000 if meta & _SEC_HI else 0)
+            r = {"frequency_hz": freq, "amplitude_v": amp if meta & _F_AMP else None}
             if not v2 or self.send_legacy_float:
-                r["gps_utc_s"] = buf.gps[idx] if buf.has_gps[idx] else None
+                if meta & _F_SOD:
+                    r["gps_utc_s"] = struct.unpack_from("<f", buf, off + 12)[0]
+                elif meta & _F_GPS:
+                    r["gps_utc_s"] = self._legacy_float(sec, meta & _US_MASK)
+                else:
+                    r["gps_utc_s"] = None
             if v2:
-                r["seq"] = buf.seq[idx]
-                if buf.has_gpsi[idx]:
-                    r["gps"] = [buf.gday[idx], buf.gsec[idx], buf.gus[idx]]
+                r["seq"] = self._head_seq + i
+                if meta & _F_GPS:
+                    r["gps"] = [days, sec, meta & _US_MASK]
             readings.append(r)
-        payload = {
-            "unit_id": self.unit_id,
-            "readings": readings,
-        }
+        payload = {"unit_id": self.unit_id, "readings": readings}
         if v2:
             payload["boot_id"] = self.boot_id
+        if telemetry:
+            payload["telemetry"] = telemetry
         return payload
 
-    def _merge_failed_batch(self, send_buf, current):
-        """Prepend send_buf's un-sent readings (chronologically older) in
-        front of current's readings (arrived during the POST, so
-        chronologically newer) by extending current backward into its own
-        free capacity. Drops send_buf's own oldest first if the combined
-        total would exceed max_readings -- walking backward from
-        send_buf's newest item and stopping after the number of slots
-        actually available naturally keeps the newest items and skips the
-        oldest, without needing to compute which indices to skip
-        separately.
-        """
-        free_slots = self._max_readings - current.count
-        n_to_prepend = send_buf.count
-        if n_to_prepend > free_slots:
-            self.dropped_count += n_to_prepend - free_slots
-            n_to_prepend = free_slots
+    def flush(self, telemetry=None):
+        """POST the oldest (at most max_readings_per_post) buffered readings, once.
 
-        for i in range(n_to_prepend):
-            src_idx = (send_buf.head + send_buf.count - 1 - i) % self._max_readings
-            current.head = (current.head - 1) % self._max_readings
-            current.freq[current.head] = send_buf.freq[src_idx]
-            current.amp[current.head] = send_buf.amp[src_idx]
-            current.has_amp[current.head] = send_buf.has_amp[src_idx]
-            current.gps[current.head] = send_buf.gps[src_idx]
-            current.has_gps[current.head] = send_buf.has_gps[src_idx]
-            current.seq[current.head] = send_buf.seq[src_idx]
-            current.gday[current.head] = send_buf.gday[src_idx]
-            current.gsec[current.head] = send_buf.gsec[src_idx]
-            current.gus[current.head] = send_buf.gus[src_idx]
-            current.has_gpsi[current.head] = send_buf.has_gpsi[src_idx]
-        current.count += n_to_prepend
+        Returns True if the batch was accepted (post_fn returned truthy) -- those
+        readings are then removed. Returns False on any failure, including post_fn
+        raising; nothing is removed, so the same readings (same seq, same order) go
+        out again next time. A no-op returning True when the buffer is empty.
 
-        send_buf.head = 0
-        send_buf.count = 0
+        Never loops to send a remainder: anything left waits for the caller's next
+        scheduled flush() (see next_post_interval_s), since every POST is a blocking
+        call competing with ADC sampling.
 
-    def flush(self):
-        """Attempt to send buffered readings, at most
-        max_readings_per_post of them (the oldest first) in this one call.
-
-        Returns True if the batch was accepted (post_fn returned truthy).
-        Returns False if the POST failed for any reason, including post_fn
-        raising -- the un-sent batch is merged back into the buffer (see
-        class docstring) to retry on the next call. A no-op (returns True)
-        when the buffer is empty, so callers can call this unconditionally
-        on a timer without checking len() first.
-
-        Whether the POST succeeded or not, anything past the first
-        max_readings_per_post readings is left for a later flush() call --
-        never sent by looping again here. That reuses the exact same
-        merge-back-in-chronological-order logic either way (a held-back
-        remainder after a successful partial send and an un-sent batch
-        after a failure are both "readings still waiting to go out,
-        oldest first, in front of whatever arrived since").
+        telemetry: optional dict sent as the batch-level "telemetry" object.
         """
         self._lock.acquire()
         try:
-            send_buf = self._storages[self._active]
-            if send_buf.count == 0:
+            if self._count == 0:
                 return True
-            self._active = 1 - self._active  # new append()s go to the other, empty buffer
+            n = min(self._count, self._per_post)
+            first = self._head_seq
+            payload = self._build_payload(n, telemetry)
+            self._inflight_end = first + n
+            self._inflight_evicted = 0
         finally:
             self._lock.release()
 
-        n_to_send = min(send_buf.count, self._max_readings_per_post)
-        payload = self._build_payload(send_buf, n_to_send)
         try:
             ok = self._post_fn(payload)
         except Exception:
@@ -341,17 +222,37 @@ class IngestBuffer:
         self._lock.acquire()
         try:
             if ok:
-                # advance past exactly what was sent -- any remainder
-                # (buffered readings beyond max_readings_per_post) stays
-                # in send_buf, to be merged back below same as a failure
-                send_buf.head = (send_buf.head + n_to_send) % self._max_readings
-                send_buf.count -= n_to_send
-            if send_buf.count > 0:
-                current = self._storages[self._active]
-                self._merge_failed_batch(send_buf, current)
+                k = first + n - self._head_seq        # sent records not already evicted meanwhile
+                if k > 0:
+                    self._head = (self._head + k) % self._cap
+                    self._head_seq += k
+                    self._count -= k
+            else:
+                self.dropped_count += self._inflight_evicted
+            self._inflight_end = None
+            self._inflight_evicted = 0
         finally:
             self._lock.release()
-        return ok
+        return bool(ok)
+
+
+def next_post_interval_s(prev_s, outcome, backlog, base_s, catchup_s, catchup_above, multiplier, cap_s):
+    """Seconds until the next scheduled flush(), after one that ended in ``outcome``:
+
+    "ok"      -- accepted. Back to the normal cadence (base_s), or the faster catch-up
+                 cadence (catchup_s) while more than catchup_above readings are still
+                 waiting: only ever right after a success, so a struggling link is never
+                 hammered.
+    "fail"    -- attempted and failed: normal exponential backoff, starting from base_s
+                 even if the previous interval was the shorter catch-up one, capped at cap_s.
+    "offline" -- not attempted (Wi-Fi down; reconnecting has its own timer): keep the
+                 current interval, but never shorter than base_s.
+    """
+    if outcome == "ok":
+        return catchup_s if backlog > catchup_above else base_s
+    if outcome == "fail":
+        return min(max(prev_s, base_s) * multiplier, cap_s)
+    return max(prev_s, base_s)
 
 
 def make_boot_id(urandom=None, fallback=None):

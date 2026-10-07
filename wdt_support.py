@@ -15,7 +15,7 @@ Why this exists (overnight freeze of 2026-09-25 15:04 UTC, reproduced on hardwar
   * A timer callback DOES run while the main thread is stuck inside such a call (soft and hard
     Timers both fed the WDT through the same 8.18 s handshake on the device), so a timer can
     keep the watchdog fed for a bounded window around the POST.
-  * A watchdog reset throws away the RAM buffer (up to ~10 minutes of readings after a run of
+  * A watchdog reset throws away the RAM buffer (up to ~60 minutes of readings after a run of
     failed POSTs); letting a slow POST finish or fail cleanly loses only the ring-buffer samples
     that overflow meanwhile (counted in overflow_count).
 """

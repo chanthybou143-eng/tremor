@@ -72,7 +72,7 @@ from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
-from wifi_ingest import IngestBuffer, make_boot_id
+from wifi_ingest import IngestBuffer, make_boot_id, next_post_interval_s
 from http_client import DnsCache, PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
 from wdt_support import Breadcrumb, WatchdogGuard, ResetCounter
 import wifi_config
@@ -148,41 +148,31 @@ FLOAT_TYPECODE = "f"
 # than 8s did, at the cost of a longer worst-case delay before a reading
 # reaches the dashboard.
 POST_INTERVAL_S = 30.0
-# After a POST actually attempted and failed (not wifi_disconnected --
-# that's already handled by _wifi_service()'s own independent 5s retry
-# timer, a different failure mode), the effective interval between
-# attempts doubles, capped, instead of retrying every POST_INTERVAL_S
-# regardless -- an overnight soak's failure runs were consistently 12-17
-# consecutive attempts 30s apart before crashing, so backing off gives a
-# struggling connection room rather than hammering it at a fixed rate.
-# BACKOFF_CAP_S was 240 (8x) at first -- a reasoned starting point, not a
-# measured optimum. A Trial 5 overnight run then measured the real cost of
-# that: at a ~0.94 readings/s arrival rate (Trial 5 run 2, clean hours) and
-# MAX_BUFFERED_READINGS=600, the buffer fills from empty in ~600-640s, and a
-# single run of 4 consecutive failures under the old 240s cap already spans
-# ~665s (60+120+240+240s of backoff waits alone) -- enough on its own to
-# overflow the buffer and drop readings, which is exactly what happened
-# (dropped=518 over several such episodes). Lowering the cap to 120 keeps a
-# 4-failure run's span to ~420-450s (comfortably under the fill time) and a
-# 5-failure run to ~540-575s (still under, though with less margin); a
-# 6-failure run's ~660-700s span still exceeds the fill time and can still
-# overflow the buffer. See tests/test_backoff_buffer_simulation.py for the
-# host-side simulation this is based on. Still not independently verified
-# on hardware whether it changes the failure-run length itself, only how
-# much buffer damage a given run length can do.
+# After a POST actually attempted and failed (not Wi-Fi down -- that is
+# _wifi_service()'s own retry timer), the interval between attempts doubles,
+# capped, instead of retrying every POST_INTERVAL_S regardless -- an overnight
+# soak's failure runs were consistently 12-17 consecutive attempts 30s apart
+# before crashing, so backing off gives a struggling connection room rather
+# than hammering it. BACKOFF_CAP_S=120 was first chosen to keep a failure run
+# inside the old 600-reading (~10 min) buffer; with the 60-minute buffer it is
+# kept because it bounds how stale the dashboard gets once the link is back.
+# The whole schedule (backoff, catch-up) is wifi_ingest.next_post_interval_s,
+# host-tested in tests/test_ring_buffer.py and simulated end to end in
+# tests/test_backoff_buffer_simulation.py.
 BACKOFF_MULTIPLIER = 2.0
 BACKOFF_CAP_S = 120.0
 # After this many consecutive failures, force an extra gc.collect() (and
 # explicitly drop this frame's socket/response reference first) rather
 # than waiting for the routine ones -- see _post_batch's docstring.
 CONSECUTIVE_FAILURE_GC_THRESHOLD = 3
-# ~30 readings/batch at POST_INTERVAL_S=30s and one reading/s (CHUNK_S)
-# -- 600 is a ~20x margin over one normal batch, and the outage-tolerance
-# semantics (drop-oldest once buffered readings span ~10 minutes) are
-# unchanged by the interval bump, since this bound is independent of how
-# often flush() is called. See the bench-run report (commit history) for
-# the actually-observed peak.
-MAX_BUFFERED_READINGS = 600
+# 60 minutes at one reading/s: afternoon uplink outages (6 Oct: ~1h40m lost
+# with the old 600-reading buffer) are mostly shorter than this. One 16-byte
+# record per reading in a single bytearray allocated once at boot (57,600
+# bytes; see wifi_ingest.py) -- the old two-ring 600-slot buffer was ~35 KB.
+# When full, the oldest reading is dropped and counted (buffer.dropped_count,
+# also sent as telemetry). The server accepts readings up to
+# tremor.ingest.MAX_AGE_S (6 h) old, so a full backlog keeps its GPS times.
+MAX_BUFFERED_READINGS = 3600
 # Caps a single flush()'s POST body -- uncapped, a fully-buffered flush
 # (600 readings) is a ~48.6KB JSON body (measured directly), a single
 # allocation-heavy contiguous write nobody had reason to bound before the
@@ -196,6 +186,13 @@ MAX_BUFFERED_READINGS = 600
 # ring-buffer draining, the same kind of stall that causes ring-buffer
 # overflow_count in the first place.
 MAX_READINGS_PER_POST = 60
+# Catching up after an outage: right after a SUCCESSFUL POST, while more than
+# MAX_READINGS_PER_POST readings are still waiting, the next POST comes after
+# this instead of POST_INTERVAL_S. 60 readings per ~10 s against ~1 arriving
+# per second drains a full 60-minute backlog in ~12-15 minutes (simulated in
+# tests/test_backoff_buffer_simulation.py), while every POST stays the same
+# bounded size. Any failure falls straight back to the normal backoff.
+CATCHUP_POST_INTERVAL_S = 10.0
 
 WIFI_RETRY_INTERVAL_S = 5    # how often to kick off a fresh connect attempt while down
 STATUS_INTERVAL_S = 10
@@ -467,9 +464,8 @@ PRE_POST_GC_COLLECT = True  # named constant so this can be disabled -- e.g. to 
                             # ENOMEM failures, or whether they happen regardless
 
 _consecutive_failures = 0
-_current_post_interval_s = POST_INTERVAL_S  # read by the main loop instead of the
-                                              # POST_INTERVAL_S constant directly --
-                                              # see BACKOFF_MULTIPLIER's comment
+_current_post_interval_s = POST_INTERVAL_S  # set by the main loop from wifi_ingest.next_post_interval_s
+                                              # (backoff after a failure, catch-up after a success)
 readings_sent_ok = 0  # cumulative individual readings actually accepted by the
                        # server (not POST attempts -- a single POST's batch size
                        # varies, especially once MAX_READINGS_PER_POST capping is
@@ -544,7 +540,7 @@ def _post_batch(payload):
 
     global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count
     global last_heap_free_at_try_start
-    global _consecutive_failures, _current_post_interval_s, readings_sent_ok, max_consecutive_failures
+    global _consecutive_failures, readings_sent_ok, max_consecutive_failures
 
     if not wlan.isconnected():
         print("# POST_FAIL reason=wifi_disconnected stage=n/a heap_free={}".format(gc.mem_free()))
@@ -625,15 +621,12 @@ def _post_batch(payload):
     if ok:
         readings_sent_ok += len(payload["readings"])
         _consecutive_failures = 0
-        _current_post_interval_s = POST_INTERVAL_S
     else:
         _consecutive_failures += 1
         if _consecutive_failures % 3 == 0:
             _dns_cache.invalidate()                # e.g. a stale address that accepts TCP but never answers
         if _consecutive_failures > max_consecutive_failures:
             max_consecutive_failures = _consecutive_failures
-        _current_post_interval_s = min(
-            _current_post_interval_s * BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
         if _consecutive_failures >= CONSECUTIVE_FAILURE_GC_THRESHOLD:
             # No local response/socket reference to explicitly drop here
             # (unlike the urequests-based version this was ported from) --
@@ -671,6 +664,9 @@ print("# AUTH ingest token {}".format("configured" if _AUTH_HEADERS is not None 
 buffer = IngestBuffer(UNIT_ID, post_fn=_post_batch, max_readings=MAX_BUFFERED_READINGS,
                        max_readings_per_post=MAX_READINGS_PER_POST, boot_id=BOOT_ID,
                        send_legacy_float=SEND_LEGACY_FLOAT)
+gc.collect()
+print("# BUFFER capacity={} storage_bytes={} heap_free={} heap_alloc={}".format(
+    buffer.capacity, buffer.storage_bytes, gc.mem_free(), gc.mem_alloc()))
 
 _last_consumed_ticks = t0
 sync.blocking_ended()   # nothing has read the GPS UART since boot (Wi-Fi connect etc.): the first sentences may be stale
@@ -711,7 +707,7 @@ chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY sam
 _last_post_ticks = t0
 _last_status_ticks = t0
 peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
-post_attempts = 0  # a flush() where the buffer was actually non-empty -- excludes no-op flushes
+post_attempts = 0  # a flush() actually attempted: buffer non-empty and Wi-Fi up
 post_successes = 0
 dup_timestamp_count = 0  # DegenerateTimestampsError occurrences -- see chunk_summary.py
 longest_post_duration_s = 0.0  # wall-clock duration of the slowest _post_batch call so far,
@@ -866,19 +862,25 @@ while True:
         peak_buffered = current_buffered
 
     now = time.ticks_us()
-    # _current_post_interval_s, not the POST_INTERVAL_S constant directly --
-    # it backs off past 30s after consecutive failures and resets to 30s on
-    # the next success (see _post_batch's docstring / BACKOFF_MULTIPLIER).
+    # _current_post_interval_s, not the POST_INTERVAL_S constant directly: it
+    # backs off after failures and shortens to CATCHUP_POST_INTERVAL_S after a
+    # success that left a backlog (wifi_ingest.next_post_interval_s).
     if time.ticks_diff(now, _last_post_ticks) >= _current_post_interval_s * 1_000_000:
         _last_post_ticks = now
         if current_buffered > 0:
-            post_attempts += 1
-            if buffer.flush():  # _post_batch checks wlan.isconnected() itself; a
-                                 # no-op (returns False, buffer untouched) while down
-                post_successes += 1
-                _reset_counter.mark_healthy()  # first success after a boot ends the run of consecutive WDT resets
-        else:
-            buffer.flush()  # genuinely nothing to send -- not counted as an attempt
+            if not wlan.isconnected():
+                outcome = "offline"     # nothing attempted; _wifi_service() is reconnecting
+            else:
+                post_attempts += 1
+                if buffer.flush():
+                    post_successes += 1
+                    _reset_counter.mark_healthy()  # first success after a boot ends the run of consecutive WDT resets
+                    outcome = "ok"
+                else:
+                    outcome = "fail"
+            _current_post_interval_s = next_post_interval_s(
+                _current_post_interval_s, outcome, len(buffer), POST_INTERVAL_S, CATCHUP_POST_INTERVAL_S,
+                MAX_READINGS_PER_POST, BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
 
     if time.ticks_diff(now, _last_status_ticks) >= STATUS_INTERVAL_S * 1_000_000:
         _last_status_ticks = now

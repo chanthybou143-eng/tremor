@@ -324,7 +324,7 @@ def _read_response_with_deadline(sock_like, now_fn, ticks_diff_fn, feed_fn, star
 # connect or TLS-handshake failure, or a non-2xx HTTP answer (wifi_unit_client calls
 # invalidate() for that), or (b) DNS_MAX_AGE_S passes -- whichever is first -- and then the next
 # POST resolves afresh. A retired IP therefore costs one or two failed POSTs (each ~4-9 s, then
-# the client's backoff), during which readings simply stay buffered (600 readings ~ 10 min), so
+# the client's backoff), during which readings simply stay buffered (3600 readings ~ 60 min), so
 # nothing is lost. TLS still sends server_hostname=<the real host> (SNI), so the certificate
 # presented is for the right name regardless of the IP used. If a fresh lookup itself FAILS
 # (DNS down) a previously cached address is reused for up to DNS_STALE_OK_S rather than failing.

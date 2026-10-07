@@ -1,115 +1,136 @@
+"""End-to-end outage simulation on a fake clock: the real IngestBuffer and the real schedule
+(wifi_ingest.next_post_interval_s) with wifi_unit_client.py's own constants, and a fake server that
+dedupes on seq like the real one. Answers: how long an outage loses nothing, how long catching up takes,
+and that nothing is lost or duplicated in between."""
+
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
-from wifi_ingest import IngestBuffer  # noqa: E402
-
-# Mirrors wifi_unit_client.py's own constants (BACKOFF_MULTIPLIER,
-# BACKOFF_CAP_S, POST_INTERVAL_S, MAX_READINGS_PER_POST,
-# MAX_BUFFERED_READINGS) -- duplicated here, not imported, because that
-# module constructs hardware objects and runs an infinite loop at module
-# scope, so it can never be imported on the host (same constraint
-# http_client.py's own module docstring documents for the POST-timeout
-# logic). Keep these in sync by hand if the real constants change.
-BACKOFF_MULTIPLIER = 2.0
-BACKOFF_CAP_S = 120.0
-POST_INTERVAL_S = 30.0
-MAX_READINGS_PER_POST = 60
-MAX_BUFFERED_READINGS = 600
-
-# Measured from Trial 5 run 2's clean, failure-free hours (14:00 and 18:00
-# UTC): (readings_sent_ok + buffered) grew by ~3,380 over ~3,590s in each,
-# i.e. ~0.94 readings/s -- roughly one reading per ~1.06s chunk.
-READING_ARRIVAL_HZ = 0.94
-
-# A failed connect/tls_handshake/read_response stage is bounded by
-# SOCKET_OP_TIMEOUT_S=4.0 in http_client.py, and that's what almost every
-# real POST_FAIL in Trial 5's log actually measured (stage_duration_s
-# 4.001-4.002 for the large majority of failures). A successful POST
-# measured 2-4s typically; 3.0s is a representative round number.
-FAILURE_ATTEMPT_DURATION_S = 4.0
-SUCCESS_ATTEMPT_DURATION_S = 3.0
+from wifi_ingest import IngestBuffer, next_post_interval_s  # noqa: E402
 
 
-def _simulate_outage(outage_duration_s, total_sim_s):
-    """Drive a real IngestBuffer through a simulated outage on a fake
-    clock: every flush() attempt that starts before outage_duration_s
-    fails; everything at or after it succeeds. Readings are appended
-    continuously at READING_ARRIVAL_HZ regardless of POST outcome, exactly
-    as the real main loop keeps sampling ADC data independent of WiFi
-    state. Returns (buffer, attempt_log) where attempt_log is a list of
-    (start_time_s, duration_s, ok) for every flush() call that actually
-    attempted a POST.
-    """
-    clock = [0.0]
-    attempt_log = []
+def _client_constants():
+    """wifi_unit_client.py cannot be imported on the host (hardware + an infinite loop at module
+    scope), so its module-level numeric constants are read from the source instead -- no hand-kept
+    copies to drift."""
+    tree = ast.parse((ROOT / "wifi_unit_client.py").read_text())
+    out = {}
+    for n in tree.body:
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            try:
+                out[n.targets[0].id] = ast.literal_eval(n.value)
+            except ValueError:
+                pass
+    return out
+
+
+C = _client_constants()
+POST_INTERVAL_S = C["POST_INTERVAL_S"]
+CATCHUP_POST_INTERVAL_S = C["CATCHUP_POST_INTERVAL_S"]
+BACKOFF_MULTIPLIER = C["BACKOFF_MULTIPLIER"]
+BACKOFF_CAP_S = C["BACKOFF_CAP_S"]
+MAX_READINGS_PER_POST = C["MAX_READINGS_PER_POST"]
+MAX_BUFFERED_READINGS = C["MAX_BUFFERED_READINGS"]
+
+# Measured: ~580 readings per 10 min in normal operation (0.97/s); 1.0/s is the worst case for filling.
+READING_HZ = 1.0
+# A successful POST takes 2-4 s. A failed one is charged the hard abort time (the worst case: it
+# blocks the longest, and readings keep arriving meanwhile).
+FAIL_S = 10.0
+OK_S = 3.0
+
+
+def simulate(outage_s, total_s, reading_hz=READING_HZ):
+    """POSTs fail while the clock < outage_s, succeed after. Readings arrive at reading_hz throughout,
+    including during POSTs (the ADC ring keeps sampling). Returns (buffer, server_seqs, log)."""
+    clock = 0.0
+    server = []                       # every seq the server stored (deduped like the real one)
+    seen = set()
+    log = []
 
     def post_fn(payload):
-        start = clock[0]
-        ok = start >= outage_duration_s
-        duration = SUCCESS_ATTEMPT_DURATION_S if ok else FAILURE_ATTEMPT_DURATION_S
-        attempt_log.append((start, duration, ok))
-        clock[0] += duration
+        ok = clock >= outage_s
+        log.append((clock, len(payload["readings"]), ok))
+        if ok:
+            for r in payload["readings"]:
+                if r["seq"] not in seen:
+                    seen.add(r["seq"])
+                    server.append(r["seq"])
         return ok
 
-    buffer = IngestBuffer(
-        "test-unit", post_fn,
-        max_readings=MAX_BUFFERED_READINGS,
-        max_readings_per_post=MAX_READINGS_PER_POST,
-    )
-
+    buf = IngestBuffer("u", post_fn, max_readings=MAX_BUFFERED_READINGS,
+                       max_readings_per_post=MAX_READINGS_PER_POST, boot_id="0123456789abcdef")
     interval = POST_INTERVAL_S
-    next_reading_t = 0.0
-    next_post_t = 0.0
-    while clock[0] < total_sim_s:
-        while next_reading_t <= clock[0]:
-            buffer.append(50.0, 1.0, None)
-            next_reading_t += 1.0 / READING_ARRIVAL_HZ
-        if clock[0] >= next_post_t:
-            ok = buffer.flush()
-            interval = POST_INTERVAL_S if ok else min(interval * BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
-            next_post_t = clock[0] + interval
-        else:
-            clock[0] = next_post_t  # fake clock: jump straight to the next scheduled check
-    return buffer, attempt_log
+    next_reading = 0.0
+    next_post = POST_INTERVAL_S
+    while clock < total_s:
+        if next_reading <= next_post:
+            clock = next_reading
+            buf.append(50.0, 0.7, None, gps=(20733, int(clock) % 86400, 0))
+            next_reading += 1.0 / reading_hz
+            continue
+        clock = next_post
+        if len(buf):
+            ok = buf.flush()
+            dur = OK_S if ok else FAIL_S
+            while next_reading < clock + dur:          # readings measured while the POST blocked
+                buf.append(50.0, 0.7, None, gps=(20733, int(next_reading) % 86400, 0))
+                next_reading += 1.0 / reading_hz
+            interval = next_post_interval_s(interval, "ok" if ok else "fail", len(buf), POST_INTERVAL_S,
+                                            CATCHUP_POST_INTERVAL_S, MAX_READINGS_PER_POST,
+                                            BACKOFF_MULTIPLIER, BACKOFF_CAP_S)
+        next_post = clock + interval
+    return buf, server, log
 
 
-def test_240s_outage_causes_no_drops_and_document_n():
-    """A 240s outage, matching the planned WiFi-off test from Trial 5, is
-    short enough relative to the new 120s backoff cap that only a few
-    attempts actually fail before the connection is back -- report N."""
-    buffer, attempt_log = _simulate_outage(outage_duration_s=240.0, total_sim_s=400.0)
-    failures = [a for a in attempt_log if not a[2]]
-    n = len(failures)
-    assert n == 3  # documents N for this specific 240s-outage scenario
-    assert buffer.dropped_count == 0
+def _caught_up_at(log, outage_s):
+    """First time after the outage a POST carried a normal-size batch again (backlog drained)."""
+    for t, n, ok in log:
+        if ok and t >= outage_s and n < MAX_READINGS_PER_POST:
+            return t
+    return None
 
 
-def test_4_consecutive_failures_do_not_overflow_buffer():
-    """Force exactly 4 consecutive failures (outage just long enough to
-    fail attempt 4 but not attempt 5) and confirm no drops -- this is the
-    scenario that, under the OLD 240s cap, was measured on real hardware
-    to overflow the buffer (Trial 5 run 2, Episode 3: buffered hit 600
-    ~615s after a real 4-failure run began). Under the new 120s cap the
-    same run length finishes much sooner and stays under the fill time."""
-    # Attempt starts at t=0, 64, 188, 312 all fail; attempt 5 at t=436 succeeds.
-    buffer, attempt_log = _simulate_outage(outage_duration_s=436.0, total_sim_s=500.0)
-    failures = [a for a in attempt_log if not a[2]]
-    assert len(failures) == 4
-    assert buffer.dropped_count == 0
+def test_the_constants_are_the_ones_decided_for_fw_resilience():
+    assert (MAX_BUFFERED_READINGS, MAX_READINGS_PER_POST, POST_INTERVAL_S, CATCHUP_POST_INTERVAL_S) == (3600, 60, 30.0, 10.0)
 
 
-def test_6_consecutive_failures_still_overflows_buffer():
-    """A 6-failure run's span (~684s of backoff waits and attempt
-    durations) still exceeds the buffer's ~600-640s fill time at the
-    measured arrival rate even under the new 120s cap -- confirms the cap
-    change narrows the failure window that causes drops, but does not
-    eliminate it. This is expected and documented, not a bug."""
-    # Attempt starts at t=0, 64, 188, 312, 436, 560 all fail; attempt 7 at t=684 succeeds.
-    buffer, attempt_log = _simulate_outage(outage_duration_s=684.0, total_sim_s=750.0)
-    failures = [a for a in attempt_log if not a[2]]
-    assert len(failures) == 6
-    assert buffer.dropped_count > 0
+def test_a_10_minute_outage_loses_nothing_and_catches_up_within_minutes():
+    buf, server, log = simulate(outage_s=600, total_s=1800)
+    assert buf.dropped_count == 0
+    assert server == list(range(len(server))) and len(server) + len(buf) == buf.next_seq   # no gap, no duplicate
+    t = _caught_up_at(log, 600)
+    assert t is not None and t - 600 < 180 + BACKOFF_CAP_S                                  # + the last backoff wait
+
+
+def test_a_45_minute_outage_loses_nothing_and_drains_in_under_15_minutes():
+    buf, server, log = simulate(outage_s=45 * 60, total_s=90 * 60)
+    assert buf.dropped_count == 0 and server == list(range(len(server)))
+    t = _caught_up_at(log, 45 * 60)
+    assert t is not None and t - 45 * 60 < 15 * 60
+
+
+def test_a_55_minute_outage_still_loses_nothing():
+    buf, server, _ = simulate(outage_s=55 * 60, total_s=120 * 60)
+    assert buf.dropped_count == 0 and server == list(range(len(server)))
+
+
+def test_a_90_minute_outage_loses_only_the_oldest_and_exactly_as_many_as_counted():
+    buf, server, _ = simulate(outage_s=90 * 60, total_s=180 * 60)
+    assert buf.dropped_count > 0
+    first = server[0]                 # one gap, at the very start, exactly dropped_count long
+    assert first == buf.dropped_count and server == list(range(first, first + len(server)))
+    assert len(server) + len(buf) + buf.dropped_count == buf.next_seq
+
+
+def test_catch_up_never_follows_a_failure():
+    _, _, log = simulate(outage_s=600, total_s=1800)
+    for (t0, _n0, ok0), (t1, _n1, _ok1) in zip(log, log[1:]):
+        if not ok0:
+            assert t1 - t0 >= 2 * POST_INTERVAL_S                     # a failure always backs off to >= 60 s
