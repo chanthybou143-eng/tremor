@@ -73,7 +73,8 @@ from machine import ADC, UART, Pin, Timer, WDT
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
 from wifi_ingest import IngestBuffer, make_boot_id, next_post_interval_s
-from http_client import DnsCache, PostStageError, classify_post_exception, parse_https_url, read_rssi, timeout_post
+from http_client import (POST_ABORT_MS, DnsCache, PostStageError, SocketAborter, classify_post_exception,
+                         parse_https_url, read_rssi, timeout_post)
 from wdt_support import Breadcrumb, WatchdogGuard, ResetCounter
 import wifi_config
 from wifi_config import INGEST_URL, UNIT_ID, WIFI_PASSWORD, WIFI_SSID
@@ -324,8 +325,13 @@ if WDT_TIMEOUT_MS_CANDIDATES:
 #   2. Guard: a 1 s Timer feeds the watchdog while a POST is in flight, for at most
 #      POST_WDT_GUARD_MS from its start. A stall then costs some overflowed ADC samples instead of a
 #      reboot that discards the RAM buffer; a genuine hang is still reset after guard + 8 s. It does
-#      nothing outside a POST. 0 disables it.
+#      nothing outside a POST. 0 disables it (and with it the abort below).
+#   3. Abort (2026-10, fw-resilience): POST_ABORT_MS (10 s) into a POST the same timer cuts it short
+#      (http_client.SocketAborter), so even a choked uplink ends a POST in ~11-21 s, inside the 25 s
+#      window -- a slow uplink can never cause a reset. See http_client.POST_ABORT_MS for the bound.
 POST_WDT_GUARD_MS = 25000
+SLOW_POST_LOG_S = 15.0      # any POST longer than this is logged (# SLOW_POST) and counted: it means the
+                            # abort took longer than expected to bite, i.e. the bound above needs a look
 _breadcrumb = Breadcrumb(machine.mem32)
 _reset_counter = ResetCounter(machine.mem32)   # main.py's consecutive-WDT-reset count (see wdt_support.ResetCounter)
 _prev_freeze = _breadcrumb.read_and_clear()
@@ -334,6 +340,7 @@ if _prev_freeze is not None:
         print("# PREV_FREEZE last_stage={} post_no={} stage_started_at_uptime_ms={}".format(
             _prev_freeze["stage"], _prev_freeze["post_no"], _prev_freeze["at_ms"]))
 _wdt_guard = None
+_post_aborter = SocketAborter()
 _current_stage = "idle"     # the POST stage in flight, for the guard's log lines (set by _stage_log)
 
 
@@ -348,10 +355,11 @@ def _guard_log(kind, stage, stalled_ms, elapsed_ms):
 if wdt is not None and POST_WDT_GUARD_MS:
     _wdt_guard = WatchdogGuard(wdt.feed, time.ticks_ms, time.ticks_diff, window_ms=POST_WDT_GUARD_MS,
                                wdt_timeout_ms=WDT_TIMEOUT_MS_ACTUAL,
-                               stage_fn=lambda: _current_stage, log_fn=_guard_log)
+                               stage_fn=lambda: _current_stage, log_fn=_guard_log,
+                               abort_after_ms=POST_ABORT_MS, abort_fn=_post_aborter.fire)
     _guard_timer = Timer()
     _guard_timer.init(mode=Timer.PERIODIC, period=1000, callback=_wdt_guard.tick)
-    print("# POST_GUARD window_ms={}".format(POST_WDT_GUARD_MS))
+    print("# POST_GUARD window_ms={} abort_ms={}".format(POST_WDT_GUARD_MS, POST_ABORT_MS))
 
 adc = ADC(26)
 uart = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1), timeout=0, timeout_char=0)
@@ -538,7 +546,7 @@ def _post_batch(payload):
     print("# PRE_POST heap_free_before_collect={} heap_free_after_collect={}".format(
         heap_free_before_collect, heap_free_after_collect))
 
-    global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count
+    global longest_post_duration_s, stage_failure_counts, last_post_duration_ms, slow_post_count, very_slow_post_count
     global last_heap_free_at_try_start
     global _consecutive_failures, readings_sent_ok, max_consecutive_failures
 
@@ -570,16 +578,18 @@ def _post_batch(payload):
         # that's often the more interesting case for spotting stalls.
         _post_start_ticks = time.ticks_us()
         sync.blocking_started()        # the GPS UART goes unread until this returns: sentences read right after may be stale
+        _post_aborter.arm()
         if _wdt_guard is not None:
             _wdt_guard.start()
         try:
             status_code, _headers, _body = timeout_post(
                 INGEST_HOST, INGEST_PATH, body_bytes, port=INGEST_PORT,
                 extra_headers=_AUTH_HEADERS, feed_fn=_feed_wdt,
-                dns_cache=_dns_cache, stage_log_fn=_stage_log)
+                dns_cache=_dns_cache, stage_log_fn=_stage_log, aborter=_post_aborter)
         finally:
             if _wdt_guard is not None:
                 _wdt_guard.stop()
+            _post_aborter.disarm()
             sync.blocking_ended()
             _breadcrumb.mark("idle", post_attempts, time.ticks_ms())
             duration_us = time.ticks_diff(time.ticks_us(), _post_start_ticks)
@@ -589,6 +599,10 @@ def _post_batch(payload):
                 longest_post_duration_s = duration_s
             if duration_s > SLOW_POST_THRESHOLD_S:
                 slow_post_count += 1
+            if duration_s > SLOW_POST_LOG_S:
+                very_slow_post_count += 1
+                print("# SLOW_POST duration_ms={} stage={} aborted={} t_ms={}".format(
+                    last_post_duration_ms, _current_stage, _post_aborter.fired, time.ticks_ms()))
         ok = 200 <= status_code < 300
         if not ok:
             _dns_cache.invalidate()                # a wrong answer may mean a stale address: look it up again next time
@@ -719,6 +733,7 @@ last_post_duration_ms = 0  # duration of the MOST RECENT attempt specifically (n
 SLOW_POST_THRESHOLD_S = 5.0  # about half of POST_DEADLINE_S -- a POST legitimately taking
                              # longer than this, even if it still succeeds, is well outside the
                              # ~0.5-2.6s historical baseline and worth counting as its own signal
+very_slow_post_count = 0  # attempts longer than SLOW_POST_LOG_S (15 s) -- each also logged as # SLOW_POST
 slow_post_count = 0  # cumulative count of attempts (success or failure) exceeding
                      # SLOW_POST_THRESHOLD_S -- distinct from stage_failure_counts, which only
                      # counts outright failures; this also catches a slow-but-successful POST
@@ -897,6 +912,7 @@ while True:
               "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={} "
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
               "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
+              "post_aborts={} slow_posts_15s={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
               "sync_count={} sync_rejected={} no_edge={} reanchors={} sync_shadow={}".format(
             _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
@@ -915,6 +931,7 @@ while True:
             _wdt_guard.expired if _wdt_guard is not None else 0,
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
+            _post_aborter.aborts, very_slow_post_count,
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
             s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"], s["shadow_ignored"],
         ))

@@ -32,7 +32,8 @@ class WatchdogGuard:
     """
 
     def __init__(self, feed_fn, ticks_ms_fn, ticks_diff_fn, window_ms=25000,
-                 wdt_timeout_ms=8000, period_ms=1000, stage_fn=None, log_fn=None):
+                 wdt_timeout_ms=8000, period_ms=1000, stage_fn=None, log_fn=None,
+                 abort_after_ms=None, abort_fn=None):
         self._feed = feed_fn
         self._ticks_ms = ticks_ms_fn
         self._ticks_diff = ticks_diff_fn
@@ -43,6 +44,12 @@ class WatchdogGuard:
         self._started_at = None
         self._last_main_feed = None
         self._ext_logged = False
+        # Optional: once a window has run abort_after_ms, call abort_fn() once (http_client.SocketAborter
+        # .fire -- cuts the POST short so it ends well inside the window; see http_client.POST_ABORT_MS).
+        self._abort_after_ms = abort_after_ms
+        self._abort_fn = abort_fn
+        self._abort_done = False
+        self.aborts = 0             # windows in which abort_fn was called
         self.windows = 0            # POSTs guarded
         self.feeds = 0              # feeds the guard itself performed (i.e. stalls it covered)
         self.expired = 0            # windows that ran out before stop() -- a POST stuck past the cap
@@ -54,6 +61,7 @@ class WatchdogGuard:
         self._started_at = now
         self._last_main_feed = now
         self._ext_logged = False
+        self._abort_done = False
         self.windows += 1
 
     def stop(self):
@@ -81,6 +89,15 @@ class WatchdogGuard:
         now = self._ticks_ms()
         elapsed = self._ticks_diff(now, started)
         if elapsed < self.window_ms:
+            if (self._abort_fn is not None and not self._abort_done and self._abort_after_ms is not None
+                    and elapsed >= self._abort_after_ms):
+                self._abort_done = True
+                self.aborts += 1
+                try:
+                    self._abort_fn()
+                except Exception:
+                    pass            # a failed abort must never stop the feed below
+                self._log("abort", self._ticks_diff(now, self._last_main_feed), elapsed)
             stalled = self._ticks_diff(now, self._last_main_feed)
             if stalled > self.longest_stall_ms:
                 self.longest_stall_ms = stalled

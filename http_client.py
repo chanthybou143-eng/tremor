@@ -176,6 +176,80 @@ SOCKET_OP_TIMEOUT_S = 4.0
 # scope here.
 POST_DEADLINE_S = 10.0
 
+# --- Hard abort: a slow uplink must never reset the board (fw-resilience, 2026-10) ----------------
+#
+# POST_DEADLINE_S above is only checked BETWEEN blocking calls. Inside one call -- above all the TLS
+# handshake, whose many socket waits each honour SOCKET_OP_TIMEOUT_S but which has no total bound
+# (8.18 s measured with 3.6 s waits) -- nothing in Python runs, so a choked uplink could keep one
+# POST going past the watchdog guard's 25 s window, and then the watchdog resets the board and the
+# whole RAM backlog is lost.
+#
+# Fix: SocketAborter. The guard's 1 s timer calls fire() once the POST has run POST_ABORT_MS (the
+# client wires that up), and fire() SHORTENS the live socket's timeout to ABORT_SOCKET_TIMEOUT_S.
+# Every lwIP wait loop re-reads socket->timeout on each pass (extmod/modlwip.c, v1.27:
+# lwip_tcp_receive, lwip_tcp_send, connect), so the call in progress fails with ETIMEDOUT within
+# milliseconds, the handshake/read/write raises OSError, and timeout_post() raises
+# PostStageError(reason="aborted_slow_link") -- the readings stay buffered for the next POST.
+# The timer callback runs during those waits (verified on the device for the 8.18 s handshake).
+#
+# Why not close() the socket from the timer: modlwip's close sets pcb.tcp = NULL, and
+# lwip_tcp_send's ERR_MEM retry loop (up to 200 x 50 ms) calls tcp_write(socket->pcb.tcp) again
+# after each delay without re-checking it -- a NULL dereference. Shortening the timeout touches only
+# an integer field.
+#
+# Worst-case POST duration with the abort (tests/test_post_abort.py simulates each case):
+#   abort fires          <= POST_ABORT_MS + 1 s guard tick                          = 11 s
+#   then, whichever is in progress:
+#     a socket wait (connect / handshake / send / read)    ~ 5 ms                   -> ~11 s
+#     CPU-bound TLS crypto (the timer cannot run during it) <= ~2 s                 -> ~13 s
+#     lwIP tcp_write ERR_MEM retry loop (no timeout check)  <= 10 s, once           -> ~21 s
+#   DNS (getaddrinfo, no timeout, <= 7 s measured) runs first and ends before the abort.
+# All < the 25 s guard window (POST_WDT_GUARD_MS); the board would only be reset if the guard
+# window expired AND the 8 s watchdog then ran out, i.e. beyond ~32 s.
+POST_ABORT_MS = 10000
+ABORT_SOCKET_TIMEOUT_S = 0.005
+
+
+class SocketAborter:
+    """Cuts short the POST in flight, from a timer callback, without closing its socket (see above).
+
+    arm() before a POST; timeout_post() attach()es the raw socket as soon as it exists; fire() from
+    the timer; disarm() after. fire() before the socket exists is remembered and applied on attach().
+    """
+
+    def __init__(self):
+        self._sock = None
+        self.fired = False
+        self.aborts = 0              # POSTs cut short so far
+
+    def arm(self):
+        self._sock = None
+        self.fired = False
+
+    def attach(self, sock):
+        self._sock = sock
+        if self.fired:
+            self._shorten(sock)
+
+    def fire(self):
+        if self.fired:
+            return
+        self.fired = True
+        self.aborts += 1
+        sock = self._sock
+        if sock is not None:
+            self._shorten(sock)
+
+    def disarm(self):
+        self._sock = None
+
+    @staticmethod
+    def _shorten(sock):
+        try:
+            sock.settimeout(ABORT_SOCKET_TIMEOUT_S)
+        except Exception:
+            pass
+
 
 def parse_https_url(url):
     """Splits a URL of the form "https://host[:port]/path" into
@@ -216,11 +290,23 @@ def _stage_error(stage, reason, now_fn, ticks_diff_fn, start_at, stage_start_at)
     )
 
 
-def _check_deadline(stage, now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms):
+ABORTED_REASON = "aborted_slow_link"
+
+
+def _check_deadline(stage, now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter=None):
+    if aborter is not None and aborter.fired:
+        raise _stage_error(stage, ABORTED_REASON, now_fn, ticks_diff_fn, start_at, stage_start_at)
     now = now_fn()
     if ticks_diff_fn(now, start_at) >= deadline_ms:
         raise _stage_error(stage, "overall_deadline_exceeded", now_fn, ticks_diff_fn,
                             start_at, stage_start_at)
+
+
+def _os_reason(exc, aborter):
+    """An OSError raised because the aborter shortened the timeout is reported as the abort."""
+    if aborter is not None and aborter.fired:
+        return "{}: {}".format(ABORTED_REASON, exc)
+    return str(exc)
 
 
 def _build_request(method, host, path, body_bytes, extra_headers=None):
@@ -237,7 +323,7 @@ def _build_request(method, host, path, body_bytes, extra_headers=None):
 
 
 def _read_response_with_deadline(sock_like, now_fn, ticks_diff_fn, feed_fn, start_at,
-                                  deadline_ms, max_header_bytes=4096):
+                                  deadline_ms, max_header_bytes=4096, aborter=None):
     """Reads one full HTTP/1.1 response from sock_like (anything with a
     .read(n) method returning bytes, or b""/None at EOF -- adapted from
     the keepalive-single-core branch's http_keepalive.py, which was
@@ -264,12 +350,13 @@ def _read_response_with_deadline(sock_like, now_fn, ticks_diff_fn, feed_fn, star
                                # read_response itself began, not since the last individual read
     buf = b""
     while b"\r\n\r\n" not in buf:
-        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter)
         feed_fn()
         try:
             chunk = sock_like.read(256)
         except OSError as exc:
-            raise _stage_error("read_response", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
+            raise _stage_error("read_response", _os_reason(exc, aborter), now_fn, ticks_diff_fn, start_at,
+                                stage_start_at)
         if not chunk:
             raise _stage_error("read_response", "connection closed while reading response headers",
                                 now_fn, ticks_diff_fn, start_at, stage_start_at)
@@ -299,12 +386,13 @@ def _read_response_with_deadline(sock_like, now_fn, ticks_diff_fn, feed_fn, star
     content_length = int(headers.get("content-length", "0"))
     body = body_start
     while len(body) < content_length:
-        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter)
         feed_fn()
         try:
             chunk = sock_like.read(content_length - len(body))
         except OSError as exc:
-            raise _stage_error("read_response", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
+            raise _stage_error("read_response", _os_reason(exc, aborter), now_fn, ticks_diff_fn, start_at,
+                                stage_start_at)
         if not chunk:
             raise _stage_error("read_response", "connection closed while reading response body",
                                 now_fn, ticks_diff_fn, start_at, stage_start_at)
@@ -389,7 +477,7 @@ class DnsCache:
 def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
                   socket_factory=None, ssl_wrap_fn=None, getaddrinfo_fn=None,
                   now_fn=None, ticks_diff_fn=None, feed_fn=None,
-                  dns_cache=None, stage_log_fn=None):
+                  dns_cache=None, stage_log_fn=None, aborter=None):
     """One-shot HTTPS POST with SOCKET_OP_TIMEOUT_S applied to every
     individual blocking call and POST_DEADLINE_S enforced across the
     whole attempt (see both constants' comments above for why both are
@@ -426,6 +514,10 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
     blocking call is actually stuck, not for the whole POST_DEADLINE_S
     duration of a legitimately slow but working POST. Defaults to a
     no-op so tests and any other caller don't need to pass one.
+
+    aborter, if given (a SocketAborter), lets a timer cut the POST short: the raw socket is attached
+    to it as soon as it exists, and once it has fired every later stage check raises
+    PostStageError(reason="aborted_slow_link") -- see POST_ABORT_MS.
 
     dns_cache, if given (a DnsCache), replaces the per-POST getaddrinfo() call and is
     invalidated on a connect or TLS-handshake failure (see DnsCache for why).
@@ -475,41 +567,48 @@ def timeout_post(host, path, payload_bytes, port=443, extra_headers=None,
         addr_family, addr_type, addr_proto, _canonname, addr = addr_entry
 
         stage_start_at = now_fn()
-        _check_deadline("connect", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        _check_deadline("connect", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter)
         feed_fn()
         stage_log("connect", None)
         try:
             sock = socket_factory(addr_family, addr_type, addr_proto)
             sock.settimeout(SOCKET_OP_TIMEOUT_S)
+            if aborter is not None:
+                aborter.attach(sock)                  # after settimeout: a fire() already pending wins
             sock.connect(addr)
         except OSError as exc:
-            dns_cache.invalidate(host, port)          # a dead/retired address must not be reused
-            raise _stage_error("connect", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
+            if aborter is None or not aborter.fired:
+                dns_cache.invalidate(host, port)      # a dead/retired address must not be reused
+            raise _stage_error("connect", _os_reason(exc, aborter), now_fn, ticks_diff_fn, start_at,
+                                stage_start_at)
 
         stage_start_at = now_fn()
-        _check_deadline("tls_handshake", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        _check_deadline("tls_handshake", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter)
         feed_fn()
         stage_log("tls_handshake", None)
         try:
             ssl_sock = ssl_wrap_fn(sock, server_hostname=host)
         except OSError as exc:
-            dns_cache.invalidate(host, port)
-            raise _stage_error("tls_handshake", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
+            if aborter is None or not aborter.fired:
+                dns_cache.invalidate(host, port)      # an abort says nothing about the address
+            raise _stage_error("tls_handshake", _os_reason(exc, aborter), now_fn, ticks_diff_fn, start_at,
+                                stage_start_at)
 
         stage_start_at = now_fn()
-        _check_deadline("send", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        _check_deadline("send", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter)
         feed_fn()
         stage_log("send", None)
         request = _build_request("POST", host, path, payload_bytes, extra_headers)
         try:
             ssl_sock.write(request)
         except OSError as exc:
-            raise _stage_error("send", str(exc), now_fn, ticks_diff_fn, start_at, stage_start_at)
+            raise _stage_error("send", _os_reason(exc, aborter), now_fn, ticks_diff_fn, start_at, stage_start_at)
 
         stage_start_at = now_fn()
-        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms)
+        _check_deadline("read_response", now_fn, ticks_diff_fn, start_at, stage_start_at, deadline_ms, aborter)
         stage_log("read_response", None)
-        result = _read_response_with_deadline(ssl_sock, now_fn, ticks_diff_fn, feed_fn, start_at, deadline_ms)
+        result = _read_response_with_deadline(ssl_sock, now_fn, ticks_diff_fn, feed_fn, start_at, deadline_ms,
+                                              aborter=aborter)
         stage_log("done", None)
         return result
     finally:
