@@ -384,9 +384,11 @@ t0 = time.ticks_us()
 # most samples acquired during the stall.
 ring_ticks = array.array("L", [0] * RING_CAPACITY)
 ring_raw = array.array("H", [0] * RING_CAPACITY)
-write_idx = 0
-read_idx = 0
-overflow_count = 0
+# State shared with the hard ADC handler, in ONE preallocated array that the handler reaches through
+# its closure (see _make_adc_isr): [write index, read index, overflow count, temperature request,
+# last temperature raw]. Not module globals -- see _make_adc_isr for why.
+_W, _R, _OVF, _TREQ, _TRAW = 0, 1, 2, 3, 4
+_adc_state = array.array("i", [0, 0, 0, 0, -1])
 
 
 # HARD timer (fw-resilience, 2026-10). A soft (scheduled) callback -- the old default -- cannot run
@@ -415,27 +417,49 @@ try:
 except Exception as _exc:
     _temp_adc = None
     print("# DIE_TEMP unavailable type={}".format(type(_exc).__name__))
-_temp_req = 0
-_temp_raw = -1
 
 
-def _on_adc_timer(timer):
-    global write_idx, overflow_count, _temp_req, _temp_raw
-    next_write_idx = (write_idx + 1) % RING_CAPACITY
-    if next_write_idx == read_idx:
-        if overflow_count < 0x3FFFFFFF:
-            overflow_count += 1
-        return
-    ring_ticks[write_idx] = time.ticks_us()
-    ring_raw[write_idx] = adc.read_u16()
-    write_idx = next_write_idx
-    if _temp_req:
-        _temp_raw = _temp_adc.read_u16()
-        _temp_req = 0
+def _make_adc_isr(ring_ticks, ring_raw, state, capacity, ticks_us, read_mains, read_temp):
+    """Build the hard ADC timer handler as a closure over everything it touches.
+
+    Bench 2026-10-08 (confirmation run on f77a594): ~1 s after start the handler died with
+    "NameError: name 'write_idx' isn't defined" and MicroPython disabled the timer -- no samples, no
+    readings, while the rest of the unit looked healthy. A hard handler runs in the real interrupt, in
+    the middle of whatever the main thread is doing; the old one looked its variables up BY NAME in the
+    module's globals table, and the main thread was still adding globals (module import, or the first
+    pass through a code path) -- a table being resized mid-lookup can miss a name that exists.
+    Closure variables are cells, not table entries: this handler never touches a globals table
+    (enforced by tests/test_client_static.py). Literal indices for the same reason: _W etc. would be
+    global lookups. Allocation-free: small ints, preallocated arrays, bound methods made once here.
+    """
+    def _on_adc_timer(timer):
+        w = state[0]                              # _W
+        nw = (w + 1) % capacity
+        if nw == state[1]:                        # _R: ring full -> drop, count
+            if state[2] < 0x3FFFFFFF:             # _OVF, capped below 2**30 (a small int)
+                state[2] += 1
+            return
+        ring_ticks[w] = ticks_us()
+        ring_raw[w] = read_mains()
+        state[0] = nw
+        if state[3]:                              # _TREQ: temperature requested mid-PPS-second
+            state[4] = read_temp()                # _TRAW
+            state[3] = 0
+    return _on_adc_timer
 
 
+_on_adc_timer = _make_adc_isr(ring_ticks, ring_raw, _adc_state, RING_CAPACITY, time.ticks_us, adc.read_u16,
+                              _temp_adc.read_u16 if _temp_adc is not None else None)
 adc_timer = Timer()
 adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer, hard=True)
+
+# Safety net: if the handler ever stops (an uncaught exception disables a MicroPython timer callback),
+# the unit would otherwise keep running, posting nothing, forever. The main loop restarts the timer
+# when neither the write index nor the overflow count has moved for ADC_STALL_MS (# ADC_STALLED).
+ADC_STALL_MS = 5000
+adc_restarts = 0
+_adc_alive = (-1, -1)
+_adc_alive_ms = time.ticks_ms()
 
 MAX_GPS_BUF_BYTES = 1024
 GPS_READ_CHUNK_BYTES = 128  # see adc_stream_gps.py for the throughput/latency
@@ -480,8 +504,8 @@ _last_temp_req_ms = None
 def _maybe_request_temp():
     """Ask the ADC handler for a temperature sample at most every TEMP_INTERVAL_MS, and only in the
     middle of a PPS second (0.3-0.7 s after the last accepted edge; any time if there is no PPS)."""
-    global _temp_req, _last_temp_req_ms
-    if _temp_adc is None or _temp_req:
+    global _last_temp_req_ms
+    if _temp_adc is None or _adc_state[_TREQ]:
         return
     now_ms = time.ticks_ms()
     if _last_temp_req_ms is not None and time.ticks_diff(now_ms, _last_temp_req_ms) < TEMP_INTERVAL_MS:
@@ -492,12 +516,12 @@ def _maybe_request_temp():
         if not 300000 <= phase_us <= 700000:
             return
     _last_temp_req_ms = now_ms
-    _temp_req = 1
+    _adc_state[_TREQ] = 1
 
 
 def _die_temp_c():
     """The latest temperature sample (read by the ADC handler), or None before the first one."""
-    raw = _temp_raw
+    raw = _adc_state[_TRAW]
     if raw < 0:
         return None
     return round(27.0 - (raw * ADC_VOLTAGE_SCALE - 0.706) / 0.001721, 1)
@@ -746,7 +770,7 @@ def _telemetry():
          "skipped_chunks_total": skipped_chunk_count, "wifi_reconnects_total": _wifi.reconnects,
          "last_post_ms": last_post_duration_ms, "heap_free": gc.mem_free(),
          "uptime_s": time.ticks_diff(time.ticks_ms(), _boot_ms) // 1000 + _uptime_wraps_s,
-         "adc_overflow_total": overflow_count, "post_aborts_total": _post_aborter.aborts,
+         "adc_overflow_total": _adc_state[_OVF], "post_aborts_total": _post_aborter.aborts,
          "slow_posts_total": very_slow_post_count}
     rssi = read_rssi(wlan)
     if isinstance(rssi, int):
@@ -820,7 +844,17 @@ while True:
     # Drain the ADC ring into the current chunk -- per sample, stopping right after the sample that
     # completes it (adc_chunker.ChunkBuilder), so a chunk is 1 s to 1 s + one sample long whatever
     # the batch size; then reduce it to one (frequency_hz, amplitude_v, time) reading and buffer it.
-    read_idx = chunker.drain(ring_ticks, ring_raw, read_idx, write_idx, RING_CAPACITY, MAX_DRAIN_PER_PASS)
+    _adc_state[_R] = chunker.drain(ring_ticks, ring_raw, _adc_state[_R], _adc_state[_W], RING_CAPACITY,
+                                   MAX_DRAIN_PER_PASS)
+    _alive = (_adc_state[_W], _adc_state[_OVF])
+    if _alive != _adc_alive:
+        _adc_alive = _alive
+        _adc_alive_ms = time.ticks_ms()
+    elif time.ticks_diff(time.ticks_ms(), _adc_alive_ms) > ADC_STALL_MS:
+        adc_restarts += 1
+        print("# ADC_STALLED restarts={} t_ms={}".format(adc_restarts, time.ticks_ms()))
+        adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer, hard=True)
+        _adc_alive_ms = time.ticks_ms()
     if chunker.complete:
         _chunk_len = chunker.n
         _chunk_ts_s = chunker.ts_s
@@ -856,7 +890,7 @@ while True:
                 chunker.elapsed_us / 1e6, _chunk_len,
                 _chunk_ts_s[0] if _chunk_len else None,
                 _chunk_ts_s[_chunk_len - 1] if _chunk_len else None,
-                since_last_post_us, overflow_count, exc,
+                since_last_post_us, _adc_state[_OVF], exc,
             ))
         except ValueError:
             skipped_chunk_count += 1  # too few crossings this chunk -- skipped (no reading, no seq), counted
@@ -932,12 +966,12 @@ while True:
               "max_consecutive_failures={} heap_free_at_try_start={} rssi_dbm={} "
               "dns_lookups={} dns_hits={} dns_stale={} dns_inval={} "
               "guard_windows={} guard_feeds={} guard_expired={} guard_ext={} guard_longest_stall_ms={} "
-              "post_aborts={} slow_posts_15s={} skipped_chunks={} wifi_reconnects={} wifi_escalations={} "
+              "adc_restarts={} post_aborts={} slow_posts_15s={} skipped_chunks={} wifi_reconnects={} wifi_escalations={} "
               "wifi_longest_down_ms={} wifi_status={} die_temp_c={} pps_iv_min_us={} pps_iv_max_us={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
               "sync_count={} sync_rejected={} no_edge={} reanchors={} sync_shadow={}".format(
             chunker.elapsed_us / 1e6, wlan.isconnected(), s["synced"],
-            current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
+            current_buffered, peak_buffered, buffer.dropped_count, _adc_state[_OVF],
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
             dup_timestamp_count, chunker.capacity_closes,
             longest_post_duration_s, last_post_duration_ms, slow_post_count,
@@ -952,7 +986,7 @@ while True:
             _wdt_guard.expired if _wdt_guard is not None else 0,
             _wdt_guard.extensions if _wdt_guard is not None else 0,
             _wdt_guard.longest_stall_ms if _wdt_guard is not None else 0,
-            _post_aborter.aborts, very_slow_post_count, skipped_chunk_count, _wifi.reconnects, _wifi.escalations,
+            adc_restarts, _post_aborter.aborts, very_slow_post_count, skipped_chunk_count, _wifi.reconnects, _wifi.escalations,
             _wifi.longest_down_ms, _wifi.status_code(), _die_temp_c(), _pps_iv[0], _pps_iv[1],
             s["pps_count"], s["pps_accepted"], s["pps_rejected"], s["pps_resync"],
             s["sync_count"], s["rejected_count"], s["no_edge_count"], s["reanchor_count"], s["shadow_ignored"],

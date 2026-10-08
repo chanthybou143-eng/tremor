@@ -78,8 +78,12 @@ def test_the_client_never_prints_or_formats_the_credentials():
 
 # --- hard ADC timer ----------------------------------------------------------------------------------------
 
+def _isr_factory():
+    return next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_make_adc_isr")
+
+
 def _isr():
-    return next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_on_adc_timer")
+    return next(n for n in _isr_factory().body if isinstance(n, ast.FunctionDef) and n.name == "_on_adc_timer")
 
 
 def test_the_adc_timer_is_hard_and_its_handler_cannot_allocate():
@@ -87,30 +91,78 @@ def test_the_adc_timer_is_hard_and_its_handler_cannot_allocate():
     assert "micropython.alloc_emergency_exception_buf(" in SRC
     isr = _isr()
     banned = (ast.List, ast.Dict, ast.Set, ast.Tuple, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp,
-              ast.JoinedStr, ast.Lambda, ast.Try, ast.With, ast.FunctionDef, ast.BinOp)
+              ast.JoinedStr, ast.Lambda, ast.Try, ast.With, ast.FunctionDef, ast.Attribute, ast.Global, ast.Nonlocal)
     for n in (x for stmt in isr.body for x in ast.walk(stmt)):
         if isinstance(n, ast.BinOp):
             assert isinstance(n.op, (ast.Add, ast.Mod)), "only small-int + and % in the ISR"
-            continue
         assert not isinstance(n, banned), type(n).__name__
         if isinstance(n, ast.Constant):
             assert isinstance(n.value, int) or n.value is None
         if isinstance(n, ast.Call):
-            assert ast.unparse(n.func) in ("time.ticks_us", "adc.read_u16", "_temp_adc.read_u16"), ast.unparse(n.func)
-    # the only counter that grows without bound is capped below 2**30 (a MicroPython small int)
-    caps = [n for n in ast.walk(isr) if isinstance(n, ast.Compare) and ast.unparse(n.left) == "overflow_count"]
-    assert len(caps) == 1 and isinstance(caps[0].ops[0], ast.Lt) and caps[0].comparators[0].value < 2 ** 30
+            assert isinstance(n.func, ast.Name) and n.func.id in ("ticks_us", "read_mains", "read_temp"), ast.unparse(n)
+    caps = [n for n in ast.walk(isr) if isinstance(n, ast.Compare) and ast.unparse(n.left) == "state[2]"
+            and isinstance(n.ops[0], ast.Lt)]
+    assert len(caps) == 1 and caps[0].comparators[0].value < 2 ** 30
+
+
+def test_the_adc_handler_never_looks_anything_up_in_a_globals_table():
+    """A hard handler that resolves a name in the module's globals table can miss it while the main thread
+    is adding a global (seen on the bench: NameError for 'write_idx', timer disabled, no readings). Every
+    name the handler uses must be one of its own locals or a closure variable of _make_adc_isr."""
+    factory, isr = _isr_factory(), _isr()
+    closure = {a.arg for a in factory.args.args}
+    local = {a.arg for a in isr.args.args} | {t.id for n in ast.walk(isr) if isinstance(n, ast.Assign)
+                                              for t in n.targets if isinstance(t, ast.Name)}
+    used = {n.id for n in ast.walk(isr) if isinstance(n, ast.Name)}
+    assert used <= closure | local, sorted(used - closure - local)
+    assert "_on_adc_timer = _make_adc_isr(ring_ticks, ring_raw, _adc_state, RING_CAPACITY, time.ticks_us, adc.read_u16," in SRC
+    for old in ("global write_idx", "\nwrite_idx = 0", "\nread_idx = 0", "\noverflow_count = 0", "\n_temp_req = 0"):
+        assert old not in SRC
+
+
+def test_a_stalled_adc_timer_is_detected_and_restarted():
+    loop = SRC[SRC.index("\nwhile True:"):]
+    assert "_alive = (_adc_state[_W], _adc_state[_OVF])" in loop           # overflow counts as alive (ring full)
+    stall = loop[loop.index("ADC_STALL_MS:"):][:400]
+    assert "# ADC_STALLED" in stall and "adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer, hard=True)" in stall
+    assert "adc_restarts={}" in SRC
 
 
 def test_the_temperature_is_read_only_inside_the_adc_handler_and_no_interrupt_is_ever_disabled():
-    # one multiplexed ADC: all access from one context, so nothing can interleave -- and nothing may
-    # delay the PPS edge interrupt, whose ticks_us() stamp is the unit's time reference
     assert "disable_irq" not in SRC
     isr_src = ast.unparse(_isr())
-    assert "_temp_raw = _temp_adc.read_u16()" in isr_src
-    assert isr_src.index("ring_raw[write_idx] = adc.read_u16()") < isr_src.index("_temp_adc.read_u16()")
-    assert SRC.count("_temp_adc.read_u16()") == 1
+    assert "state[4] = read_temp()" in isr_src
+    assert isr_src.index("ring_raw[w] = read_mains()") < isr_src.index("read_temp()")
+    assert SRC.count("_temp_adc.read_u16") == 1                            # handed to the handler, never called elsewhere
     assert SRC.index("_temp_adc = ADC(ADC.CORE_TEMP)") < SRC.index("adc_timer.init(")
+
+
+def test_the_pps_handler_only_uses_attributes_created_before_its_interrupt_is_enabled():
+    """Same hazard for the PPS hard handler: it reads/writes instance attributes, so the instance's attribute
+    table must never grow once the interrupt is on -- every attribute any method sets must already exist."""
+    tree = ast.parse((ROOT / "pps_time_sync.py").read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PPSTimeSync")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    irq_line = next(n.lineno for n in ast.walk(init) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "irq")
+
+    def assigned(fn, before=None):
+        out = set()
+        for n in ast.walk(fn):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target] if isinstance(n, ast.AugAssign) else []
+            for t in targets:
+                for x in ast.walk(t):
+                    if (isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "self"
+                            and (before is None or n.lineno < before)):
+                        out.add(x.attr)
+        return out
+    created = assigned(init, before=irq_line)
+    for fn in cls.body:
+        if isinstance(fn, ast.FunctionDef) and fn.name != "__init__":
+            assert assigned(fn) <= created, (fn.name, sorted(assigned(fn) - created))
+    pps = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_on_pps")
+    read = {x.attr for x in ast.walk(pps) if isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "self"}
+    methods = {n.name for n in cls.body if isinstance(n, ast.FunctionDef)}
+    assert read <= created | methods, sorted(read - created - methods)
 
 
 def test_temperature_requests_are_made_only_mid_pps_second():
@@ -174,3 +226,12 @@ def test_pps_spread_telemetry_is_the_max_since_the_last_successful_post():
     assert "_pps_spread_since_post = _pps_spread" in status
     flush = SRC[SRC.index("if buffer.flush(telemetry=_telemetry()):"):][:250]
     assert "_pps_spread_since_post = None" in flush                 # reset only after a delivered POST
+
+
+def test_pps_time_sync_never_adds_module_globals_after_import():
+    """The PPS hard handler reads a few pps_time_sync module globals (time, PPS_* constants); that table is
+    complete once the module has imported -- before the interrupt is enabled -- as long as nothing adds to it."""
+    src = (ROOT / "pps_time_sync.py").read_text()
+    tree = ast.parse(src)
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Global)]
+    assert "setattr(" not in src and "globals()" not in src

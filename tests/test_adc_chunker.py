@@ -134,6 +134,6 @@ def test_timestamps_are_chunk_relative_and_start_at_zero():
 
 def test_the_client_uses_the_builder_and_a_12_second_ring():
     src = (ROOT / "wifi_unit_client.py").read_text()
-    assert "read_idx = chunker.drain(ring_ticks, ring_raw, read_idx, write_idx, RING_CAPACITY, MAX_DRAIN_PER_PASS)" in src
+    assert "_adc_state[_R] = chunker.drain(ring_ticks, ring_raw, _adc_state[_R], _adc_state[_W], RING_CAPACITY," in src
     assert "chunker.reset()" in src and "RING_CAPACITY = 12360" in src
     assert "_elapsed_us_total" not in src
