@@ -17,7 +17,7 @@ BOOT = "3bf8ae13fd84b5d0"
 
 GOOD = {"rssi_dbm": -67, "die_temp_c": 31.4, "backlog": 412, "dropped_total": 0, "skipped_chunks_total": 7,
         "wifi_reconnects_total": 2, "last_post_ms": 2350, "heap_free": 301_234, "uptime_s": 86_400,
-        "adc_overflow_total": 0, "post_aborts_total": 1, "slow_posts_total": 0}
+        "adc_overflow_total": 0, "post_aborts_total": 1, "slow_posts_total": 0, "pps_spread_us_max": 103}
 
 
 @pytest.fixture
@@ -151,3 +151,74 @@ def test_readings_delivered_hours_late_after_midnight_still_reach_the_aggregates
     aggs = store.aggregates("unit-1", int(start // 60), int(start // 60) + 120, 1000)
     assert sum(a.n for a in aggs) == 7200
     app.config["TREMOR_SHUTDOWN"]()
+
+
+# --- best effort: a telemetry failure never costs a reading -------------------------------------------------
+
+def _rows(path):
+    with sqlite3.connect(path) as db:
+        return db.execute("SELECT count(*) FROM readings").fetchone()[0], db.execute("SELECT count(*) FROM telemetry").fetchone()[0]
+
+
+def test_readings_commit_when_the_telemetry_insert_fails(tmp_path):
+    path = str(tmp_path / "r.db")
+    store = open_store(path)
+    with sqlite3.connect(path) as db:                                      # every telemetry insert now fails
+        db.execute("CREATE TRIGGER boom BEFORE INSERT ON telemetry BEGIN SELECT RAISE(ABORT, 'disk says no'); END")
+    res = store.ingest(parse_payload({**v2_series("unit-1", BOOT, T0 - 5, 5), "telemetry": GOOD}), T0)
+    assert res.inserted == 5 and _rows(path) == (5, 0) and store.telemetry_errors == 1
+    u = store.unit_states()[0]
+    assert u.readings_total == 5 and u.last_received_at == T0              # the rest of the transaction committed too
+    store.ingest(parse_payload({**v2_series("unit-1", BOOT, T0 - 5, 5), "telemetry": GOOD}), T0 + 1)   # a retry
+    assert _rows(path) == (5, 0)                                           # still deduplicated normally
+
+
+def test_readings_commit_when_the_telemetry_table_is_missing(tmp_path):
+    path = str(tmp_path / "r.db")
+    store = open_store(path)
+    with sqlite3.connect(path) as db:
+        db.execute("DROP TABLE telemetry")
+    res = store.ingest(parse_payload({**v2_series("unit-1", BOOT, T0 - 5, 5), "telemetry": GOOD}), T0)
+    assert res.inserted == 5 and store.telemetry_errors == 1
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT count(*) FROM readings").fetchone()[0] == 5
+
+
+def test_the_http_answer_is_still_202_and_health_counts_the_skipped_telemetry(ctx):
+    client, _clock, app, tmp = ctx
+    with sqlite3.connect(str(tmp / "readings.db")) as db:
+        db.execute("CREATE TRIGGER boom BEFORE INSERT ON telemetry BEGIN SELECT RAISE(ABORT, 'x'); END")
+    r = client.post("/api/ingest", json={**v2_series("unit-1", BOOT, T0 - 5, 5), "telemetry": GOOD})
+    assert r.status_code == 202 and r.get_json()["inserted"] == 5
+    h = client.get("/api/health").get_json()
+    assert h["store"]["telemetry_insert_errors"] == 1 and h["units"][0]["readings_total"] == 5
+
+
+# --- a field added after the table was created gets its column at startup ------------------------------
+
+def test_an_existing_telemetry_table_gains_the_new_column_at_startup_without_a_version_bump(tmp_path):
+    path = str(tmp_path / "r.db")
+    open_store(path)
+    with sqlite3.connect(path) as db:                                      # the table as first deployed (no pps column)
+        db.execute("DROP TABLE telemetry")
+        db.execute("CREATE TABLE telemetry (id INTEGER PRIMARY KEY, ingest_id INTEGER, unit_id TEXT NOT NULL, "
+                   "boot_id TEXT, received_at REAL NOT NULL, rssi_dbm INTEGER, backlog INTEGER)")
+        db.execute("INSERT INTO telemetry(unit_id, received_at, rssi_dbm, backlog) VALUES ('unit-1', 1.0, -70, 3)")
+    store = open_store(path)
+    with sqlite3.connect(path) as db:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(telemetry)")}
+        assert set(TELEMETRY_FIELDS) <= cols
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1 == SCHEMA_VERSION
+        assert db.execute("SELECT rssi_dbm, backlog, pps_spread_us_max FROM telemetry").fetchall() == [(-70, 3, None)]
+    store.ingest(parse_payload({**v2_series("unit-1", BOOT, T0 - 5, 5), "telemetry": GOOD}), T0)
+    assert store.latest_telemetry()["unit-1"]["pps_spread_us_max"] == 103 and store.telemetry_errors == 0
+    open_store(path)                                                       # idempotent on the next start
+
+
+def test_a_column_that_cannot_be_added_is_left_out_of_inserts_not_fatal(tmp_path):
+    path = str(tmp_path / "r.db")
+    store = open_store(path)
+    store._telemetry_cols.discard("pps_spread_us_max")                     # as if ALTER TABLE had failed
+    store.ingest(parse_payload({**v2_series("unit-1", BOOT, T0 - 5, 5), "telemetry": GOOD}), T0)
+    t = store.latest_telemetry()["unit-1"]
+    assert t["rssi_dbm"] == -67 and t["pps_spread_us_max"] is None and store.telemetry_errors == 0

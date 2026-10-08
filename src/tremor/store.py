@@ -21,6 +21,7 @@ Deduplication (INSERT OR IGNORE against partial unique indexes):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -38,6 +39,8 @@ from .ingest import (
     ParsedBatch,
     resolve_time,
 )
+
+log = logging.getLogger("tremor.store")
 
 SCHEMA_VERSION = 1
 DAY_US = 86400 * US
@@ -318,7 +321,8 @@ CREATE INDEX IF NOT EXISTS ix_ingests_received ON ingests(received_at);
 
 -- Per-POST device health (ingest.TELEMETRY_FIELDS). Added without a SCHEMA_VERSION bump on purpose:
 -- CREATE ... IF NOT EXISTS is all an existing database needs, and older server code (which refuses a
--- newer user_version) still starts against it -- it just never reads this table.
+-- newer user_version) still starts against it -- it just never reads this table. A field added later
+-- gets its column from _add_telemetry_columns() at startup (ALTER TABLE ... ADD COLUMN) as well.
 CREATE TABLE IF NOT EXISTS telemetry (
   id INTEGER PRIMARY KEY,
   ingest_id INTEGER,
@@ -336,7 +340,8 @@ CREATE TABLE IF NOT EXISTS telemetry (
   uptime_s INTEGER,
   adc_overflow_total INTEGER,
   post_aborts_total INTEGER,
-  slow_posts_total INTEGER
+  slow_posts_total INTEGER,
+  pps_spread_us_max INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_telemetry_unit ON telemetry(unit_id, id);
 CREATE INDEX IF NOT EXISTS ix_telemetry_received ON telemetry(received_at);
@@ -402,6 +407,8 @@ class SqliteReadingStore(ReadingStore):
         self._read_timeout = read_timeout_s
         self._read_only = read_only
         self._count_cache: Tuple[float, int] = (0.0, 0)
+        self._telemetry_cols: set = set(TELEMETRY_FIELDS)
+        self.telemetry_errors = 0           # telemetry inserts skipped (never a lost reading), see /api/health
         if read_only:
             if not os.path.isfile(path):
                 raise StoreError(f"cannot open {path} read-only: no such file")
@@ -415,8 +422,25 @@ class SqliteReadingStore(ReadingStore):
                     raise StoreError(f"database schema v{cur_ver} is newer than this code (v{SCHEMA_VERSION})")
                 db.executescript(_SCHEMA)
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._telemetry_cols = self._add_telemetry_columns(db)
         except sqlite3.Error as exc:
             raise StoreError(f"cannot open {path}: {exc}") from exc
+
+    @staticmethod
+    def _add_telemetry_columns(db) -> set:
+        """Give an existing telemetry table a column for every TELEMETRY_FIELDS entry it lacks (a field
+        added after the table was created). Additive only -- no SCHEMA_VERSION bump, so older server code
+        still opens the database and simply ignores the extra column. Returns the columns now present;
+        a column that could not be added is left out of inserts rather than failing them."""
+        have = {r[1] for r in db.execute("PRAGMA table_info(telemetry)")}
+        for name, (kind, _lo, _hi) in TELEMETRY_FIELDS.items():
+            if name not in have:
+                try:
+                    db.execute(f"ALTER TABLE telemetry ADD COLUMN {name} {'INTEGER' if kind is int else 'REAL'}")
+                    have.add(name)
+                except sqlite3.Error as exc:
+                    log.warning("telemetry: cannot add column %s: %s", name, exc)
+        return have
 
     # -- connection handling: one short-lived connection per call ------------
     @contextmanager
@@ -493,11 +517,7 @@ class SqliteReadingStore(ReadingStore):
             dups = n - inserted
             db.execute("UPDATE ingests SET n_inserted=? WHERE id=?", (inserted, ingest_id))
             if batch.telemetry:
-                cols = [c for c in TELEMETRY_FIELDS if c in batch.telemetry]
-                db.execute(
-                    f"INSERT INTO telemetry(ingest_id, unit_id, boot_id, received_at, {', '.join(cols)}) "
-                    f"VALUES (?,?,?,?{',?' * len(cols)})",
-                    (ingest_id, batch.unit_id, batch.boot_id, received_at, *(batch.telemetry[c] for c in cols)))
+                self._insert_telemetry(db, batch, ingest_id, received_at)
             db.execute(
                 "INSERT INTO units(unit_id, first_seen, last_received_at, last_gps_us, last_gps_locked, "
                 "last_boot_id, readings_total, unlocked_total, duplicates_total, implausible_total) "
@@ -645,6 +665,7 @@ class SqliteReadingStore(ReadingStore):
                 "SELECT count(*) FROM retention_days WHERE export_done=1 AND agg_done=1 AND pruned_done=0").fetchone()[0]
         return {
             "backend": "sqlite", "schema_version": SCHEMA_VERSION, "synchronous": self._sync,
+            "telemetry_insert_errors": self.telemetry_errors,
             "db_bytes": size(self.path), "journal_bytes": size(self.path + "-journal"),
             "raw_rows": self._count_cache[1], "aggregate_rows": n_agg, "event_intervals": n_events,
             "days_exported_awaiting_prune": unpruned_exported,
@@ -813,6 +834,22 @@ class SqliteReadingStore(ReadingStore):
                             "(SELECT id FROM telemetry WHERE received_at < ? LIMIT 5000)",
                             (older_than_received_at, older_than_received_at)).rowcount
             return n
+
+    def _insert_telemetry(self, db, batch: ParsedBatch, ingest_id: int, received_at: float) -> None:
+        """Best effort, inside the batch's transaction but behind a SAVEPOINT: any failure here is rolled
+        back to the savepoint and logged -- it can never roll back or block the batch's readings."""
+        cols = [c for c in TELEMETRY_FIELDS if c in batch.telemetry and c in self._telemetry_cols]
+        db.execute("SAVEPOINT telemetry")
+        try:
+            db.execute(
+                f"INSERT INTO telemetry(ingest_id, unit_id, boot_id, received_at{''.join(', ' + c for c in cols)}) "
+                f"VALUES (?,?,?,?{',?' * len(cols)})",
+                (ingest_id, batch.unit_id, batch.boot_id, received_at, *(batch.telemetry[c] for c in cols)))
+        except sqlite3.Error as exc:
+            db.execute("ROLLBACK TO SAVEPOINT telemetry")
+            self.telemetry_errors += 1
+            log.warning("telemetry insert skipped (readings unaffected): %s", exc)
+        db.execute("RELEASE SAVEPOINT telemetry")
 
     def latest_telemetry(self) -> Dict[str, dict]:
         with self._read() as db:

@@ -169,6 +169,9 @@ TELEMETRY_FIELDS = {
     "adc_overflow_total": (int, 0, 2**53),
     "post_aborts_total": (int, 0, 2**53),
     "slow_posts_total": (int, 0, 2**53),
+    # max - min of the accepted 1 s PPS intervals in any 10 s window since the last successful POST:
+    # ~2x the worst PPS timestamp latency (interrupt contention), see pps_time_sync.take_interval_window
+    "pps_spread_us_max": (int, 0, 2_000_000),
 }
 
 
