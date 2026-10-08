@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from wifi_support import LINK_NAMES, WifiSupervisor, link_name  # noqa: E402
 
-PM_NONE = 0xA11140                  # CYW43_PM_VALUE(CYW43_NO_POWERSAVE_MODE, 10, 0, 0, 0) -- informational only
+PM_NONE = 0x10                      # WLAN.PM_NONE on v1.27 = CYW43_PM_VALUE(no power save, 10 ms, 0, 0, 0); read back on the bench
 PM_PERFORMANCE = 0xA11142
 
 
@@ -62,7 +62,7 @@ class Rig:
 def test_power_saving_is_switched_off_and_read_back():
     r = Rig()
     assert r.sup.apply_pm() == PM_NONE and r.wlan.pm == PM_NONE
-    assert r.log == ["# WIFI_PM requested=0xa11140 before=0xa11142 after=0xa11140"]
+    assert r.log == ["# WIFI_PM requested=0x10 before=0xa11142 after=0x10"]
 
 
 def test_a_driver_without_pm_support_is_logged_by_exception_type_only():

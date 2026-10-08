@@ -96,7 +96,9 @@ is checked later against the AEMO weekly report):
 | `freq_diff1s_std_mHz`, `freq_diff1s_mad_mHz` | gap report | hard within ±15 % of soft, not higher |
 | `freq_glitches_gt_20mHz` | gap report | hard ≤ soft |
 | `amplitude_mean_v`, `amplitude_std_mV` | gap report | means within ±1 %; std not higher |
-| `overflow` (= adc_overflow_total), `chunk_capacity_overflow`, `dup_timestamp_count` | log summary | hard 0 (or ≤ soft) |
+| `chunk_capacity_overflow`, `dup_timestamp_count` | log summary | hard ≤ soft |
+| `overflow` (= adc_overflow_total) | log summary | information only: the soft timer loses samples uncounted during a stall, the hard timer counts them -- judge on missing seconds |
+| missing s per POST / per POST second, POST count, aborts, median POST ms | `scripts/bench_ab_report.py` | normalises the gap figures for different uplink conditions |
 | `pps_spread_us_median / p95 / max`, `pps_windows_spread_gt_10us` | log summary | see below |
 | `boot_lines` | log summary | 1 per log (no reset) |
 
@@ -136,7 +138,7 @@ Expect, in order:
 - `# BUFFER capacity=3600 storage_bytes=57600 heap_free=…` and the STATUS `heap_free=` (taken after
   `gc.collect()`). **Pass: ≥ 150 KB free at steady state.** Otherwise set `MAX_BUFFERED_READINGS = 2700`
   (45 min) and rerun 2.2.
-- `# WIFI_PM requested=0xa11140 before=… after=0xa11140`. `before` is the driver default; PM_PERFORMANCE
+- `# WIFI_PM requested=0x10 before=… after=0x10` (`WLAN.PM_NONE` is 0x10 on v1.27: CYW43_PM_VALUE(no power save, 10 ms)). `before` is the driver default; PM_PERFORMANCE
   is `0xa11142`.
 - STATUS `die_temp_c=` plausible (ambient + a few °C) from the second STATUS line on (the first sample is
   taken mid-PPS-second within ~10 s of boot). If it reads nonsense, `ADC.CORE_TEMP` is not channel 4 on this

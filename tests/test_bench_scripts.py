@@ -75,3 +75,51 @@ def test_log_summary_takes_last_counters_and_the_pps_spread():
     assert s["overflow"] == 3 and s["heap_free_min"] == 310000 and s["boot_lines"] == 1 and s["slow_post_lines"] == 1
     assert s["pps_spread_windows"] == 2 and s["pps_spread_us_max"] == 35 and s["pps_windows_spread_gt_10us"] == 1
     assert s["die_temp_c_last"] == 31.2
+
+
+# --- A/B report ---------------------------------------------------------------------------------------------
+
+LOG = """# BENCH start outage_start_s=180 outage_s=0 t_ms=1
+# BOOT reset_cause=WDT_RESET
+# BOOT_ID boot_id=0123456789abcdef
+# POST_STAGE stage=dns t_ms=1000 cache
+# POST_STAGE stage=connect t_ms=1001
+# POST_STAGE stage=done t_ms=3500
+# STATUS elapsed_s=10.0 overflow=0 heap_free=300000 post_attempts=1
+# POST_STAGE stage=dns t_ms=31000 cache
+# POST_STAGE stage=tls_handshake t_ms=31200
+# WDT_GUARD_ABORT stage=tls_handshake stalled_ms=9000 post_elapsed_ms=10000 t_ms=41000
+# POST_FAIL reason=aborted_slow_link: stage=tls_handshake elapsed_s=10.005 stage_duration_s=9.8 deadline_s=10.0
+# POST_STAGE stage=dns t_ms=91000 cache
+# POST_STAGE stage=done t_ms=93000
+# SLOW_POST duration_ms=16000 stage=done aborted=False t_ms=93001
+# POST_FAIL reason=http_status stage=n/a status=503 heap_free_at_try_start=1 heap_free_now=1
+# POST_STAGE stage=dns t_ms=150000 lookup
+# POST_FAIL reason=exception stage=body type=MemoryError msg=x heap_free_at_try_start=1 heap_free_now=1
+# POST_STAGE stage=dns t_ms=210000 cache
+# POST_STAGE stage=done t_ms=212000
+# STATUS elapsed_s=220.0 overflow=0 heap_free=290000 post_attempts=5""".splitlines()
+
+
+def test_posts_are_parsed_with_outcome_and_duration():
+    from bench_ab_report import boot_id, parse_posts, post_stats
+    posts = parse_posts(LOG)
+    assert [p["outcome"] for p in posts] == ["ok", "abort", "http", "fail", "ok"]
+    assert [p["duration_ms"] for p in posts] == [2500, 10005, 2000, None, 2000]
+    st = post_stats(posts)
+    assert (st["posts"], st["posts_ok"], st["posts_failed"], st["posts_aborted"], st["posts_duration_unknown"]) == (5, 2, 2, 1, 1)
+    assert st["post_ms_median"] == 2250 and st["post_seconds_total"] == 16.5
+    assert boot_id(LOG) == "0123456789abcdef"
+
+
+def test_gaps_are_normalised_per_post_and_per_post_second():
+    from bench_ab_report import run_report, verdicts
+    times = [float(t) for t in range(600) if t not in (30, 60, 90, 120, 150)]       # 5 missing seconds
+    r = run_report(LOG, rows(times))
+    assert r["missing_seconds_in_gaps"] == 5 and r["posts"] == 5
+    assert r["missing_s_per_post"] == 1.0 and r["missing_s_per_post_second"] == round(5 / 16.5, 3)
+    assert r["missing_s_per_10min"] == round(5 / r["span_s"] * 600, 2)
+    clean = run_report(LOG, rows([float(t) for t in range(600)]))
+    v = dict(verdicts(r, clean))
+    assert v["hard: missing_s_per_10min <= 0.5"] and v["hard: missing_s_per_post <= 10% of soft"]
+    assert v["one boot per log (no reset)"] and v["seq_missing: 0 in both"]
