@@ -8,8 +8,10 @@ and NOTHING is written to the Pico's flash. The device's own wifi_config.py is i
 (never the Mac's, never printed). Then POSTs are refused for OUTAGE_S seconds starting OUTAGE_START_S
 after start -- as if the uplink were down -- and the client runs normally otherwise.
 
-The client arms the 8 s watchdog as usual. To stop: Ctrl-C; the watchdog resets the board ~8 s later,
-and with the jumper still fitted it comes back in maintenance mode.
+The client arms the 8 s watchdog as usual. To stop: Ctrl-C, THEN UNPLUG USB. Ctrl-C only kills mpremote
+on the Mac; the client keeps running on the Pico (and feeding its watchdog), and the next mpremote session
+would leave that watchdog armed and get the board reset mid-import. Plug back in (jumper fitted, LED
+steady) before the next run.
 
 scripts/bench_normal.py is this file with OUTAGE_S = 0 (a plain run, e.g. for the hard-timer A/B);
 tests/test_bench_scripts.py keeps the two identical otherwise.

@@ -85,7 +85,20 @@ def boot_id(lines):
     return None
 
 
+def trim_to_log(rows, lines):
+    """Keep only the readings the log covers: from the boot's first reading for elapsed_s (last STATUS).
+    A client can outlive its log -- killing mpremote does not stop it -- and must not be compared longer."""
+    s = summarise(lines)
+    span = s.get("elapsed_s")
+    timed = [r["t"] for r in rows if r.get("t") is not None]
+    if not span or not timed:
+        return rows
+    end = min(timed) + span
+    return [r for r in rows if r.get("t") is None or r["t"] <= end]
+
+
 def run_report(lines, rows):
+    rows = trim_to_log(rows, lines)
     g = analyse(rows)
     s = summarise(lines)
     p = post_stats(parse_posts(lines))

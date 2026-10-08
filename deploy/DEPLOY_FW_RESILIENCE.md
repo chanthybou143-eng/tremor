@@ -64,8 +64,14 @@ history page computes not-yet-aggregated days from raw readings, as it already d
 
 Unit 1 keeps posting during these runs, under new `boot_id`s. Each run is the new code served from the Mac
 via `mpremote mount` and run from RAM; the device's own `wifi_config.py` is imported from its flash, never
-printed. Stop a run with Ctrl-C: the watchdog resets the board ~8 s later and, with the jumper still fitted,
-it comes back in maintenance mode (LED steady on).
+printed. Stop a run with Ctrl-C **and then unplug USB** (see "Stopping a run" below).
+
+**Stopping a run (corrected 2026-10-08):** Ctrl-C only kills `mpremote` on the Mac -- the client keeps
+running on the Pico and keeps feeding its watchdog (RECOVERY.md). The next `mpremote` session then
+interrupts it but leaves that watchdog armed, and it resets the board ~8 s later, mid-import (seen in the
+first hard run). So: **Ctrl-C, then unplug USB; and plug back in (jumper fitted, LED steady) before every
+run.** Only a power-cycle guarantees no client and no armed watchdog. In 2.2, stop only once the backlog
+has drained (`buffered=` < 60 on the last STATUS lines).
 
 **2.0 Maintenance mode:** unplug, fit the GP22 jumper (pin 29 to pin 28), plug in. LED steady on
 (RECOVERY.md).
