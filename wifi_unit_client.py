@@ -754,10 +754,13 @@ def _telemetry():
     temp = _die_temp_c()
     if temp is not None:
         t["die_temp_c"] = temp
+    if _pps_spread_since_post is not None:
+        t["pps_spread_us_max"] = _pps_spread_since_post
     return t
 
 
 _boot_ms = time.ticks_ms()
+_pps_spread_since_post = None   # max PPS interval spread (us) over the STATUS windows since the last successful POST
 _uptime_wraps_s = 0      # whole seconds folded in from _boot_ms every ~6 days (ticks_ms wraps at 2**30 ms)
 sync.blocking_ended()   # nothing has read the GPS UART since boot (Wi-Fi connect etc.): the first sentences may be stale
 # The current chunk's samples (adc_chunker.ChunkBuilder: fixed-capacity arrays allocated once and
@@ -896,6 +899,7 @@ while True:
                 post_attempts += 1
                 if buffer.flush(telemetry=_telemetry()):
                     post_successes += 1
+                    _pps_spread_since_post = None     # delivered: start the next telemetry window
                     _reset_counter.mark_healthy()  # first success after a boot ends the run of consecutive WDT resets
                     outcome = "ok"
                 else:
@@ -912,6 +916,10 @@ while True:
             _boot_ms = time.ticks_add(_boot_ms, (_since_boot_ms // 1000) * 1000)
         s = sync.status
         _pps_iv = sync.take_interval_window()   # accepted 1 s PPS intervals in this STATUS window: max - min = timestamp jitter
+        if _pps_iv[0] is not None:
+            _pps_spread = _pps_iv[1] - _pps_iv[0]
+            if _pps_spread_since_post is None or _pps_spread > _pps_spread_since_post:
+                _pps_spread_since_post = _pps_spread
         gc.collect()  # so mem_free()/mem_alloc() reflect reclaimable garbage,
                        # not a snapshot mid-accumulation -- see module docstring
         print("# STATUS elapsed_s={:.1f} wifi={} synced={} buffered={} peak_buffered={} "

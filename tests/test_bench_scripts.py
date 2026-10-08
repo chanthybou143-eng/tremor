@@ -123,3 +123,21 @@ def test_gaps_are_normalised_per_post_and_per_post_second():
     v = dict(verdicts(r, clean))
     assert v["hard: missing_s_per_10min <= 0.5"] and v["hard: missing_s_per_post <= 10% of soft"]
     assert v["one boot per log (no reset)"] and v["seq_missing: 0 in both"]
+
+
+# --- flash verification -----------------------------------------------------------------------------------
+
+def test_verify_flash_compares_every_board_file_and_never_reads_the_config():
+    from verify_flash import BOARD_CODE, compare
+    assert "elif f == 'wifi_config.py':\n        print('PRESENT', f)" in BOARD_CODE   # skipped before any open()
+    good = {"main.py": "aa" * 32, "wifi_ingest.py": "bb" * 32}
+    lines = ["PRESENT wifi_config.py", "FILE main.py 10 " + "aa" * 32, "FILE wifi_ingest.py 20 " + "cc" * 32,
+             "FILE http_keepalive.py 30 " + "dd" * 32, "DIR lib"]
+    rows, ok = compare(lines, good.get, {"main.py", "wifi_ingest.py", "adc_chunker.py"})
+    st = {name: status for status, name, _ in rows}
+    assert not ok and st == {"wifi_config.py": "PRESENT", "main.py": "OK", "wifi_ingest.py": "MISMATCH",
+                             "http_keepalive.py": "NOT_IN_COMMIT", "lib": "DIR", "adc_chunker.py": "MISSING"}
+    rows, ok = compare(["PRESENT wifi_config.py", "FILE main.py 10 " + "aa" * 32], good.get, {"main.py"})
+    assert ok
+    rows, ok = compare(["FILE main.py 10 " + "aa" * 32], good.get, {"main.py"})
+    assert not ok and ("MISSING", "wifi_config.py", "device config") in rows

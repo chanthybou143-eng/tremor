@@ -139,8 +139,8 @@ def _repo_imports(name, seen=None):
 
 def test_the_flash_runbook_names_every_module_the_firmware_imports():
     doc = (ROOT / "deploy" / "DEPLOY_FW_RESILIENCE.md").read_text()
-    cp_line = next(line for line in doc.splitlines() if line.startswith("mpremote fs cp ") and line.endswith(" :"))
-    flashed = set(cp_line[len("mpremote fs cp "):-2].split())
+    cp_line = next(line for line in doc.splitlines() if "mpremote fs cp " in line and line.endswith(" :"))
+    flashed = set(cp_line[cp_line.index("mpremote fs cp ") + len("mpremote fs cp "):-2].split())
     untouched = doc[doc.index("are untouched") - 200:doc.index("are untouched")]
     needed = _repo_imports("main") | _repo_imports("wifi_unit_client")
     needed.discard("wifi_config")                       # the device's own, never in the repo
@@ -167,3 +167,10 @@ def test_files_the_runbook_calls_untouched_really_are_unchanged_since_master():
             continue
         r = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", "master", "--", f])
         assert r.returncode == 0, f"{f} is listed as untouched but differs from master"
+
+
+def test_pps_spread_telemetry_is_the_max_since_the_last_successful_post():
+    status = SRC[SRC.index("_pps_iv = sync.take_interval_window()"):][:400]
+    assert "_pps_spread_since_post = _pps_spread" in status
+    flush = SRC[SRC.index("if buffer.flush(telemetry=_telemetry()):"):][:250]
+    assert "_pps_spread_since_post = None" in flush                 # reset only after a delivered POST

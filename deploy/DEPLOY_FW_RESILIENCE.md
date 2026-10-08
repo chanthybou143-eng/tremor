@@ -155,34 +155,39 @@ Expect, in order:
 
 ## 3. Flash Unit 1
 
-From maintenance mode (2.0). Back up exactly the files being replaced, then copy the new ones.
+From maintenance mode (2.0), with the checkout at the bench-tested commit `<C>` (`git rev-parse HEAD`).
+Run the commands from `~/tremor-merge`; `mpremote` is `.venv/bin/mpremote`. Back up every file being
+replaced or removed (never `wifi_config.py`, which stays on the board untouched), copy the new ones,
+remove the unused leftover `http_keepalive.py`, then verify **every** file on the board.
 
 ```bash
-B=~/tremor-flash-backup-$(date +%Y%m%d)-pre-fw-resilience && mkdir -p $B && cd $B
-for f in wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py; do mpremote fs cp :$f ./$f; done
-shasum -a 256 *.py > MANIFEST.txt
-cd ~/tremor-merge
-mpremote fs cp wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py wifi_support.py adc_chunker.py :
-mpremote exec "import hashlib,binascii
-for f in ('wifi_unit_client.py','wifi_ingest.py','http_client.py','wdt_support.py','pps_time_sync.py','wifi_support.py','adc_chunker.py'):
-    print(binascii.hexlify(hashlib.sha256(open(f,'rb').read()).digest()).decode(), f)"
-shasum -a 256 wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py wifi_support.py adc_chunker.py   # must match
+B=~/tremor-flash-backup-$(date +%Y%m%d)-pre-fw-resilience && mkdir -p $B
+for f in wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py http_keepalive.py; do .venv/bin/mpremote fs cp :$f $B/$f; done
+(cd $B && shasum -a 256 *.py > MANIFEST.txt)
+.venv/bin/mpremote fs cp wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py wifi_support.py adc_chunker.py :
+.venv/bin/mpremote fs rm :http_keepalive.py
+python3 scripts/verify_flash.py <C>
 ```
 
-Unplug, **remove the jumper**, power up (on its normal supply). LED slow blink. Within ~1 min:
+`verify_flash.py` hashes every file on the board except `wifi_config.py` (presence only: never opened,
+read, hashed or printed) and compares each with `git show <C>:<file>`. Pass: every line `OK` (plus
+`PRESENT wifi_config.py`) and `ALL FILES VERIFIED`. Any `MISMATCH`, `NOT_IN_COMMIT` or `MISSING`: stop.
+
+Unplug, **remove the jumper**, power up on its normal supply. LED slow blink. Within ~1 min:
 
 ```bash
-curl -s https://tremorgrid.pythonanywhere.com/api/health | python3 -m json.tool | grep -A25 '"unit-1"'
-#   new boot_id in telemetry; rssi_dbm, die_temp_c, backlog (< 60), dropped_total 0, heap_free (>= 150000)
+curl -s https://tremorgrid.pythonanywhere.com/api/health | python3 -m json.tool | grep -A30 '"unit-1"'
+#   new boot_id in telemetry; rssi_dbm, die_temp_c, backlog (< 60), dropped_total 0, heap_free (>= 150000),
+#   pps_spread_us_max (standalone PPS latency -- compare with the bench's USB-attached numbers)
 ```
 
 The next afternoon, `python3 scripts/bench_gap_report.py --boot <new boot_id> --from <ISO> --to <ISO>`:
-`seq_missing 0` through the slow-uplink period, and in telemetry `post_aborts_total` / `slow_posts_total`
-(how often the abort was needed) and `dropped_total` (should stay 0 unless an outage lasted > ~58 min).
+`seq_missing 0` through the slow-uplink period, readings ~1.00 s apart, POST-locked gaps (compare with
+the old firmware's ~44/h), and in telemetry `post_aborts_total` / `slow_posts_total` / `dropped_total`.
 
-**Rollback (firmware):** jumper → maintenance; `mpremote fs cp $B/*.py :`; `mpremote fs rm :wifi_support.py :adc_chunker.py`;
-remove the jumper; power-cycle. To drop only the hard ADC timer, flash `wifi_unit_client.py` from `fccf4e0`
-(`git show fccf4e0:wifi_unit_client.py > /tmp/wuc.py`, then copy it to the board as `wifi_unit_client.py`).
+**Rollback (firmware):** jumper → maintenance; `.venv/bin/mpremote fs cp $B/*.py :` (restores the five
+replaced files and http_keepalive.py); `.venv/bin/mpremote fs rm :wifi_support.py :adc_chunker.py`;
+remove the jumper; power-cycle.
 
 ## Open items (logged 2026-10-08)
 
