@@ -72,6 +72,7 @@ from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
+from adc_chunker import ChunkBuilder
 from wifi_ingest import IngestBuffer, make_boot_id, next_post_interval_s
 from http_client import (POST_ABORT_MS, DnsCache, PostStageError, SocketAborter, classify_post_exception,
                          parse_https_url, read_rssi, timeout_post)
@@ -89,20 +90,14 @@ INGEST_TOKEN = getattr(wifi_config, "INGEST_TOKEN", None)
 _AUTH_HEADERS = {"X-Tremor-Token": INGEST_TOKEN} if INGEST_TOKEN else None
 
 ADC_SAMPLE_HZ = 1030   # matches adc_stream_gps.py's measured real-world rate
-# adc_stream_gps.py's RING_CAPACITY=512 (~497ms headroom) assumed only
-# short USB/GPS-poll stalls. Unlike WiFi reconnect (made non-blocking
-# above), urequests.post() itself IS a blocking call with no async
-# alternative in stock urequests -- DNS+TCP+TLS+transfer for a small JSON
-# batch is plausibly ~0.5-2s, occasionally more, and the main loop can't
-# drain the ring buffer while blocked inside it. 4096 samples (~4s
-# headroom, ~24KB RAM) is a cheap stopgap so a typical POST doesn't
-# overflow it -- NOT a guarantee against a pathological multi-second
-# stall. OPEN DESIGN QUESTION for real hardware: if measured POST
-# latency threatens this headroom, the more robust fix is running the
-# POST on the Pico 2's second core via _thread (ADC/ring-buffer draining
-# stays on core 0, uninterrupted) rather than keep enlarging this buffer --
-# worth deciding once real latency numbers exist, not guessed now.
-RING_CAPACITY = 4096
+# ADC ring headroom: how long the main loop may go without draining before samples are lost
+# (counted in overflow_count). 12 s at ADC_SAMPLE_HZ (fw-resilience, 2026-10-08): with the HARD ADC
+# timer the samples keep coming during a POST, and the 4 s ring of before overflowed on every POST
+# (plus its gc/json work) longer than ~4 s -- 7.1 s of samples lost per 30 min on the bench. 12 s
+# covers a normal POST (~2-5 s), an aborted one (~11 s, http_client.POST_ABORT_MS) and the pre-POST
+# work. Cost: 6 bytes per sample ('L' ticks + 'H' raw) = 74,160 bytes, +49.6 KB over 4096 samples
+# (the bench showed ~288 KB free at steady state with the 4 s ring).
+RING_CAPACITY = 12360    # 12 s at 1030 Hz
 MAX_DRAIN_PER_PASS = 128  # see adc_stream_gps.py: bounds one drain so GPS
                           # UART servicing and WiFi/POST bookkeeping always get a turn
 
@@ -123,9 +118,10 @@ CHUNK_S = 1.0            # one summarized reading per second, same cadence as ov
 # Lowering it further isn't well justified: with array.array buffers
 # below, each extra slot of margin costs only its flat itemsize (a few
 # bytes), not the boxed-float overhead a plain list paid per slot -- the
-# margin is now cheap, and real chunks have been observed needing up to
-# ~1148 samples (inferred from a crash requiring a slice sized past 1030
-# during unrelated heap pressure), so 1200 stays a reasonable ceiling.
+# margin is now cheap. Chunks used to need up to ~1158 samples because the
+# main loop only checked for a complete chunk after each 128-sample drain;
+# since adc_chunker.ChunkBuilder closes them per sample they hold ~1031-1032,
+# and a chunk that does fill up is closed early (counted, never dropped).
 CHUNK_CAPACITY = 1200
 
 # NEEDS VERIFICATION ON HARDWARE: this assumes single-precision floats
@@ -763,42 +759,13 @@ def _telemetry():
 
 _boot_ms = time.ticks_ms()
 _uptime_wraps_s = 0      # whole seconds folded in from _boot_ms every ~6 days (ticks_ms wraps at 2**30 ms)
-_last_consumed_ticks = t0
 sync.blocking_ended()   # nothing has read the GPS UART since boot (Wi-Fi connect etc.): the first sentences may be stale
-_elapsed_us_total = 0
-# Fixed-capacity buffers, allocated once here and reused every chunk by
-# writing to index _chunk_len (never .append()'d/reallocated) -- see
-# CHUNK_CAPACITY above for why. Only indices [0, _chunk_len) hold valid
-# data for the *current* chunk; everything from _chunk_len onward is
-# stale leftover from a previous chunk and must never be read -- every
-# consumer below is bounded to _chunk_len, not len(...), specifically to
-# guard against that.
-#
-# array.array, not plain lists: a plain list of floats still boxes each
-# individual value (a separate heap object per element) even though the
-# list itself is pre-sized -- only the backing pointer array was fixed,
-# not the ~1030 float objects it points to, which were freshly allocated
-# and freed every chunk regardless of the list-growth fix. array.array
-# stores packed, unboxed values instead, so filling these buffers by
-# index allocates nothing at all: indexing/reading/rewriting existing
-# slots is unchanged (array.array supports the exact same arr[i]/
-# arr[i]=x/len(arr) interface as a list), and the stale-data guards
-# above are unaffected. counts uses 'H' (raw ADC u16, matches ring_raw's
-# own typecode) and ticks uses 'I', both narrower than a list's 4-byte
-# pointer slot for at least one of them; the float buffers use
-# FLOAT_TYPECODE (see its own comment above -- unverified pending
-# check_float_precision.py).
-_chunk_ticks = array.array("I", [0] * CHUNK_CAPACITY)     # raw time.ticks_us() per sample -- for gps_utc_s lookup
-_chunk_ts_s = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)    # chunk-relative elapsed seconds per sample -- summarize_chunk's timestamps
-_chunk_counts = array.array("H", [0] * CHUNK_CAPACITY)    # raw u16 ADC counts per sample -- converted to volts below
+# The current chunk's samples (adc_chunker.ChunkBuilder: fixed-capacity arrays allocated once and
+# reused -- see CHUNK_CAPACITY above for why -- closed at exactly CHUNK_S, per sample). Only indices
+# [0, chunker.n) hold the current chunk. _voltages/_filtered_buf are summarize_chunk's scratch buffers.
+chunker = ChunkBuilder(CHUNK_CAPACITY, int(CHUNK_S * 1_000_000), FLOAT_TYPECODE, time.ticks_diff, t0)
 _voltages = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)      # scratch buffer for the volts-converted chunk
 _filtered_buf = array.array(FLOAT_TYPECODE, [0.0] * CHUNK_CAPACITY)  # scratch buffer for summarize_chunk's filtered signal
-_chunk_len = 0
-_chunk_start_us = 0  # _elapsed_us_total at the current chunk's first sample --
-                      # see _chunk_ts_s's own comment in the main loop below
-chunk_capacity_overflow_count = 0  # a chunk needed more than CHUNK_CAPACITY samples --
-                                    # extra samples past capacity are dropped and counted here,
-                                    # same "count, don't silently lose" contract as overflow_count
 _last_post_ticks = t0
 _last_status_ticks = t0
 peak_buffered = 0  # highest len(buffer) observed -- see bench-run report in commit history
@@ -847,64 +814,20 @@ while True:
     _feed_wdt()  # covers everything in this iteration OTHER than a POST attempt --
                  # timeout_post() feeds it separately, at a finer grain, during one
 
-    drained = 0
-    while read_idx != write_idx and drained < MAX_DRAIN_PER_PASS:
-        raw_ticks = ring_ticks[read_idx]
-        raw_count = ring_raw[read_idx]
-        read_idx = (read_idx + 1) % RING_CAPACITY
-        drained += 1
-
-        _elapsed_us_total += time.ticks_diff(raw_ticks, _last_consumed_ticks)
-        _last_consumed_ticks = raw_ticks
-
-        if _chunk_len < CHUNK_CAPACITY:
-            if _chunk_len == 0:
-                # First sample of a new chunk -- this becomes the
-                # reference point _chunk_ts_s is measured from. See its
-                # own comment below for why.
-                _chunk_start_us = _elapsed_us_total
-            _chunk_ticks[_chunk_len] = raw_ticks
-            # Chunk-relative, not _elapsed_us_total/1e6 (session-cumulative)
-            # directly: chunk_summary.py/freq_estimator.py only ever use
-            # differences between _chunk_ts_s values (span, zero-crossing
-            # interpolation), never an absolute value, so a chunk-relative
-            # timestamp is numerically equivalent for every downstream
-            # calculation -- but it keeps the magnitude bounded to
-            # roughly [0, CHUNK_S] regardless of how long the process has
-            # been running, instead of growing for hours. That bound
-            # matters because FLOAT_TYPECODE='f' (single precision, this
-            # is a rp2 board): float32's step size at ~1030s of session
-            # time is already ~0.24ms, close to the ~0.97ms raw sample
-            # interval at ADC_SAMPLE_HZ=1030, and by ~10h it's ~3.9ms --
-            # *wider* than the sample interval, meaning consecutive
-            # samples' cumulative timestamps could round to the same
-            # float32 value. A chunk-relative value never exceeds
-            # ~1.2s, where float32's step size is a few microseconds --
-            # utterly negligible next to the ~970us sample interval, for
-            # as long as this process runs.
-            _chunk_ts_s[_chunk_len] = (_elapsed_us_total - _chunk_start_us) / 1e6
-            _chunk_counts[_chunk_len] = raw_count
-            _chunk_len += 1
-        else:
-            # CHUNK_CAPACITY's margin over the nominal ~1030 samples/chunk
-            # wasn't enough this time -- drop the extra samples (same
-            # "count, don't silently lose" contract as the ADC ring
-            # buffer's own overflow_count) rather than grow the buffer,
-            # which would defeat the whole point of preallocating it.
-            chunk_capacity_overflow_count += 1
-
-    # Once ~CHUNK_S worth of samples has accumulated, reduce it to one
-    # (frequency_hz, amplitude_v, gps_utc_s) reading and buffer it. Every
-    # index used below is bounded to _chunk_len, not len(...) -- these are
-    # fixed-capacity buffers reused every chunk (see CHUNK_CAPACITY), so
-    # indices past _chunk_len hold stale data from a previous chunk.
-    if _chunk_len > 0 and (_chunk_ts_s[_chunk_len - 1] - _chunk_ts_s[0]) >= CHUNK_S:
+    # Drain the ADC ring into the current chunk -- per sample, stopping right after the sample that
+    # completes it (adc_chunker.ChunkBuilder), so a chunk is 1 s to 1 s + one sample long whatever
+    # the batch size; then reduce it to one (frequency_hz, amplitude_v, time) reading and buffer it.
+    read_idx = chunker.drain(ring_ticks, ring_raw, read_idx, write_idx, RING_CAPACITY, MAX_DRAIN_PER_PASS)
+    if chunker.complete:
+        _chunk_len = chunker.n
+        _chunk_ts_s = chunker.ts_s
+        _chunk_counts = chunker.counts
         for _i in range(_chunk_len):
             _voltages[_i] = _chunk_counts[_i] * ADC_VOLTAGE_SCALE
         try:
             frequency_hz, amplitude_v = summarize_chunk(
                 _chunk_ts_s, _voltages, n=_chunk_len, filtered_buf=_filtered_buf)
-            _last_tick = _chunk_ticks[_chunk_len - 1]
+            _last_tick = chunker.ticks[_chunk_len - 1]
             # Full-precision integer UTC (days, second-of-day, microsecond) for the v2
             # payload. The float32 time (~4-8 ms) is only needed for the legacy format, or
             # in v2 when SEND_LEGACY_FLOAT is on -- otherwise skip computing it.
@@ -927,14 +850,14 @@ while True:
             since_last_post_us = time.ticks_diff(time.ticks_us(), _last_post_ticks)
             print("# DUP_TIMESTAMP elapsed_s={:.1f} n={} first={} last={} "
                   "since_last_post_us={} overflow_count={} error={}".format(
-                _elapsed_us_total / 1e6, _chunk_len,
+                chunker.elapsed_us / 1e6, _chunk_len,
                 _chunk_ts_s[0] if _chunk_len else None,
                 _chunk_ts_s[_chunk_len - 1] if _chunk_len else None,
                 since_last_post_us, overflow_count, exc,
             ))
         except ValueError:
             skipped_chunk_count += 1  # too few crossings this chunk -- skipped (no reading, no seq), counted
-        _chunk_len = 0
+        chunker.reset()
 
     if uart.any():
         chunk = uart.read(GPS_READ_CHUNK_BYTES)
@@ -1005,10 +928,10 @@ while True:
               "wifi_longest_down_ms={} wifi_status={} die_temp_c={} pps_iv_min_us={} pps_iv_max_us={} "
               "pps_edges={} pps_accepted={} pps_rejected={} pps_resync={} "
               "sync_count={} sync_rejected={} no_edge={} reanchors={} sync_shadow={}".format(
-            _elapsed_us_total / 1e6, wlan.isconnected(), s["synced"],
+            chunker.elapsed_us / 1e6, wlan.isconnected(), s["synced"],
             current_buffered, peak_buffered, buffer.dropped_count, overflow_count,
             gc.mem_free(), gc.mem_alloc(), post_attempts, post_successes,
-            dup_timestamp_count, chunk_capacity_overflow_count,
+            dup_timestamp_count, chunker.capacity_closes,
             longest_post_duration_s, last_post_duration_ms, slow_post_count,
             stage_failure_counts["dns"], stage_failure_counts["connect"],
             stage_failure_counts["tls_handshake"], stage_failure_counts["send"],

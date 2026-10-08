@@ -12,9 +12,11 @@ Branch `fw-resilience`. Each step below needs your go-ahead. Do them in this ord
 | `5fa2501` | Firmware: hard ADC timer (separate, for the A/B below) |
 | branch head | Firmware: STATUS reads the Wi-Fi status exception-safely |
 
-Device files that change: `wifi_unit_client.py`, `wifi_ingest.py`, `http_client.py`, `wdt_support.py`, and the
-new `wifi_support.py`. `main.py`, `boot_support.py`, `pps_time_sync.py`, `nmea_parser.py`, `chunk_summary.py`,
-`freq_estimator.py` and `wifi_config.py` are untouched.
+Device files that change: `wifi_unit_client.py`, `wifi_ingest.py`, `http_client.py`, `wdt_support.py`,
+`pps_time_sync.py`, and the new `wifi_support.py` and `adc_chunker.py`. `main.py`, `boot_support.py`,
+`nmea_parser.py`, `chunk_summary.py`, `freq_estimator.py` and `wifi_config.py` are untouched.
+(`pps_time_sync.py` was wrongly listed as untouched until 2026-10-08: commit `1ec6045` added the PPS
+interval window that the new client calls -- flashing without it would crash the client at STATUS.)
 
 ## 0. Push the branch (Mac)
 
@@ -98,10 +100,10 @@ is checked later against the AEMO weekly report):
 | Metric | Where | Pass (hard vs soft) |
 |---|---|---|
 | `time_gaps`, `missing_seconds_in_gaps`, `gaps_locked_to_post_cadence` | gap report | hard ≈ 0 (soft ≈ 40+/h, nearly all locked) |
-| `readings_per_10min` | gap report | hard ≥ ~595 (600 minus `skipped_chunks`) |
+| `readings_per_10min` | gap report | information (revised 2026-10-08: the shortfall was chunks up to 1.124 s long, not lost time; after the chunk fix expect ~1.00 s spacing and ~600) |
 | `freq_diff1s_std_mHz`, `freq_diff1s_mad_mHz` | gap report | hard within ±15 % of soft, not higher |
 | `freq_glitches_gt_20mHz` | gap report | hard ≤ soft |
-| `amplitude_mean_v`, `amplitude_std_mV` | gap report | means within ±1 %; std not higher |
+| `amplitude_std_mV` | gap report | hard not higher (the mean tracks the mains voltage: grid-dependent, not judged) |
 | `chunk_capacity_overflow`, `dup_timestamp_count` | log summary | hard ≤ soft |
 | `overflow` (= adc_overflow_total) | log summary | information only: the soft timer loses samples uncounted during a stall, the hard timer counts them -- judge on missing seconds |
 | missing s per POST / per POST second, POST count, aborts, median POST ms | `scripts/bench_ab_report.py` | normalises the gap figures for different uplink conditions |
@@ -157,14 +159,14 @@ From maintenance mode (2.0). Back up exactly the files being replaced, then copy
 
 ```bash
 B=~/tremor-flash-backup-$(date +%Y%m%d)-pre-fw-resilience && mkdir -p $B && cd $B
-for f in wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py; do mpremote fs cp :$f ./$f; done
+for f in wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py; do mpremote fs cp :$f ./$f; done
 shasum -a 256 *.py > MANIFEST.txt
 cd ~/tremor-merge
-mpremote fs cp wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py wifi_support.py :
+mpremote fs cp wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py wifi_support.py adc_chunker.py :
 mpremote exec "import hashlib,binascii
-for f in ('wifi_unit_client.py','wifi_ingest.py','http_client.py','wdt_support.py','wifi_support.py'):
+for f in ('wifi_unit_client.py','wifi_ingest.py','http_client.py','wdt_support.py','pps_time_sync.py','wifi_support.py','adc_chunker.py'):
     print(binascii.hexlify(hashlib.sha256(open(f,'rb').read()).digest()).decode(), f)"
-shasum -a 256 wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py wifi_support.py   # must match
+shasum -a 256 wifi_unit_client.py wifi_ingest.py http_client.py wdt_support.py pps_time_sync.py wifi_support.py adc_chunker.py   # must match
 ```
 
 Unplug, **remove the jumper**, power up (on its normal supply). LED slow blink. Within ~1 min:
@@ -178,6 +180,19 @@ The next afternoon, `python3 scripts/bench_gap_report.py --boot <new boot_id> --
 `seq_missing 0` through the slow-uplink period, and in telemetry `post_aborts_total` / `slow_posts_total`
 (how often the abort was needed) and `dropped_total` (should stay 0 unless an outage lasted > ~58 min).
 
-**Rollback (firmware):** jumper → maintenance; `mpremote fs cp $B/*.py :`; `mpremote fs rm :wifi_support.py`;
+**Rollback (firmware):** jumper → maintenance; `mpremote fs cp $B/*.py :`; `mpremote fs rm :wifi_support.py :adc_chunker.py`;
 remove the jumper; power-cycle. To drop only the hard ADC timer, flash `wifi_unit_client.py` from `fccf4e0`
 (`git show fccf4e0:wifi_unit_client.py > /tmp/wuc.py`, then copy it to the board as `wifi_unit_client.py`).
+
+## Open items (logged 2026-10-08)
+
+- **GPIO IRQ priority / PPS timestamp latency.** On the bench the PPS edge stamp was delayed by up to
+  ~50-90 µs with the hard ADC timer (spread p95 103 µs, vs 23 µs soft): the ADC timer's alarm IRQ and the
+  GPIO IRQ share the default NVIC priority, so a PPS edge waits for a running ADC handler. Accepted for
+  now (it shifts time tags, not frequency). Resolve before any phase-angle work or Unit 2: raise
+  IO_IRQ_BANK0 above the timer IRQ (NVIC IPR via mem32; verify nested hard IRQs on the device) or
+  DMA-paced ADC. The bench numbers may be inflated by USB mount/serial traffic: re-measure on the
+  standalone unit (needs the PPS spread in telemetry -- not yet sent).
+- **Production vs bench POST-locked gaps (A/B finding 5).** Production (~44 gaps/h) ran the OLD firmware;
+  the soft-timer bench run used the NEW firmware with the timer switched to soft -- not like for like.
+  After flashing, compare POST-locked gaps from the server data of the new boot.

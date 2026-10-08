@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import ast
 import string
+
+import pytest
 import sys
 from pathlib import Path
 
@@ -119,3 +121,49 @@ def test_temperature_requests_are_made_only_mid_pps_second():
 
 def test_status_reports_the_pps_interval_spread():
     assert "pps_iv_min_us={} pps_iv_max_us={}" in SRC and "sync.take_interval_window()" in SRC
+
+
+def _repo_imports(name, seen=None):
+    """Repo-root modules imported (transitively) by `name` -- what must be on the Pico's flash."""
+    seen = set() if seen is None else seen
+    path = ROOT / f"{name}.py"
+    if name in seen or not path.exists():
+        return seen
+    seen.add(name)
+    for n in ast.walk(ast.parse(path.read_text())):
+        mods = [a.name for a in n.names] if isinstance(n, ast.Import) else [n.module] if isinstance(n, ast.ImportFrom) and n.module else []
+        for m in mods:
+            _repo_imports(m.split(".")[0], seen)
+    return seen
+
+
+def test_the_flash_runbook_names_every_module_the_firmware_imports():
+    doc = (ROOT / "deploy" / "DEPLOY_FW_RESILIENCE.md").read_text()
+    cp_line = next(line for line in doc.splitlines() if line.startswith("mpremote fs cp ") and line.endswith(" :"))
+    flashed = set(cp_line[len("mpremote fs cp "):-2].split())
+    untouched = doc[doc.index("are untouched") - 200:doc.index("are untouched")]
+    needed = _repo_imports("main") | _repo_imports("wifi_unit_client")
+    needed.discard("wifi_config")                       # the device's own, never in the repo
+    for m in sorted(needed):
+        assert f"{m}.py" in flashed or f"`{m}.py`" in untouched, f"{m}.py is neither flashed nor listed as untouched"
+    assert {"adc_chunker.py", "wifi_support.py", "pps_time_sync.py"} <= flashed
+
+
+def test_files_the_runbook_calls_untouched_really_are_unchanged_since_master():
+    import re
+    import subprocess
+    doc = (ROOT / "deploy" / "DEPLOY_FW_RESILIENCE.md").read_text()
+    seg = doc[doc.index("Device files that change:"):doc.index("are untouched")]
+    untouched = re.findall(r"`(\w+\.py)`", seg[seg.index("`main.py`"):])
+    assert "main.py" in untouched and "wifi_config.py" in untouched
+    try:
+        ok = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--verify", "master"], capture_output=True).returncode == 0
+    except OSError:
+        ok = False
+    if not ok:
+        pytest.skip("no git / no master branch here")
+    for f in untouched:
+        if f == "wifi_config.py":
+            continue
+        r = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", "master", "--", f])
+        assert r.returncode == 0, f"{f} is listed as untouched but differs from master"

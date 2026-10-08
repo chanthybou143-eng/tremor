@@ -638,7 +638,7 @@ def test_the_client_reports_every_reanchor_and_tells_pps_time_sync_when_it_is_bl
     assert a < post < b                                         # started before the POST, ended in its finally
     assert src.rindex("finally:", 0, b) > post
     loop = src.index("\nwhile True:")
-    assert "sync.blocking_ended()" in src[src.rindex("_last_consumed_ticks = t0"):loop]   # and once before the main loop
+    assert "sync.blocking_ended()" in src[src.rindex("_boot_ms = time.ticks_ms()"):loop]   # and once before the main loop
     assert "sync_shadow={}" in src and 's["shadow_ignored"]' in src
 
 
