@@ -137,3 +137,33 @@ def test_the_client_uses_the_builder_and_a_12_second_ring():
     assert "_adc_state[_R] = chunker.drain(ring_ticks, ring_raw, _adc_state[_R], _adc_state[_W], RING_CAPACITY," in src
     assert "chunker.reset()" in src and "RING_CAPACITY = 12360" in src
     assert "_elapsed_us_total" not in src
+
+
+# --- the hard-IRQ producer -------------------------------------------------------------------------------
+
+def test_the_adc_handler_fills_the_ring_counts_overflow_and_serves_temperature_requests():
+    import array
+    from adc_chunker import make_adc_isr
+    cap = 5
+    rt, rr = array.array("L", [0] * cap), array.array("H", [0] * cap)
+    st = array.array("i", [0, 0, 0, 0, -1, cap])
+    clock = iter(range(1000, 100000, 971))
+    isr = make_adc_isr(rt, rr, st, (lambda: next(clock), lambda: 30000, lambda: 14000))
+    for _ in range(4):
+        isr(None)
+    assert st[0] == 4 and list(rt[:4]) == [1000, 1971, 2942, 3913] and list(rr[:4]) == [30000] * 4
+    isr(None)                                          # ring full (one slot always free): dropped, counted
+    assert st[0] == 4 and st[2] == 1
+    st[1] = 2                                          # the main loop consumed two
+    st[3] = 1                                          # and asked for a temperature
+    isr(None)
+    assert st[0] == 0 and st[4] == 14000 and st[3] == 0   # wrapped; temperature taken right after the sample
+
+
+def test_the_overflow_counter_never_leaves_small_int_range():
+    import array
+    from adc_chunker import make_adc_isr
+    st = array.array("i", [0, 1, 0x3FFFFFFF, 0, -1, 2])    # full ring, counter at the cap
+    isr = make_adc_isr(array.array("L", [0, 0]), array.array("H", [0, 0]), st, (lambda: 0, lambda: 0, None))
+    isr(None)
+    assert st[2] == 0x3FFFFFFF

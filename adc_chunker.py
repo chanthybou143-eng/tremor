@@ -1,4 +1,5 @@
-"""Turns the ADC ring buffer's (ticks_us, raw count) samples into ~1 s chunks for chunk_summary.
+"""The ADC ring buffer: its hard-IRQ producer (make_adc_isr) and its consumer, which turns the
+(ticks_us, raw count) samples into ~1 s chunks for chunk_summary (ChunkBuilder).
 
 Pure Python (array only), no MicroPython imports, so it runs and is tested on the desktop:
 tests/test_adc_chunker.py. wifi_unit_client.py calls drain() once per main-loop pass.
@@ -77,3 +78,40 @@ class ChunkBuilder:
         self.n = 0
         self.complete = False
         self._rel_us = 0
+
+
+def make_adc_isr(ring_ticks, ring_raw, state, fns):
+    """Build the hard ADC timer handler as a closure over everything it touches.
+
+    Two MicroPython facts shape this, both found the hard way on the bench (2026-10-08):
+
+    1. No globals-table lookups. The first version looked its variables up BY NAME in the module's
+       globals table; ~1 s after start it died with "NameError: name 'write_idx' isn't defined" and
+       MicroPython disabled the timer (no samples, no readings, everything else looking healthy). A hard
+       handler interrupts the main thread anywhere -- including while it adds a global (module import,
+       the first pass through a code path), when the table being resized can miss a name that exists.
+       Closure variables are cells, not table entries; literal indices, because _W etc. would be lookups.
+    2. At most 4 closure variables. Calling a closure copies its closed-over variables plus the call's
+       arguments into a temporary array, on the stack only when there are <= 5 of them (py/objclosure.c,
+       closure_call, v1.27); more and it is heap-allocated on EVERY call -- a MemoryError in a hard IRQ.
+       4 cells + the timer argument = 5. Hence the capacity lives in `state` and the three functions in
+       one tuple `fns` = (ticks_us, read_mains, read_temp).
+
+    Allocation-free otherwise: small ints, preallocated arrays, tuple indexing, bound methods made once.
+    Enforced by tests/test_client_static.py and tests/test_adc_chunker.py; exercised on the device by
+    scripts/bench_isr_smoke.py.
+    """
+    def _on_adc_timer(timer):
+        w = state[0]                              # _W
+        nw = (w + 1) % state[5]                   # _CAP
+        if nw == state[1]:                        # _R: ring full -> drop, count
+            if state[2] < 0x3FFFFFFF:             # _OVF, capped below 2**30 (a small int)
+                state[2] += 1
+            return
+        ring_ticks[w] = fns[0]()                  # ticks_us
+        ring_raw[w] = fns[1]()                    # mains channel
+        state[0] = nw
+        if state[3]:                              # _TREQ: temperature requested mid-PPS-second
+            state[4] = fns[2]()                   # _TRAW <- temperature channel
+            state[3] = 0
+    return _on_adc_timer

@@ -78,8 +78,11 @@ def test_the_client_never_prints_or_formats_the_credentials():
 
 # --- hard ADC timer ----------------------------------------------------------------------------------------
 
+CHUNKER = (ROOT / "adc_chunker.py").read_text()
+
+
 def _isr_factory():
-    return next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_make_adc_isr")
+    return next(n for n in ast.parse(CHUNKER).body if isinstance(n, ast.FunctionDef) and n.name == "make_adc_isr")
 
 
 def _isr():
@@ -99,7 +102,7 @@ def test_the_adc_timer_is_hard_and_its_handler_cannot_allocate():
         if isinstance(n, ast.Constant):
             assert isinstance(n.value, int) or n.value is None
         if isinstance(n, ast.Call):
-            assert isinstance(n.func, ast.Name) and n.func.id in ("ticks_us", "read_mains", "read_temp"), ast.unparse(n)
+            assert ast.unparse(n.func) in ("fns[0]", "fns[1]", "fns[2]"), ast.unparse(n)
     caps = [n for n in ast.walk(isr) if isinstance(n, ast.Compare) and ast.unparse(n.left) == "state[2]"
             and isinstance(n.ops[0], ast.Lt)]
     assert len(caps) == 1 and caps[0].comparators[0].value < 2 ** 30
@@ -115,7 +118,22 @@ def test_the_adc_handler_never_looks_anything_up_in_a_globals_table():
                                               for t in n.targets if isinstance(t, ast.Name)}
     used = {n.id for n in ast.walk(isr) if isinstance(n, ast.Name)}
     assert used <= closure | local, sorted(used - closure - local)
-    assert "_on_adc_timer = _make_adc_isr(ring_ticks, ring_raw, _adc_state, RING_CAPACITY, time.ticks_us, adc.read_u16," in SRC
+    assert "_on_adc_timer = make_adc_isr(ring_ticks, ring_raw, _adc_state,\n" in SRC
+    assert "from adc_chunker import ChunkBuilder, make_adc_isr" in SRC
+    assert "(time.ticks_us, adc.read_u16, _temp_adc.read_u16 if _temp_adc is not None else None))" in SRC
+
+
+def test_the_adc_handler_closes_over_at_most_4_variables():
+    """py/objclosure.c (v1.27) closure_call: closed-over variables + arguments are copied into a temporary
+    array on the STACK only if there are <= 5 of them, else on the HEAP -- on every call. In a hard IRQ that
+    is a MemoryError (seen on the bench: the handler died on its first interrupt with 7 + 1). The handler
+    takes 1 argument, so at most 4 closed-over variables."""
+    factory, isr = _isr_factory(), _isr()
+    params = {a.arg for a in factory.args.args}
+    used = {n.id for n in ast.walk(isr) if isinstance(n, ast.Name)}
+    closed = used & params
+    assert len(closed) + len(isr.args.args) <= 5, sorted(closed)
+    assert len(isr.args.args) == 1
     for old in ("global write_idx", "\nwrite_idx = 0", "\nread_idx = 0", "\noverflow_count = 0", "\n_temp_req = 0"):
         assert old not in SRC
 
@@ -131,8 +149,8 @@ def test_a_stalled_adc_timer_is_detected_and_restarted():
 def test_the_temperature_is_read_only_inside_the_adc_handler_and_no_interrupt_is_ever_disabled():
     assert "disable_irq" not in SRC
     isr_src = ast.unparse(_isr())
-    assert "state[4] = read_temp()" in isr_src
-    assert isr_src.index("ring_raw[w] = read_mains()") < isr_src.index("read_temp()")
+    assert "state[4] = fns[2]()" in isr_src
+    assert isr_src.index("ring_raw[w] = fns[1]()") < isr_src.index("fns[2]()")
     assert SRC.count("_temp_adc.read_u16") == 1                            # handed to the handler, never called elsewhere
     assert SRC.index("_temp_adc = ADC(ADC.CORE_TEMP)") < SRC.index("adc_timer.init(")
 

@@ -72,7 +72,7 @@ from machine import ADC, UART, Pin, Timer, WDT
 
 from pps_time_sync import PPSTimeSync
 from chunk_summary import summarize_chunk, DegenerateTimestampsError
-from adc_chunker import ChunkBuilder
+from adc_chunker import ChunkBuilder, make_adc_isr
 from wifi_ingest import IngestBuffer, make_boot_id, next_post_interval_s
 from http_client import (POST_ABORT_MS, DnsCache, PostStageError, SocketAborter, classify_post_exception,
                          parse_https_url, read_rssi, timeout_post)
@@ -385,10 +385,10 @@ t0 = time.ticks_us()
 ring_ticks = array.array("L", [0] * RING_CAPACITY)
 ring_raw = array.array("H", [0] * RING_CAPACITY)
 # State shared with the hard ADC handler, in ONE preallocated array that the handler reaches through
-# its closure (see _make_adc_isr): [write index, read index, overflow count, temperature request,
-# last temperature raw]. Not module globals -- see _make_adc_isr for why.
-_W, _R, _OVF, _TREQ, _TRAW = 0, 1, 2, 3, 4
-_adc_state = array.array("i", [0, 0, 0, 0, -1])
+# its closure (see adc_chunker.make_adc_isr): [write index, read index, overflow count, temperature request,
+# last temperature raw, ring capacity]. Not module globals -- see adc_chunker.make_adc_isr for why.
+_W, _R, _OVF, _TREQ, _TRAW, _CAP = 0, 1, 2, 3, 4, 5
+_adc_state = array.array("i", [0, 0, 0, 0, -1, RING_CAPACITY])
 
 
 # HARD timer (fw-resilience, 2026-10). A soft (scheduled) callback -- the old default -- cannot run
@@ -419,37 +419,8 @@ except Exception as _exc:
     print("# DIE_TEMP unavailable type={}".format(type(_exc).__name__))
 
 
-def _make_adc_isr(ring_ticks, ring_raw, state, capacity, ticks_us, read_mains, read_temp):
-    """Build the hard ADC timer handler as a closure over everything it touches.
-
-    Bench 2026-10-08 (confirmation run on f77a594): ~1 s after start the handler died with
-    "NameError: name 'write_idx' isn't defined" and MicroPython disabled the timer -- no samples, no
-    readings, while the rest of the unit looked healthy. A hard handler runs in the real interrupt, in
-    the middle of whatever the main thread is doing; the old one looked its variables up BY NAME in the
-    module's globals table, and the main thread was still adding globals (module import, or the first
-    pass through a code path) -- a table being resized mid-lookup can miss a name that exists.
-    Closure variables are cells, not table entries: this handler never touches a globals table
-    (enforced by tests/test_client_static.py). Literal indices for the same reason: _W etc. would be
-    global lookups. Allocation-free: small ints, preallocated arrays, bound methods made once here.
-    """
-    def _on_adc_timer(timer):
-        w = state[0]                              # _W
-        nw = (w + 1) % capacity
-        if nw == state[1]:                        # _R: ring full -> drop, count
-            if state[2] < 0x3FFFFFFF:             # _OVF, capped below 2**30 (a small int)
-                state[2] += 1
-            return
-        ring_ticks[w] = ticks_us()
-        ring_raw[w] = read_mains()
-        state[0] = nw
-        if state[3]:                              # _TREQ: temperature requested mid-PPS-second
-            state[4] = read_temp()                # _TRAW
-            state[3] = 0
-    return _on_adc_timer
-
-
-_on_adc_timer = _make_adc_isr(ring_ticks, ring_raw, _adc_state, RING_CAPACITY, time.ticks_us, adc.read_u16,
-                              _temp_adc.read_u16 if _temp_adc is not None else None)
+_on_adc_timer = make_adc_isr(ring_ticks, ring_raw, _adc_state,
+                              (time.ticks_us, adc.read_u16, _temp_adc.read_u16 if _temp_adc is not None else None))
 adc_timer = Timer()
 adc_timer.init(freq=ADC_SAMPLE_HZ, mode=Timer.PERIODIC, callback=_on_adc_timer, hard=True)
 
