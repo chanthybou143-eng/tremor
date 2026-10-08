@@ -201,3 +201,17 @@ remove the jumper; power-cycle.
 - **Production vs bench POST-locked gaps (A/B finding 5).** Production (~44 gaps/h) ran the OLD firmware;
   the soft-timer bench run used the NEW firmware with the timer switched to soft -- not like for like.
   After flashing, compare POST-locked gaps from the server data of the new boot.
+- **adc_restarts is not in telemetry** (STATUS only). A standalone unit restarting a dead ADC timer
+  (# ADC_STALLED) is invisible to the server except as missing readings. Add it to telemetry (firmware
+  field + ingest.TELEMETRY_FIELDS; the startup migration adds the column).
+- **Telemetry heap_free is the PRE-collect value** (gc.mem_free() before the pre-POST gc.collect): it
+  reads 34-53 KB while the collected steady state is ~237 KB. Send the post-collect value (or both).
+
+## Flash record (2026-10-08)
+
+Unit 1 flashed with `2dc6afb` (= origin/fw-resilience). Backup of the replaced files + http_keepalive.py:
+`~/tremor-flash-backup-20261008-pre-fw-resilience` (the 5 replaced files are byte-identical to master).
+`scripts/verify_flash.py 2dc6afb`: ALL FILES VERIFIED (12 OK + wifi_config.py present, not read).
+Standalone boot `597ea8ff32626c7b`: first 15 min -- 600.1 readings/10 min, seq complete, 0 gaps,
+dropped 0, ADC overflow 0, pps_spread_us_max 86-134 us. Not merged to master: soak through at least one
+slow-uplink afternoon first.
