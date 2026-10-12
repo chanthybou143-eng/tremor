@@ -359,9 +359,14 @@ def _cli(argv=None) -> int:
     r.add_argument("--max-seconds", type=float, default=60.0)
     rd = sub.add_parser("reset-day", help="forget a day's retention state (e.g. after fixing an 'attention' problem)")
     rd.add_argument("unit_id"); rd.add_argument("day", type=int)
-    pe = sub.add_parser("prune-exports", help="delete old export files (only after you have pulled them off the server)")
-    pe.add_argument("--older-than-days", type=int, required=True)
+    pe = sub.add_parser("prune-exports", help="REMOVED -- use delete-exports")
+    pe.add_argument("--older-than-days", type=int)
     pe.add_argument("--confirm-downloaded", action="store_true")
+    de = sub.add_parser("delete-exports",
+                        help="delete server copies of exports that scripts/archive_exports.py has verified off-server")
+    de.add_argument("--confirm", required=True, help="delete_confirm_<date>.txt written by archive_exports.py")
+    de.add_argument("--keep-days", type=int, default=EXPORT_KEEP_DAYS)
+    de.add_argument("--yes", action="store_true", help="actually delete (default: dry run)")
     a = ap.parse_args(argv)
 
     store = open_store(a.db)
@@ -385,19 +390,92 @@ def _cli(argv=None) -> int:
         store.save_day_state(st)
         print("reset", a.unit_id, day_to_date(a.day))
     elif a.cmd == "prune-exports":
-        if not a.confirm_downloaded:
-            print("refusing: pass --confirm-downloaded once you have copied the export files elsewhere")
-            return 2
-        cutoff = time.time() - a.older_than_days * 86400
-        n = 0
-        for root, _dirs, files in os.walk(cfg.export_dir):
-            for fn in files:
-                p = os.path.join(root, fn)
-                if fn.endswith(".csv.gz") and os.path.getmtime(p) < cutoff:
-                    os.remove(p)
-                    n += 1
-        print("deleted", n, "export file(s)")
+        print("prune-exports was removed: it deleted exports by file age without checking that the day had been "
+              "pruned (a day deleted before its prune is marked 'attention' and never pruned) or that a verified "
+              "copy exists elsewhere. Use scripts/archive_exports.py on the Mac, then delete-exports --confirm.")
+        return 2
+    elif a.cmd == "delete-exports":
+        return delete_exports(store, eng, a.confirm, a.keep_days, a.yes, time.time())
     return 0
+
+
+# Server copies of exports are deleted only after scripts/archive_exports.py (on the Mac) has downloaded
+# each day, verified it against the stored SHA-256 and row count, mirrored it to a second copy, and
+# listed it in a confirmation file. This many days must have passed since the day ended.
+EXPORT_KEEP_DAYS = 30
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for b in iter(lambda: fh.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def delete_exports(store: ReadingStore, eng: "RetentionEngine", confirm_path: str, keep_days: int,
+                   really: bool, now: float, out=print) -> int:
+    """Delete the server copy of each export listed in `confirm_path` ("unit YYYY-MM-DD sha256" per line),
+    but only if, checked here on the server at the moment of deletion:
+      * the day is pruned_done (retention never looks at its export again) and has no 'attention';
+      * it ended at least keep_days ago and its export is not already deleted;
+      * the file's CURRENT SHA-256 equals both the line (what the Mac verified) and the hash stored when
+        the export was written.
+    Each deletion is recorded (retention_days.export_deleted_at): /api/export then answers 410.
+    Dry run unless `really`. Returns 0 if every line passed, 1 if any was skipped, 2 for a bad file."""
+    try:
+        lines = [ln.split() for ln in open(confirm_path) if ln.strip() and not ln.lstrip().startswith("#")]
+    except OSError as exc:
+        out(f"cannot read {confirm_path}: {exc}")
+        return 2
+    skipped = done = 0
+    states: Dict[str, Dict[int, DayState]] = {}
+    for parts in lines:
+        if len(parts) != 3 or not re.fullmatch(r"[0-9a-f]{64}", parts[2]):
+            out(f"SKIP  {' '.join(parts)}: not 'unit YYYY-MM-DD sha256'")
+            skipped += 1
+            continue
+        unit, day_s, sha = parts
+        try:
+            d = (date.fromisoformat(day_s) - day_to_date(0)).days
+        except ValueError:
+            out(f"SKIP  {unit} {day_s}: bad date"); skipped += 1; continue
+        if unit not in states:
+            states[unit] = store.day_states(unit)
+        st = states[unit].get(d)
+        path = eng.export_path(unit, d)
+        reason = None
+        if st is None or not st.export_done:
+            reason = "no export recorded for this day"
+        elif st.attention:
+            reason = f"day needs attention ({st.attention})"
+        elif not st.pruned_done:
+            reason = "day not pruned yet -- deleting its export now would block its prune"
+        elif st.export_deleted_at is not None:
+            reason = "already deleted"
+        elif (d + 1) * 86400 > now - keep_days * 86400:
+            reason = f"younger than {keep_days} days"
+        elif not os.path.isfile(path):
+            reason = "export file not on the server"
+        elif sha != st.export_sha256:
+            reason = "hash in the confirmation file differs from the hash stored at export time"
+        elif _sha256_file(path) != st.export_sha256:
+            reason = "file on the server no longer matches its stored hash"
+        if reason:
+            out(f"SKIP  {unit} {day_s}: {reason}")
+            skipped += 1
+            continue
+        if really:
+            os.remove(path)
+            st.export_deleted_at = now
+            store.save_day_state(st)
+            out(f"DELETED {unit} {day_s} ({path})")
+        else:
+            out(f"WOULD DELETE {unit} {day_s} ({path})")
+        done += 1
+    out(f"{'deleted' if really else 'would delete'} {done}, skipped {skipped}"
+        + ("" if really else "  (dry run: add --yes to delete)"))
+    return 1 if skipped else 0
 
 
 if __name__ == "__main__":

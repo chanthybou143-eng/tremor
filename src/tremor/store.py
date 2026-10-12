@@ -121,6 +121,7 @@ class DayState:
     pruned_rows: int = 0
     pruned_done: bool = False
     attention: Optional[str] = None          # set when verification fails -> never pruned
+    export_deleted_at: Optional[float] = None    # the server copy of the export was deleted after archiving
 
 
 @dataclass(frozen=True)
@@ -360,6 +361,7 @@ CREATE TABLE IF NOT EXISTS retention_days (
   pruned_rows INTEGER NOT NULL DEFAULT 0,
   pruned_done INTEGER NOT NULL DEFAULT 0,
   attention TEXT,
+  export_deleted_at REAL,
   PRIMARY KEY (unit_id, day)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS readings_1min (
@@ -423,8 +425,17 @@ class SqliteReadingStore(ReadingStore):
                 db.executescript(_SCHEMA)
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._telemetry_cols = self._add_telemetry_columns(db)
+                self._add_retention_columns(db)
         except sqlite3.Error as exc:
             raise StoreError(f"cannot open {path}: {exc}") from exc
+
+    @staticmethod
+    def _add_retention_columns(db) -> None:
+        """retention_days.export_deleted_at (export archiving, 2026-10) on a database created before it.
+        Additive, no SCHEMA_VERSION bump: older code still opens the database and ignores the column."""
+        have = {r[1] for r in db.execute("PRAGMA table_info(retention_days)")}
+        if "export_deleted_at" not in have:
+            db.execute("ALTER TABLE retention_days ADD COLUMN export_deleted_at REAL")
 
     @staticmethod
     def _add_telemetry_columns(db) -> set:
@@ -663,12 +674,15 @@ class SqliteReadingStore(ReadingStore):
             n_agg = db.execute("SELECT count(*) FROM readings_1min").fetchone()[0]
             unpruned_exported = db.execute(
                 "SELECT count(*) FROM retention_days WHERE export_done=1 AND agg_done=1 AND pruned_done=0").fetchone()[0]
+            exports_deleted = db.execute(
+                "SELECT count(*) FROM retention_days WHERE export_deleted_at IS NOT NULL").fetchone()[0]
         return {
             "backend": "sqlite", "schema_version": SCHEMA_VERSION, "synchronous": self._sync,
             "telemetry_insert_errors": self.telemetry_errors,
             "db_bytes": size(self.path), "journal_bytes": size(self.path + "-journal"),
             "raw_rows": self._count_cache[1], "aggregate_rows": n_agg, "event_intervals": n_events,
             "days_exported_awaiting_prune": unpruned_exported,
+            "days_export_archived_off_server": exports_deleted,
             "days_needing_attention": [{"unit_id": a, "day": b, "reason": c} for a, b, c in attention],
         }
 
@@ -687,12 +701,12 @@ class SqliteReadingStore(ReadingStore):
         return min(days) if days else None
 
     _DS_COLS = ("unit_id, day, export_path, export_cursor, export_rows, export_sha256, export_done, "
-                "agg_next_hour, agg_done, verified_at, pruned_rows, pruned_done, attention")
+                "agg_next_hour, agg_done, verified_at, pruned_rows, pruned_done, attention, export_deleted_at")
 
     @staticmethod
     def _ds(r) -> DayState:
         return DayState(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], bool(r[8]), r[9], r[10],
-                        bool(r[11]), r[12])
+                        bool(r[11]), r[12], r[13])
 
     def day_states(self, unit_id: str) -> Dict[int, DayState]:
         with self._read() as db:
@@ -702,10 +716,10 @@ class SqliteReadingStore(ReadingStore):
     def save_day_state(self, st: DayState) -> None:
         with self._write() as db:
             db.execute(
-                f"INSERT OR REPLACE INTO retention_days({self._DS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                f"INSERT OR REPLACE INTO retention_days({self._DS_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (st.unit_id, st.day, st.export_path, st.export_cursor, st.export_rows, st.export_sha256,
                  int(st.export_done), st.agg_next_hour, int(st.agg_done), st.verified_at, st.pruned_rows,
-                 int(st.pruned_done), st.attention))
+                 int(st.pruned_done), st.attention, st.export_deleted_at))
 
     def read_day_page(self, unit_id, day, cursor, limit):
         lo, hi = day * DAY_US, (day + 1) * DAY_US

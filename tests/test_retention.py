@@ -330,7 +330,7 @@ def test_old_ingest_log_rows_are_pruned(env):
 
 # --- CLI ------------------------------------------------------------------------------------------------------
 
-def test_cli_status_run_and_prune_exports(env, capsys):
+def test_cli_status_and_run_and_the_old_prune_exports_now_refuses(env, capsys):
     store, cfg, _eng, _cl, tmp = env
     fill_day(store, 20, n=100)
     args = ["--db", store.path, "--export-dir", cfg.export_dir]
@@ -338,11 +338,12 @@ def test_cli_status_run_and_prune_exports(env, capsys):
     # (the CLI uses the real clock, under which the day is ancient and prunable)
     assert _cli(args + ["run", "--max-seconds", "20"]) == 0
     assert "idle" in capsys.readouterr().out
-    assert _cli(args + ["prune-exports", "--older-than-days", "0"]) == 2          # refuses without confirmation
     files = [os.path.join(r, f) for r, _d, fs in os.walk(cfg.export_dir) for f in fs]
     assert files
-    assert _cli(args + ["prune-exports", "--older-than-days", "0", "--confirm-downloaded"]) == 0
-    assert not [os.path.join(r, f) for r, _d, fs in os.walk(cfg.export_dir) for f in fs]
+    # it used to delete by file age, regardless of prune state or any verified copy elsewhere
+    assert _cli(args + ["prune-exports", "--older-than-days", "0", "--confirm-downloaded"]) == 2
+    assert "removed" in capsys.readouterr().out
+    assert [os.path.join(r, f) for r, _d, fs in os.walk(cfg.export_dir) for f in fs] == files
 
 
 def test_day_to_date_round_trip():

@@ -882,12 +882,8 @@ def create_app(
                    for u in units],
         )
 
-    @app.get("/api/export/<unit>/<day>")
-    def api_export(unit, day):
-        """Download one day's gzip CSV export (so it can be pulled off the server).
-        Needs TREMOR_EXPORT_TOKEN, sent as the X-Tremor-Token header (never in the URL, which
-        ends up in access logs); disabled entirely if no token is configured. Rate limited so
-        an anonymous caller cannot tie up the single web worker."""
+    def _export_gate():
+        """Shared by every /api/export* route: enabled, rate limited, token checked (header only)."""
         if not export_auth.enabled:
             return jsonify(error="export is disabled on this server"), 403
         limited = _rate_limited(export_limiter)
@@ -895,6 +891,46 @@ def create_app(
             return limited
         if not export_auth.check(request.headers.get(TOKEN_HEADER)):
             return jsonify(error="unauthorized"), 401
+        return None
+
+    @app.get("/api/export/manifest")
+    def api_export_manifest():
+        """Every exported day with what an off-server archive needs to verify its copy before the server
+        copy may be deleted (scripts/archive_exports.py): stored SHA-256 and row count, the file's size if
+        it is still here, and the retention state. Metadata only, no readings. Same token as /api/export."""
+        gate = _export_gate()
+        if gate is not None:
+            return gate
+        try:
+            units = [u.unit_id for u in store.unit_states()]
+            out = {}
+            for unit in units:
+                days = []
+                for d, st in sorted(store.day_states(unit).items()):
+                    if not st.export_done or st.export_sha256 is None:
+                        continue                         # not exported yet, or an empty day (no file)
+                    path = engine.export_path(unit, d)
+                    present = os.path.isfile(path)
+                    days.append(dict(
+                        day=day_to_date(d).isoformat(), rows=st.export_rows, sha256=st.export_sha256,
+                        size=os.path.getsize(path) if present else None, file_present=present,
+                        pruned_done=st.pruned_done, attention=st.attention,
+                        export_deleted_at=st.export_deleted_at))
+                out[unit] = days
+        except StoreError as exc:
+            log.error("/api/export/manifest: storage unavailable: %s", exc)
+            return jsonify(error="storage unavailable"), 503
+        return jsonify(server_time=clock(), units=out)
+
+    @app.get("/api/export/<unit>/<day>")
+    def api_export(unit, day):
+        """Download one day's gzip CSV export (so it can be pulled off the server).
+        Needs TREMOR_EXPORT_TOKEN, sent as the X-Tremor-Token header (never in the URL, which
+        ends up in access logs); disabled entirely if no token is configured. Rate limited so
+        an anonymous caller cannot tie up the single web worker."""
+        gate = _export_gate()
+        if gate is not None:
+            return gate
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", unit) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
             return jsonify(error="not found"), 404
         try:
@@ -903,6 +939,14 @@ def create_app(
             return jsonify(error="not found"), 404
         path = engine.export_path(unit, d)
         if not os.path.isfile(path):
+            try:
+                st = store.day_states(unit).get(d)
+            except StoreError:
+                st = None
+            if st is not None and st.export_deleted_at is not None:
+                # archived off the server (scripts/archive_exports.py + retention delete-exports)
+                when = datetime.fromtimestamp(st.export_deleted_at, timezone.utc).date().isoformat()
+                return jsonify(error=f"archived off-server on {when}"), 410
             return jsonify(error="not found"), 404
         return send_file(path, mimetype="application/gzip", as_attachment=True,
                          download_name=os.path.basename(path))
