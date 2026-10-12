@@ -221,6 +221,15 @@ seconds-of-day value belongs to. A reading with no usable GPS time is stored wit
   `python -m tremor.retention`. A UTC day is processed `settle_s` = `MAX_AGE_S` + 30 min after it ends, so a
   reading the server still accepts can never arrive for a day that was already exported (that would fail the
   pre-prune verification and leave the late rows out of the aggregates).
+- **Export archive** (2026-10, `deploy/DEPLOY_EXPORT_ARCHIVE.md`): exports are kept on the server until
+  `scripts/archive_exports.py` (Mac, stdlib only) has downloaded and verified each day (size, SHA-256 vs
+  `/api/export/manifest`, gzip, header, row count) into `~/tremor-exports` and a required second copy, and
+  listed it in `delete_confirm_<date>.txt`; `python -m tremor.retention delete-exports --confirm FILE --yes`
+  then deletes a server copy only if the day is `pruned_done`, has no attention, ended >= 30 days ago, and
+  its current hash matches both the list and the hash stored at export time (records
+  `retention_days.export_deleted_at`; `/api/export` answers 410). Never delete an export before its day is
+  pruned: verification would fail ("export file missing") and the day would never be pruned. The old
+  `prune-exports` (age-based, unchecked) refuses.
 - **API:** `/api/units` (window from the DB; adds `gps_utc`, `unlocked_count`, `duplicates_ignored`),
   `/api/history?unit=&from=&to=&limit=` (hard limit 10,000; `resolution=raw|1min|auto`), `/api/health` (DB size,
   quota use with a warning at 80%, days needing attention), `/api/export/<unit>/<YYYY-MM-DD>`.
