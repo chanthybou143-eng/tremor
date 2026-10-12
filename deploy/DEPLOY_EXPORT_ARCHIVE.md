@@ -44,11 +44,21 @@ Rollback: `git checkout <rollback hash>`, Reload. The added column is ignored by
 
 ## 2. First archive run (Mac)
 
-Pick the second copy: an external disk (best), or a cloud-synced folder (iCloud Drive / Dropbox) with
-`--allow-same-disk` (the script refuses a second copy on the same disk otherwise).
+Primary copy: `~/tremor-exports`. Second copy (chosen 2026-10-12): the iCloud Drive folder
+`~/Library/Mobile Documents/com~apple~CloudDocs/TREMOR-archive`, which is on the same disk, so the script
+needs `--allow-same-disk` (it relies on iCloud syncing it off the Mac).
+
+**Keep it downloaded.** In Finder, open iCloud Drive, right-click **TREMOR-archive** and choose
+**Keep Downloaded**. Otherwise macOS may evict the files under storage pressure: an evicted file is
+only a placeholder on this Mac, its content in the cloud. The script checks every second-copy file for that
+*before* hashing it. A placeholder is reported as `WARNING ... iCloud placeholder (evicted)` (or
+`(.icloud stub)` on older macOS); that day is not verified and not listed for deletion, and the run exits 1.
+Fix it with Keep Downloaded and run again.
 
 ```bash
-cd ~/tremor-merge && python3 scripts/archive_exports.py --second-copy /Volumes/<disk>/tremor-exports
+mkdir -p ~/Library/Mobile\ Documents/com~apple~CloudDocs/TREMOR-archive        # once
+cd ~/tremor-merge && python3 scripts/archive_exports.py --allow-same-disk \
+    --second-copy ~/Library/Mobile\ Documents/com~apple~CloudDocs/TREMOR-archive
 #   Export token (hidden): <type it; nothing is echoed>
 ```
 

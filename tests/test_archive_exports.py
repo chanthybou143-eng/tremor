@@ -169,3 +169,50 @@ def test_the_https_fetcher_reports_http_errors_by_status_only(monkeypatch):
     with pytest.raises(ax.FetchError) as e:
         ax.https_fetcher("https://example.invalid", TOKEN, pace_s=0)("/api/export/manifest")
     assert str(e.value) == "HTTP 401" and TOKEN not in str(e.value) and e.value.__cause__ is None
+
+
+# --- iCloud Drive placeholders in the second copy -----------------------------------------------------------
+
+def test_an_evicted_icloud_file_is_warned_about_by_name_not_hashed_and_not_listed(w, monkeypatch):
+    run(w)
+    evicted = w["second"] / "unit-1" / "readings_unit-1_2026-10-01.csv.gz"
+    real = ax.icloud_placeholder
+    monkeypatch.setattr(ax, "icloud_placeholder",
+                        lambda p: "iCloud placeholder (evicted): not downloaded on this Mac" if Path(p) == evicted else real(p))
+    hashed = []
+    real_sha = ax.sha256_of
+    monkeypatch.setattr(ax, "sha256_of", lambda p: hashed.append(Path(p)) or real_sha(p))
+    rc, conf, out = run(w)
+    assert rc == 1 and evicted not in hashed
+    assert any(o.startswith("WARNING unit-1 2026-10-01: second copy is an iCloud placeholder (evicted)") and
+               "Keep Downloaded" in o for o in out)
+    assert [ln.split()[1] for ln in conf.read_text().splitlines() if not ln.startswith("#")] == ["2026-10-15"]
+
+
+def test_an_old_style_icloud_stub_is_recognised_and_not_re_downloaded_over(w):
+    run(w)
+    p = w["second"] / "unit-1" / "readings_unit-1_2026-10-15.csv.gz"
+    stub = p.with_name("." + p.name + ".icloud")
+    p.rename(stub)                                         # what older macOS leaves behind for an evicted file
+    assert ax.icloud_placeholder(p).startswith("iCloud placeholder (.icloud stub)")
+    rc, conf, out = run(w)
+    assert rc == 1 and any("2026-10-15: second copy is an iCloud placeholder (.icloud stub)" in o for o in out)
+    assert not p.exists()                                  # not silently re-written beside the stub
+    assert "2026-10-15" not in conf.read_text()
+
+
+def test_a_dataless_flag_is_detected(tmp_path, monkeypatch):
+    f = tmp_path / "x.csv.gz"
+    f.write_bytes(b"1")
+    assert ax.icloud_placeholder(f) is None
+    import os as _os
+    real = _os.stat
+
+    class S:
+        def __init__(self, st):
+            self._st = st
+        def __getattr__(self, k):
+            return getattr(self._st, k)
+        st_flags = ax.SF_DATALESS
+    monkeypatch.setattr(ax.os, "stat", lambda p, *a, **k: S(real(p, *a, **k)))
+    assert "evicted" in ax.icloud_placeholder(f)

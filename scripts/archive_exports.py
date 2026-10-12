@@ -109,6 +109,22 @@ def check_export_bytes(data, want):
     return problems
 
 
+SF_DATALESS = 0x40000000          # macOS: file content not on disk (iCloud Drive "evicted" / not downloaded)
+
+
+def icloud_placeholder(p):
+    """None if the file's content is really on this disk; otherwise a description. An evicted iCloud Drive
+    file is either 'dataless' (same name, content in the cloud only -- reading it would trigger a download,
+    or hang offline) or, on older macOS, replaced by a hidden '.<name>.icloud' stub."""
+    p = Path(p)
+    stub = p.with_name("." + p.name + ".icloud")
+    if not p.exists() and stub.exists():
+        return "iCloud placeholder (.icloud stub): not downloaded on this Mac"
+    if p.exists() and getattr(os.stat(p), "st_flags", 0) & SF_DATALESS:
+        return "iCloud placeholder (evicted): not downloaded on this Mac"
+    return None
+
+
 def file_name(unit, day):
     return f"readings_{unit}_{day}.csv.gz"
 
@@ -180,7 +196,7 @@ def archive(fetch, dest, second, keep_days=EXPORT_KEEP_DAYS, allow_same_disk=Fal
         for d in days:
             day, key = d["day"], (unit, d["day"])
             p1, p2 = dest / unit / file_name(unit, day), second / unit / file_name(unit, day)
-            have = key in local and p1.exists() and p2.exists()
+            have = key in local and p1.exists() and (p2.exists() or icloud_placeholder(p2) is not None)
             if have and local[key]["sha256"] != d["sha256"]:
                 out(f"WARNING {unit} {day}: archived hash differs from the server's stored hash -- re-archiving")
                 have = False
@@ -218,7 +234,12 @@ def archive(fetch, dest, second, keep_days=EXPORT_KEEP_DAYS, allow_same_disk=Fal
         ok = True
         for base, name in ((dest, "archive"), (second, "second copy")):
             p = base / unit / file_name(unit, day)
-            if not p.exists():
+            ph = icloud_placeholder(p)
+            if ph:                                    # never hash it: that would silently download, or hang
+                out(f"WARNING {unit} {day}: {name} is an {ph} ({p}) -- not verified, not listed for deletion. "
+                    "In Finder: right-click the folder > Keep Downloaded.")
+                ok = False
+            elif not p.exists():
                 out(f"PROBLEM {unit} {day}: missing from the {name} ({p})")
                 ok = False
             elif sha256_of(p) != m["sha256"]:
