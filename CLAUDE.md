@@ -459,16 +459,18 @@ unplugged, measured exactly on the device).
   session. Chunk timestamps come from raw `ticks_us` (the Pico crystal), so a crystal error of x ppm biases every
   reading by -x ppm (~50 µHz per ppm). Measure ticks per accepted PPS second (sum over a window, not one interval)
   and scale chunk time by it. Measured so far (2026-09-11/19 logs, `period_us`): crystal ~3-5 ppm SLOW, i.e.
-  only ~+0.2 mHz of bias -- this does NOT explain the -1.9 mHz offset vs AEMO SA1 on 2026-09-27 (see
-  ~/tremor-analysis/). Current STATUS lines no longer log `period_us`; add a windowed ticks-per-PPS-second field
+  only ~+0.2 mHz of bias -- the old -1.6..-2.0 mHz offset vs AEMO was the soft-timer sampling defects
+  plus 4 s ring overflow, fixed in 2dc6afb (now -0.3 / -0.56 mHz): see `docs/FREQUENCY_OFFSET.md`. Current STATUS lines no longer log `period_us`; add a windowed ticks-per-PPS-second field
   so temperature drift can be tracked.
 * **Plausibility filter for impossible readings** (e.g. the 80.995 Hz glitch in boot `3bf8ae13fd84b5d0` on
   2026-09-27, and plugpack-unplugged data) -- for the next firmware session. Flag (don't silently drop) readings
   outside a physically possible band and readings with near-zero amplitude, rather than sending them as normal
   data. The band must stay wider than real NEM contingency excursions (~47-52 Hz) so genuine events survive;
   the offline analysis used 49.5-50.5 Hz only because 2026-09-27 had no event.
-* Optional: precompile the client with `mpy-cross` (boot compiles ~52 KB of source each time).
-* `http_keepalive.py` is on the flash but unused; leave it or remove it in a maintenance session.
+* **Estimator bias on a perfect sine (low priority):** `summarize_chunk` reads -0.15 +- 0.02 mHz on a perfect
+  50.000 Hz sine (`analysis/mechanism_sim.py`) -- part of the remaining -0.3 / -0.56 mHz vs AEMO. Look at the
+  boxcar pre-filter / crossing interpolation before any absolute-accuracy work.
+* Optional: precompile the client with `mpy-cross` (boot compiles ~56 KB of source each time).
 
 ### Switching the server to `TREMOR_INGEST_AUTH=required` (done 2026-09-27)
 
