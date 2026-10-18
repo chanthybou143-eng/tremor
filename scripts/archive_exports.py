@@ -18,8 +18,10 @@ no 'attention', ended at least --keep-days (30) ago. Deleting is a separate, del
     python3.9 -m tremor.retention delete-exports --confirm delete_confirm_<date>.txt --yes
 This script never deletes anything on the server.
 
-The export token is typed at a hidden prompt, sent only as the X-Tremor-Token header over HTTPS, and never
-printed, logged or written to disk; errors report the HTTP status only.
+The export token is typed at a hidden prompt (or, for the unattended weekly run, read from the macOS login
+Keychain with --token-keychain SERVICE: see scripts/archive_weekly.sh), sent only as the X-Tremor-Token header
+over HTTPS, and never printed, logged, written to disk, put on a command line or in the environment; errors
+report the HTTP status only.
 Once a server copy is deleted and its day pruned, these two copies are the only full-resolution record of
 that day (the server keeps 1-minute aggregates and event rows) -- hence the required second copy.
 """
@@ -35,6 +37,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -79,6 +82,29 @@ def https_fetcher(base, token, pace_s=PACE_S):
                 raise FetchError(f"network error ({type(e.reason).__name__})") from None
         raise FetchError(429)
     return fetch
+
+
+class TokenError(Exception):
+    """The token could not be obtained. The message never contains the token."""
+
+
+def keychain_token(service, run=None):
+    """The export token from the macOS login Keychain (a generic password with this service name), read by
+    /usr/bin/security straight into memory: its stdout is captured, never printed, and the token is never put
+    on a command line or in the environment. Raises TokenError (exit status only, no output) on failure."""
+    run = run or subprocess.run
+    try:
+        r = run(["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise TokenError(f"Keychain: could not run /usr/bin/security ({type(e).__name__})") from None
+    if r.returncode != 0:
+        raise TokenError(f"Keychain: no readable item for service '{service}' (security exit {r.returncode}; "
+                         "44 = no such item, otherwise the Keychain is locked or access was denied)")
+    token = r.stdout.strip()
+    if not token:
+        raise TokenError(f"Keychain: the item for service '{service}' is empty")
+    return token
 
 
 def sha256_of(path):
@@ -283,11 +309,21 @@ def main(argv=None):
     ap.add_argument("--allow-same-disk", action="store_true",
                     help="accept a second copy on the same disk (only for a cloud-synced folder)")
     ap.add_argument("--base", default=DEFAULT_BASE)
+    ap.add_argument("--token-keychain", metavar="SERVICE",
+                    help="read the token from the macOS Keychain item with this service name instead of prompting "
+                         "(unattended runs; never prompts)")
     a = ap.parse_args(argv)
-    token = getpass.getpass("Export token (hidden): ").strip()
-    if not token:
-        print("no token entered")
-        return 2
+    if a.token_keychain:
+        try:
+            token = keychain_token(a.token_keychain)
+        except TokenError as e:
+            print(e)
+            return 2
+    else:
+        token = getpass.getpass("Export token (hidden): ").strip()
+        if not token:
+            print("no token entered")
+            return 2
     rc, _conf = archive(https_fetcher(a.base, token), a.dest, a.second_copy, a.keep_days, a.allow_same_disk)
     return rc
 

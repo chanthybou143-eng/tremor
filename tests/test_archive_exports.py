@@ -216,3 +216,65 @@ def test_a_dataless_flag_is_detected(tmp_path, monkeypatch):
         st_flags = ax.SF_DATALESS
     monkeypatch.setattr(ax.os, "stat", lambda p, *a, **k: S(real(p, *a, **k)))
     assert "evicted" in ax.icloud_placeholder(f)
+
+
+# --- unattended runs: the token from the macOS Keychain (--token-keychain) ----------------------------------
+
+def fake_security(calls, rc=0, stdout=TOKEN + "\n"):
+    import subprocess
+
+    def run(args, **kw):
+        calls.append((list(args), kw))
+        return subprocess.CompletedProcess(args, rc, stdout=stdout if rc == 0 else "", stderr="")
+    return run
+
+
+def test_keychain_token_is_read_from_security_stdout_into_memory_only():
+    import subprocess
+    calls = []
+    assert ax.keychain_token("tremor-export-token", run=fake_security(calls)) == TOKEN
+    (args, kw), = calls
+    assert args == ["/usr/bin/security", "find-generic-password", "-s", "tremor-export-token", "-w"]
+    assert kw["capture_output"] is True and kw["stdin"] is subprocess.DEVNULL      # captured, never printed
+    assert "env" not in kw and TOKEN not in " ".join(args)
+
+
+@pytest.mark.parametrize("rc,stdout,expect", [(44, "", "exit 44; 44 = no such item"),
+                                              (36, "", "exit 36"), (0, "  \n", "is empty")])
+def test_keychain_failures_raise_without_the_token(rc, stdout, expect):
+    with pytest.raises(ax.TokenError) as e:
+        ax.keychain_token("svc", run=fake_security([], rc=rc, stdout=stdout))
+    assert expect in str(e.value) and TOKEN not in str(e.value)
+
+
+def test_keychain_cannot_run_security_is_a_token_error():
+    def run(args, **kw):
+        raise FileNotFoundError(args[0])
+    with pytest.raises(ax.TokenError, match="could not run /usr/bin/security"):
+        ax.keychain_token("svc", run=run)
+
+
+def test_main_with_token_keychain_never_prompts_and_never_leaks_the_token(w, monkeypatch, capsys):
+    import os
+    calls, seen = [], []
+    monkeypatch.setattr(ax.subprocess, "run", fake_security(calls))
+    monkeypatch.setattr(ax.getpass, "getpass", lambda *a, **k: pytest.fail("prompted in unattended mode"))
+    monkeypatch.setattr(ax, "https_fetcher", lambda base, token: seen.append(token) or w["fetch"])
+    argv = ["--token-keychain", "tremor-export-token", "--dest", str(w["dest"]), "--second-copy", str(w["second"]),
+            "--allow-same-disk"]
+    assert ax.main(argv) == 0
+    assert seen == [TOKEN] and len(calls) == 1
+    blob = capsys.readouterr().out + " ".join(argv) + " ".join(os.environ.values())
+    for p in list(w["dest"].rglob("*")) + list(w["second"].rglob("*")):
+        if p.is_file():
+            blob += p.read_bytes().decode("latin-1")
+    assert "archived this run: 3" in blob and TOKEN not in blob
+
+
+def test_main_with_an_unreadable_keychain_item_stops_before_touching_anything(w, monkeypatch, capsys):
+    monkeypatch.setattr(ax.subprocess, "run", fake_security([], rc=44))
+    monkeypatch.setattr(ax.getpass, "getpass", lambda *a, **k: pytest.fail("prompted in unattended mode"))
+    monkeypatch.setattr(ax, "https_fetcher", lambda *a: pytest.fail("fetched without a token"))
+    rc = ax.main(["--token-keychain", "svc", "--dest", str(w["dest"]), "--second-copy", str(w["second"])])
+    assert rc == 2 and not w["dest"].exists()
+    assert "Keychain: no readable item for service 'svc' (security exit 44" in capsys.readouterr().out
