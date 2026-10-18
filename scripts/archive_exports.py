@@ -151,6 +151,11 @@ def icloud_placeholder(p):
     return None
 
 
+def describe_os_error(e):
+    """'Operation not permitted' etc. -- the reason only (the path is reported separately)."""
+    return e.strerror or type(e).__name__
+
+
 def file_name(unit, day):
     return f"readings_{unit}_{day}.csv.gz"
 
@@ -222,7 +227,10 @@ def archive(fetch, dest, second, keep_days=EXPORT_KEEP_DAYS, allow_same_disk=Fal
         for d in days:
             day, key = d["day"], (unit, d["day"])
             p1, p2 = dest / unit / file_name(unit, day), second / unit / file_name(unit, day)
-            have = key in local and p1.exists() and (p2.exists() or icloud_placeholder(p2) is not None)
+            try:
+                have = key in local and p1.exists() and (p2.exists() or icloud_placeholder(p2) is not None)
+            except OSError:                       # cannot even look (e.g. macOS privacy block): the re-verify
+                have = key in local               # below reports it; never re-download over an unreadable copy
             if have and local[key]["sha256"] != d["sha256"]:
                 out(f"WARNING {unit} {day}: archived hash differs from the server's stored hash -- re-archiving")
                 have = False
@@ -244,7 +252,13 @@ def archive(fetch, dest, second, keep_days=EXPORT_KEEP_DAYS, allow_same_disk=Fal
                 out(f"FAIL    {unit} {day}: " + "; ".join(bad))
                 problems += 1
                 continue
-            if not write_verified(data, p1, d["sha256"]) or not write_verified(data, p2, d["sha256"]):
+            try:
+                written = write_verified(data, p1, d["sha256"]) and write_verified(data, p2, d["sha256"])
+            except OSError as e:
+                out(f"FAIL    {unit} {day}: local write failed ({describe_os_error(e)})")
+                problems += 1
+                continue
+            if not written:
                 out(f"FAIL    {unit} {day}: local write did not verify")
                 problems += 1
                 continue
@@ -260,16 +274,20 @@ def archive(fetch, dest, second, keep_days=EXPORT_KEEP_DAYS, allow_same_disk=Fal
         ok = True
         for base, name in ((dest, "archive"), (second, "second copy")):
             p = base / unit / file_name(unit, day)
-            ph = icloud_placeholder(p)
-            if ph:                                    # never hash it: that would silently download, or hang
-                out(f"WARNING {unit} {day}: {name} is an {ph} ({p}) -- not verified, not listed for deletion. "
-                    "In Finder: right-click the folder > Keep Downloaded.")
-                ok = False
-            elif not p.exists():
-                out(f"PROBLEM {unit} {day}: missing from the {name} ({p})")
-                ok = False
-            elif sha256_of(p) != m["sha256"]:
-                out(f"PROBLEM {unit} {day}: {name} no longer matches its recorded hash ({p})")
+            try:
+                ph = icloud_placeholder(p)
+                if ph:                                # never hash it: that would silently download, or hang
+                    out(f"WARNING {unit} {day}: {name} is an {ph} ({p}) -- not verified, not listed for deletion. "
+                        "In Finder: right-click the folder > Keep Downloaded.")
+                    ok = False
+                elif not p.exists():
+                    out(f"PROBLEM {unit} {day}: missing from the {name} ({p})")
+                    ok = False
+                elif sha256_of(p) != m["sha256"]:
+                    out(f"PROBLEM {unit} {day}: {name} no longer matches its recorded hash ({p})")
+                    ok = False
+            except OSError as e:                      # unreadable is unverified: reported, never listed
+                out(f"PROBLEM {unit} {day}: {name} unreadable ({describe_os_error(e)}) ({p})")
                 ok = False
         if ok:
             verified.add((unit, day))

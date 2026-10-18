@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Weekly unattended export archive (scripts/archive_weekly.sh): Sunday 10:00 local time; if the Mac is
-  asleep or off then, launchd runs it once at the next wake. Never deletes anything.
-  Template: __HOME__ is replaced at install time (deploy/DEPLOY_EXPORT_ARCHIVE.md, section 6).
+  OPTIONAL, NOT INSTALLED (2026-10-18): the weekly routine is run by hand from Terminal instead.
+  Under launchd, macOS blocks network-volume access for /bin/bash (DEPLOY_EXPORT_ARCHIVE.md, 6b);
+  it would need a dedicated app holding that permission. Kept for reference: Sunday 10:00 local time,
+  once at the next wake if asleep; never deletes anything; __HOME__ is replaced at install time.
 -->
 <plist version="1.0">
 <dict>

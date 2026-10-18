@@ -1,5 +1,8 @@
 #!/bin/bash
-# Unattended export archive run (weekly, from launchd: deploy/com.tremor.archive-exports.plist).
+# The weekly export archive routine. Run it by hand from Terminal (the main path, see
+# deploy/DEPLOY_EXPORT_ARCHIVE.md section 2):   ~/tremor-merge/scripts/archive_weekly.sh
+# (launchd: deploy/com.tremor.archive-exports.plist is documented but NOT installed -- macOS blocks
+# network-volume access for a launchd-started /bin/bash.)
 #
 #   1. is the archive laptop reachable?  no -> log + notify + stop (nothing downloaded, nothing written)
 #   2. mount its Samba share silently (password from the Keychain)
@@ -31,7 +34,11 @@ LOGDIR="$DEST/logs"
 mkdir -p "$LOGDIR" || exit 2
 LOG="$LOGDIR/archive_$(date +%Y-%m-%d_%H%M%S).log"
 LAST_OK="$LOGDIR/last_success"
-exec >>"$LOG" 2>&1
+if [ -t 1 ]; then
+    exec > >(tee -a "$LOG") 2>&1          # from Terminal: on screen AND in the log
+else
+    exec >>"$LOG" 2>&1
+fi
 
 say() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
 
@@ -57,6 +64,7 @@ since_last_ok() {  # " Last fully verified run: N days ago." (or never)
 fail() {  # exit code, title, message
     notify "$2" "$3$(since_last_ok) Log: $(basename "$LOG")"
     say "exit $1"
+    sleep 0.2
     exit "$1"
 }
 
@@ -106,11 +114,12 @@ if [ "$rc" -ne 0 ] || [ "$crc" -ne 0 ] || ! echo "$check" | grep -q '^laptop cop
 fi
 
 touch "$LAST_OK"
-msg="${summary#archived this run: }; laptop check OK."
+msg="$summary; laptop check OK."
 if [ -n "$ready" ]; then
     n="${ready%% day(s)*}"
     msg="$msg $n day(s) ready for deletion: upload $(basename "${ready##*-> }") (manual step)."
 fi
 notify "TREMOR archive OK" "$msg"
 say "exit 0"
+sleep 0.2                                     # let tee flush before the shell prompt returns
 exit 0

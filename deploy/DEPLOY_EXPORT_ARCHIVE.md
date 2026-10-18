@@ -42,7 +42,7 @@ curl -s https://tremorgrid.pythonanywhere.com/api/health | python3.9 -c "import 
 
 Rollback: `git checkout <rollback hash>`, Reload. The added column is ignored by older code.
 
-## 2. Archive run (Mac) -- every week or two
+## 2. Archive run (Mac) -- every Sunday, by hand
 
 Primary copy: `~/tremor-exports` (Mac). Second copy (since 2026-10-18): the old ASUS laptop
 **tremor-archive** (Ubuntu, always on, lid closed), Samba share `tremor-archive` mounted on the Mac at
@@ -50,13 +50,32 @@ Primary copy: `~/tremor-exports` (Mac). Second copy (since 2026-10-18): the old 
 `/srv/tremor-archive/tremor-exports`). It is a separate disk, so no `--allow-same-disk`. (The 2026-10-12
 plan was an iCloud Drive folder; it was never used -- the first real run, 2026-10-18, went to the laptop.)
 
-**The routine in one line** (mount, then archive; the archiver only starts if the mount succeeded):
+**The weekly routine -- every Sunday, by hand, in Terminal** (one command; no typing, the token comes from
+the Keychain, see 6a):
+
+```bash
+~/tremor-merge/scripts/archive_weekly.sh
+```
+
+It checks the laptop is reachable, mounts the share silently, runs the archiver
+(`--token-keychain tremor-export-token`), re-hashes the laptop copy on the laptop's own disk (2c), prints
+everything and saves it to `~/tremor-exports/logs/archive_<date>_<time>.log`, and shows one notification.
+**It never deletes anything.** Last line / exit status:
+
+| Exit | Notification | Meaning / what to do |
+|---|---|---|
+| 0 | `TREMOR archive OK` | All verified in both copies + laptop check OK. If it says `N day(s) ready for deletion: upload delete_confirm_<date>.txt (manual step)`, do section 3. |
+| 1 | `TREMOR archive: PROBLEM` | `FAIL`/`PROBLEM`/`WARNING` lines or a failed laptop check: stop, send me the log (it never contains the token). Affected days are never listed for deletion. |
+| 2 | `TREMOR archive: PROBLEM` | Setup: Keychain item missing/locked, mount failed, or the share's folder not visible. |
+| 3 | `TREMOR archive skipped` | Laptop unreachable: turn it on, run again. Also says how long since the last verified run (and shouts after 14 days). |
+
+Fallback without the wrapper (typed token, nothing else needed) -- the original one-liner:
 
 ```bash
 osascript -e 'mount volume "smb://chanthy@tremor-archive.local/tremor-archive"' >/dev/null && cd ~/tremor-merge && python3 scripts/archive_exports.py --second-copy /Volumes/tremor-archive/tremor-exports
 ```
 
-Then 2c. The same, step by step:
+Then 2c. The same, step by step (what the wrapper does):
 
 **2a. Mount the share** -- silent, password from the Keychain (tested 2026-10-18 after a fresh unmount: no
 dialog; already mounted: exit 0, no duplicate mount). Laptop unreachable: expected to exit non-zero
@@ -115,7 +134,8 @@ Check `/api/health`: `exports_bytes` and `used_fraction` drop; `days_needing_att
 
 ## 4. Ongoing
 
-Run step 2 every week or two (it only fetches new days and re-verifies the rest), and step 3 whenever a
+Run step 2 every Sunday (`~/tremor-merge/scripts/archive_weekly.sh`; it only fetches new days and
+re-verifies the rest), and step 3 whenever a
 list is produced. Keep the second copy current (laptop on and the share mounted for each run). If a day
 ever has to go back on the server: copy the archived file to `~/tremor_data/exports/<unit>/` (same name),
 and clear its `export_deleted_at` (ask me -- not needed for anything the server does today).
@@ -151,18 +171,13 @@ ssh tremor-archive 'uptime -p; iw dev wlp2s0 get power_save; cat /sys/class/powe
 
 If the power fails for longer than the battery lasts, the laptop stays off afterwards: press its power button.
 
-## 6. Unattended weekly run (Keychain token + launchd)
+## 6. Keychain token (for the weekly command) and the optional launchd schedule (NOT installed)
 
-`scripts/archive_weekly.sh`, run by launchd every Sunday 10:00 (once at the next wake if the Mac was asleep):
-laptop reachable? -> silent mount -> `archive_exports.py --token-keychain tremor-export-token` -> the 2c
-laptop-side check -> a log in `~/tremor-exports/logs/` and ONE notification: `TREMOR archive OK` (with
-"N day(s) ready for deletion: upload ..." when there is a list), `TREMOR archive skipped` (laptop
-unreachable; says how many days since the last verified run, and shouts after 14), or
-`TREMOR archive: PROBLEM` (see the named log). **It never deletes anything**: step 3 stays manual. The
-token is read inside python straight from the Keychain; the wrapper never sees it. It runs from
-`~/tremor-merge`, which stays on `master`.
+The weekly command (section 2) reads the export token from the login Keychain inside python
+(`archive_exports.py --token-keychain tremor-export-token`); the wrapper itself never sees it. It runs from
+`~/tremor-merge`, which stays on `master` (`git pull` it after archiver changes).
 
-**6a. Token into the login Keychain** (once; again only if the token changes). `-w` last = hidden prompt
+**6a. Token into the login Keychain** (done 2026-10-18; redo only if the token changes). `-w` last = hidden prompt
 (asked twice); `-T /usr/bin/security` lets the archiver read it without a dialog; `-U` updates an existing item:
 
 ```bash
@@ -180,48 +195,17 @@ osascript -e 'mount volume "smb://chanthy@tremor-archive.local/tremor-archive"' 
 #   expect: no prompt; "archived this run: ...; problems: 0"
 ```
 
-**6b. Watched test run under launchd** -- a copy of the agent WITHOUT the schedule, started by hand, so the
-weekly schedule is not loaded until this passes. Optional but recommended first: `ssh-add -D` (empties the
-ssh-agent's memory only; key files untouched) so the test proves ssh gets the key passphrase from the
-Keychain (`UseKeychain yes`) as it must after a reboot, not from an already-unlocked agent.
+**6b. Optional: a launchd schedule -- NOT installed (decision 2026-10-18: run it by hand instead).**
+`deploy/com.tremor.archive-exports.plist` (Sunday 10:00, at the next wake if asleep; `__HOME__` filled in at
+install) is kept for reference only. A watched test run on 2026-10-18 showed why it does not work as is:
+macOS's privacy control attributes the job's file access to the launchd-started `/bin/bash`, which has no
+"Network Volumes" permission and, as a background process, can never be asked -- so reading
+`/Volumes/tremor-archive/...` fails with `Operation not permitted` (log: TCC
+`kTCCServiceSystemPolicyNetworkVolumes`, responsible `/bin/bash`). From Terminal the same access is
+attributed to Terminal, which has it -- hence the manual routine. Making launchd work would need a
+dedicated small app (e.g. an `osacompile` applet started with `open -a`) to hold that one permission;
+giving `/bin/bash` or python Full Disk Access instead is far too broad. Since that run, an unreadable copy
+is reported as `PROBLEM ... unreadable (Operation not permitted)` instead of crashing the archiver.
 
-```bash
-mkdir -p ~/tremor-exports/logs
-T=~/Library/LaunchAgents/com.tremor.archive-exports.test.plist
-sed "s|__HOME__|$HOME|g" ~/tremor-merge/deploy/com.tremor.archive-exports.plist > "$T"
-plutil -remove StartCalendarInterval "$T" && plutil -replace Label -string com.tremor.archive-exports.test "$T"
-launchctl bootstrap gui/$(id -u) "$T"
-launchctl kickstart -p gui/$(id -u)/com.tremor.archive-exports.test
-#   wait ~1 min (longer if new days are downloaded), then:
-tail -30 "$(ls -t ~/tremor-exports/logs/archive_*.log | head -1)"; cat ~/tremor-exports/logs/launchd.log
-```
-
-Pass criteria (all three before 6c):
-- (a) **SSH unattended:** the log shows `laptop copy: all OK` and `laptop check exit 0` (not
-  `Permission denied` / passphrase errors).
-- (b) **Network volume from launchd:** the log shows the archiver's `archived this run: ...` line, with no
-  `macOS privacy block on network volumes?` and no `Operation not permitted`. If macOS shows a dialog
-  asking whether bash/python may access files on a network volume, allow it and run the kickstart again.
-- (c) **Notification:** a `TREMOR archive OK` banner appeared. If not: System Settings > Notifications >
-  **Script Editor** (osascript notifications appear under it) > Allow, then kickstart again.
-
-Then remove the test agent:
-
-```bash
-launchctl bootout gui/$(id -u)/com.tremor.archive-exports.test
-rm ~/Library/LaunchAgents/com.tremor.archive-exports.test.plist
-```
-
-**6c. Load the weekly schedule** (only after (a), (b), (c) passed):
-
-```bash
-P=~/Library/LaunchAgents/com.tremor.archive-exports.plist
-sed "s|__HOME__|$HOME|g" ~/tremor-merge/deploy/com.tremor.archive-exports.plist > "$P"
-launchctl bootstrap gui/$(id -u) "$P"
-launchctl print gui/$(id -u)/com.tremor.archive-exports | grep -E 'state|Weekday|Hour|Minute'
-```
-
-Stop it: `launchctl bootout gui/$(id -u)/com.tremor.archive-exports`. Run it now, out of schedule:
-`launchctl kickstart gui/$(id -u)/com.tremor.archive-exports`. Exit codes in the log: 0 all verified,
-1 problems, 2 setup error (token, mount), 3 laptop unreachable. Keep `~/tremor-merge` on `master` and
-`git pull` it after archiver changes.
+Check nothing is installed: `ls ~/Library/LaunchAgents | grep -i tremor` (expect nothing) and
+`launchctl print gui/$(id -u)/com.tremor.archive-exports` (expect "Bad request" / not found).

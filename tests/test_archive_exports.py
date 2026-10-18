@@ -278,3 +278,60 @@ def test_main_with_an_unreadable_keychain_item_stops_before_touching_anything(w,
     rc = ax.main(["--token-keychain", "svc", "--dest", str(w["dest"]), "--second-copy", str(w["second"])])
     assert rc == 2 and not w["dest"].exists()
     assert "Keychain: no readable item for service 'svc' (security exit 44" in capsys.readouterr().out
+
+
+# --- an unreadable / unwritable copy is a reported problem, never a crash -----------------------------------
+
+def test_an_unreadable_second_copy_is_a_problem_line_not_a_crash_and_never_listed(w, monkeypatch):
+    run(w)
+    blocked = w["second"] / "unit-1" / "readings_unit-1_2026-10-01.csv.gz"
+    real_sha = ax.sha256_of
+
+    def sha(p):
+        if Path(p) == blocked:                 # what macOS's network-volume privacy block looks like
+            raise PermissionError(1, "Operation not permitted", str(p))
+        return real_sha(p)
+    monkeypatch.setattr(ax, "sha256_of", sha)
+    calls_before = len(w["calls"])
+    rc, conf, out = run(w)
+    assert rc == 1
+    assert f"PROBLEM unit-1 2026-10-01: second copy unreadable (Operation not permitted) ({blocked})" in out
+    assert out[-2] == "archived this run: 0; verified in both copies: 2; problems: 1"     # the run completed
+    assert [ln.split()[1] for ln in conf.read_text().splitlines() if not ln.startswith("#")] == ["2026-10-15"]
+    assert w["calls"][calls_before:] == ["/api/export/manifest"]                        # nothing re-downloaded
+
+
+def test_a_copy_that_cannot_even_be_looked_at_is_not_re_downloaded_over(w, monkeypatch):
+    run(w)
+    real = ax.icloud_placeholder
+
+    def placeholder(p):
+        if Path(p).is_relative_to(w["second"]):
+            raise PermissionError(1, "Operation not permitted", str(p))
+        return real(p)
+    real_exists = Path.exists
+
+    def exists(self):
+        if self.is_relative_to(w["second"]):
+            raise PermissionError(1, "Operation not permitted", str(self))
+        return real_exists(self)
+    monkeypatch.setattr(ax, "icloud_placeholder", placeholder)
+    monkeypatch.setattr(Path, "exists", exists)
+    calls_before = len(w["calls"])
+    rc, conf, out = run(w)
+    assert rc == 1 and conf is None and w["calls"][calls_before:] == ["/api/export/manifest"]
+    assert sum("second copy unreadable (Operation not permitted)" in o for o in out) == 3
+
+
+def test_a_failing_write_is_a_fail_line_and_the_day_is_not_recorded(w, monkeypatch):
+    real = ax.write_verified
+
+    def write(data, target, sha):
+        if Path(target).is_relative_to(w["second"]) and "2026-10-15" in Path(target).name:
+            raise PermissionError(1, "Operation not permitted", str(target))
+        return real(data, target, sha)
+    monkeypatch.setattr(ax, "write_verified", write)
+    rc, conf, out = run(w)
+    assert rc == 1 and "FAIL    unit-1 2026-10-15: local write failed (Operation not permitted)" in out
+    assert ("unit-1", "2026-10-15") not in ax.load_local_manifest(w["dest"])
+    assert "2026-10-15" not in conf.read_text()

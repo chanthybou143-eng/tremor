@@ -67,7 +67,7 @@ def called(env, name):
 def test_all_good_archives_checks_the_laptop_and_notifies_ok(env):
     rc, notes, log = run(env)
     assert rc == 0
-    assert notes == ["TREMOR archive OK | 1; verified in both copies: 23; problems: 0; laptop check OK."]
+    assert notes == ["TREMOR archive OK | archived this run: 1; verified in both copies: 23; problems: 0; laptop check OK."]
     args = (env["stub"] / "python.args").read_text().split()
     assert args == ["scripts/archive_exports.py", "--token-keychain", "tremor-export-token",
                     "--dest", str(env["dest"]), "--second-copy", str(env["second"])]
