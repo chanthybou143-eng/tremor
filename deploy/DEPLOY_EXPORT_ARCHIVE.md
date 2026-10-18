@@ -137,11 +137,11 @@ key `~/.ssh/id_ed25519`, passphrase in the Keychain). Host key ED25519
 | Security updates | unattended-upgrades (stock), auto-reboot 04:00 when needed | `/etc/apt/apt.conf.d/52tremor-unattended` |
 | Battery limit 80 % | re-applied every boot (ASUS `charge_control_end_threshold`) | `tremor-battery-limit.service` |
 | Samba share | SMB3 only, encryption required, user `chanthy` only, NetBIOS off (`nmbd` disabled) | `/etc/samba/smb.conf` (stock kept as `smb.conf.orig`) |
-| Firewall | **ufw is OFF** (checked 2026-10-18: `Status: inactive`; Ubuntu desktop default). A rule for TCP 445 from 192.168.1.0/24 is stored but not enforced. To turn it on: allow SSH from 192.168.1.0/24, default deny incoming, `ufw enable` -- keep an SSH session open while doing it | `sudo ufw status verbose` |
+| Firewall | ufw **enabled** 2026-10-18: default deny incoming / allow outgoing; allow TCP 22 and 445 from 192.168.1.0/24 and from fe80::/10 (IPv6 link-local: `.local` can resolve over IPv6); mDNS (UDP 5353) via Ubuntu's stock `before.rules`. Verified from the Mac: 22 and 445 reachable, 139 (smbd listens) blocked | `sudo ufw status verbose` |
 
 SSH, no-sleep, lid, Wi-Fi power save and the battery limit were proven to survive a reboot with the lid
-closed and nobody logged in (Wi-Fi credentials are stored system-wide). Samba (`smbd` enabled) was added
-after those reboots: after the next reboot, remount (2a) to confirm. Quick health
+closed and nobody logged in (Wi-Fi credentials are stored system-wide). Samba (`smbd` enabled) and ufw were
+added after those reboots: after the next reboot, remount (2a) and check `sudo ufw status` to confirm. Quick health
 check from the Mac:
 
 ```bash
